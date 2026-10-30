@@ -291,13 +291,17 @@ export class GitlabProvider implements Provider {
   async changeDiff(ref: RepoRef, number: number, call: Call) {
     call.signal.throwIfAborted()
     const files = await this.api.MergeRequests.allDiffs(ref.path, number, { perPage: MAX_PAGE })
+    // GitLab leaves `diff` empty for collapsed or oversized files; say so instead of presenting a complete diff.
+    let omitted = false
     const parts = files.map((file) => {
       const from = file.new_file ? '/dev/null' : `a/${file.old_path}`
       const to = file.deleted_file ? '/dev/null' : `b/${file.new_path}`
-      return `diff --git a/${file.old_path} b/${file.new_path}\n--- ${from}\n+++ ${to}\n${file.diff}`
+      const skipped = file.too_large === true || (file.collapsed === true && file.diff === '')
+      if (skipped) omitted = true
+      return `diff --git a/${file.old_path} b/${file.new_path}\n--- ${from}\n+++ ${to}\n${skipped ? '# GitLab 未返回这个文件的 diff（文件过大或已折叠）\n' : file.diff}`
     })
     const { text, truncated } = truncateBytes(parts.join(''), call.limits.maxDiffBytes)
-    return { diff: text, truncated }
+    return { diff: text, truncated: truncated || omitted }
   }
 
   async changeStatus(ref: RepoRef, number: number, call: Call) {

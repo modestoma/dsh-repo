@@ -102,6 +102,30 @@ describe('GitHub provider', () => {
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, merge_method: 'squash' })
   })
 
+  it('aggregates every page of check runs with commit statuses', async () => {
+    const passing = Array.from({ length: 100 }, (_, index) => ({ name: `ok${index}`, status: 'completed', conclusion: 'success', html_url: null }))
+    fakeHttp([
+      { method: 'GET', path: `${API}/pulls/5`, reply: { body: { head: { sha: SHA }, mergeable: true } } },
+      { method: 'GET', path: `${API}/commits/${SHA}/check-runs`, reply: request => request.url.searchParams.get('page') === '1'
+        ? { body: { check_runs: passing } }
+        : { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure', html_url: 'u' }] } } },
+      { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [{ context: 'ci/lint', state: 'pending', target_url: null }] } } },
+    ])
+    const status = await new RepoService(testConfig(), credentials(TOKENS)).changeStatus(REPO, 5)
+    expect(status.checks).toHaveLength(102)
+    expect(status.overall).toBe('failure')
+  })
+
+  it('lists one directory through the Trees API and passes on its truncation flag', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: new RegExp(`${API}/git/trees/dev(:|%3A)src$`), reply: { body: { truncated: true, tree: [{ path: 'a.ts', type: 'blob', mode: '100644', size: 3 }, { path: 'lib', type: 'tree', mode: '040000' }] } } },
+    ])
+    expect(await new RepoService(testConfig(), credentials(TOKENS)).listTree(REPO, { ref: 'dev', path: 'src/' })).toEqual({
+      ref: 'dev', truncated: true, entries: [{ path: 'src/a.ts', type: 'file', size: 3 }, { path: 'src/lib', type: 'dir' }],
+    })
+    expect(requests[0]?.url.searchParams.has('recursive')).toBe(false)
+  })
+
   it('aggregates check runs and commit statuses', async () => {
     fakeHttp([
       { method: 'GET', path: `${API}/pulls/5`, reply: { body: { head: { sha: SHA }, mergeable: true } } },

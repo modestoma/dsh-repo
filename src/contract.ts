@@ -288,7 +288,7 @@ export interface ChangeListOptions extends PageOptions {
 /** A unified diff. */
 export interface ChangeDiff {
   readonly diff: string
-  /** Whether {@link diff} was cut at the configured limit. */
+  /** Whether {@link diff} is incomplete: cut at the configured limit, or the host left out some files. */
   readonly truncated: boolean
 }
 

@@ -120,6 +120,15 @@ describe('GitLab provider', () => {
     expect(diff).toBe('diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/n.txt b/n.txt\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+n\n')
   })
 
+  it('marks the diff incomplete when GitLab omits a file', async () => {
+    fakeHttp([{ method: 'GET', path: `${API}/merge_requests/7/diffs`, reply: { body: [
+      { old_path: 'big.json', new_path: 'big.json', new_file: false, deleted_file: false, too_large: true, collapsed: false, diff: '' },
+    ] } }])
+    const { diff, truncated } = await new RepoService(testConfig(), credentials(TOKENS)).changeDiff(REPO, 7)
+    expect(truncated).toBe(true)
+    expect(diff).toContain('GitLab 未返回这个文件的 diff')
+  })
+
   it('classifies GitLab errors', async () => {
     fakeHttp([{ method: 'GET', path: API, reply: { status: 401, body: { message: '401 Unauthorized' } } }])
     await expect(new RepoService(testConfig(), credentials(TOKENS)).repoInfo(REPO)).rejects.toMatchObject({ code: 'unauthenticated', message: expect.stringContaining('401 Unauthorized') })

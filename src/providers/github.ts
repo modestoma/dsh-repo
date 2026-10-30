@@ -14,6 +14,12 @@ import { RepoError } from '../errors.ts'
 import { nextPage, titleOf, truncateBytes } from './types.ts'
 import type { Call, Provider, TokenSource } from './types.ts'
 
+/** GitHub's largest page. */
+const PAGE = 100
+
+/** Pages of check runs or statuses read before giving up on a complete status. */
+const MAX_STATUS_PAGES = 10
+
 interface GithubUser { readonly login: string; readonly html_url?: string }
 interface GithubLabel { readonly name?: string }
 
@@ -193,21 +199,21 @@ export class GithubProvider implements Provider {
   async listTree(ref: RepoRef, query: { ref?: string; path: string; recursive: boolean }, call: Call) {
     const at = query.ref ?? (await this.repoInfo(ref, call)).defaultBranch
     const max = call.limits.maxTreeEntries
-    if (query.recursive) {
-      const treeish = query.path === '' ? at : `${at}:${query.path}`
-      const { data } = await this.octokit.rest.git.getTree({ ...split(ref.path), tree_sha: treeish, recursive: 'true', request: { signal: call.signal } })
-      const prefix = query.path === '' ? '' : `${query.path}/`
-      const entries: TreeEntry[] = data.tree.map(entry => ({
-        path: `${prefix}${entry.path ?? ''}`,
-        type: entry.type === 'tree' ? 'dir' : entry.type === 'commit' ? 'submodule' : entry.mode === '120000' ? 'symlink' : 'file',
-        ...entry.size === undefined ? {} : { size: entry.size },
-      }))
-      return { ref: at, entries: entries.slice(0, max), truncated: data.truncated || entries.length > max }
-    }
-    const { data } = await this.octokit.rest.repos.getContent({ ...split(ref.path), path: query.path, ref: at, request: { signal: call.signal } })
-    if (!Array.isArray(data)) throw new RepoError('invalid', `${query.path} 是文件，不是目录；读取文件请用 readFile`)
-    const entries: TreeEntry[] = data.map(entry => ({ path: entry.path, type: entry.type === 'submodule' ? 'submodule' : entry.type, size: entry.size }))
-    return { ref: at, entries: entries.slice(0, max), truncated: entries.length > max }
+    // The Trees API reports its own truncation; the Contents API silently stops at 1,000 entries.
+    const treeish = query.path === '' ? at : `${at}:${query.path}`
+    const { data } = await this.octokit.rest.git.getTree({
+      ...split(ref.path),
+      tree_sha: treeish,
+      ...query.recursive ? { recursive: 'true' } : {},
+      request: { signal: call.signal },
+    })
+    const prefix = query.path === '' ? '' : `${query.path}/`
+    const entries: TreeEntry[] = data.tree.map(entry => ({
+      path: `${prefix}${entry.path ?? ''}`,
+      type: entry.type === 'tree' ? 'dir' : entry.type === 'commit' ? 'submodule' : entry.mode === '120000' ? 'symlink' : 'file',
+      ...entry.size === undefined ? {} : { size: entry.size },
+    }))
+    return { ref: at, entries: entries.slice(0, max), truncated: data.truncated || entries.length > max }
   }
 
   async readFile(ref: RepoRef, path: string, at: string | undefined, call: Call) {
@@ -360,12 +366,12 @@ export class GithubProvider implements Provider {
     const { data: change } = await this.octokit.rest.pulls.get({ ...repo, pull_number: number, request: { signal } })
     const sha = change.head.sha
     const [runs, statuses] = await Promise.all([
-      this.octokit.rest.checks.listForRef({ ...repo, ref: sha, per_page: 100, request: { signal } }),
-      this.octokit.rest.repos.getCombinedStatusForRef({ ...repo, ref: sha, per_page: 100, request: { signal } }),
+      this.allPages(page => this.octokit.rest.checks.listForRef({ ...repo, ref: sha, per_page: PAGE, page, request: { signal } }).then(response => response.data.check_runs)),
+      this.allPages(page => this.octokit.rest.repos.getCombinedStatusForRef({ ...repo, ref: sha, per_page: PAGE, page, request: { signal } }).then(response => response.data.statuses)),
     ])
     const checks: CheckInfo[] = [
-      ...runs.data.check_runs.map(run => ({ name: run.name, state: checkRunState(run.status, run.conclusion), ...run.html_url === null ? {} : { webUrl: run.html_url } })),
-      ...statuses.data.statuses.map(status => ({
+      ...runs.map(run => ({ name: run.name, state: checkRunState(run.status, run.conclusion), ...run.html_url === null ? {} : { webUrl: run.html_url } })),
+      ...statuses.map(status => ({
         name: status.context,
         state: status.state === 'success' ? 'success' as const : status.state === 'pending' ? 'pending' as const : 'failure' as const,
         ...status.target_url === null ? {} : { webUrl: status.target_url },
@@ -434,6 +440,17 @@ export class GithubProvider implements Provider {
       request: { signal: call.signal },
     })
     return { sha: data.sha }
+  }
+
+  /** Every page of a list endpoint, so an aggregate never rests on a partial list. */
+  private async allPages<T>(read: (page: number) => Promise<readonly T[]>): Promise<T[]> {
+    const items: T[] = []
+    for (let page = 1; page <= MAX_STATUS_PAGES; page += 1) {
+      const batch = await read(page)
+      items.push(...batch)
+      if (batch.length < PAGE) return items
+    }
+    throw new RepoError('too-large', `CI 检查超过 ${MAX_STATUS_PAGES * PAGE} 条，无法给出完整状态`)
   }
 
   private async comments(ref: RepoRef, number: number, call: Call): Promise<CommentInfo[]> {
