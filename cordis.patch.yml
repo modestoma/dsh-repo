@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-repo
+      name: '@modesto_ma/dsh-repo'
