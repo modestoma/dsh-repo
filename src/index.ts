@@ -10,7 +10,7 @@
  * @module dsh-repo
  */
 
-import { hostsFile, mirrorDir, resolveConfig } from './config.ts'
+import { defaultMirrorDir, hostsFile, resolveConfig } from './config.ts'
 import type { HostApproval, HostContext } from './host.ts'
 import { HostStore } from './hosts.ts'
 import { runGit } from './mirror/git.ts'
@@ -23,7 +23,7 @@ import { createTools } from './tools.ts'
 
 export type * from './contract.ts'
 export type { HostSpec, RepoConfig, RepoLimits } from './config.ts'
-export { apiBaseUrl, hostsFile, mirrorDir, normalizeHostUrl, pluginConfigSchema, resolveConfig } from './config.ts'
+export { apiBaseUrl, defaultMirrorDir, hostsFile, normalizeHostUrl, pluginConfigSchema, resolveConfig } from './config.ts'
 export { RepoError, toRepoError } from './errors.ts'
 export { HostStore, addedTokenRef, isAcceptedToken } from './hosts.ts'
 export { GitError, credentialEnvironment, runGit } from './mirror/git.ts'
@@ -36,8 +36,10 @@ export { GitlabProvider } from './providers/gitlab.ts'
 export type { Provider } from './providers/types.ts'
 export { hostOf, matchesPattern, resolveTarget } from './target.ts'
 export { createTools } from './tools.ts'
-export { HOST_TOKEN_ROUTE, HOSTS_ROUTE, STATE_ROUTE } from './settings/contract.ts'
-export type { HostAddRequest, MutationError, MutationOk, SettingsState } from './settings/contract.ts'
+export { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, STATE_ROUTE } from './settings/contract.ts'
+export type { HostAddRequest, MutationError, MutationOk, PickedDirectory, SettingsState } from './settings/contract.ts'
+export { hostDirectoryPicker } from './settings/directory-picker.ts'
+export type { DirectoryPicker } from './settings/directory-picker.ts'
 export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes, settingsState } from './settings/routes.ts'
 export type { Declined, ToolDeps } from './tools.ts'
 
@@ -75,7 +77,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   const hosts = new HostStore(resolved.hosts, hostsFile(resolved, env))
   const mirrors = new MirrorStore({
     git: options.git ?? runGit,
-    root: mirrorDir(resolved, env),
+    root: hosts.mirrorDir() ?? defaultMirrorDir(env),
     timeoutMs: resolved.mirror.gitTimeoutMs,
     maxFileBytes: resolved.limits.maxFileBytes,
     maxTreeEntries: resolved.limits.maxTreeEntries,
@@ -84,6 +86,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     credentials: ctx.credentials,
     hosts,
     mirrors,
+    defaultMirrorDir: defaultMirrorDir(env),
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
     ...options.providerFactory === undefined ? {} : { factory: options.providerFactory },
   })

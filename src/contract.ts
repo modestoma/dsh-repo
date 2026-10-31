@@ -402,18 +402,29 @@ export interface HostCreate {
   readonly token?: string
 }
 
-/** One successful host change reported to {@link DshRepoService.onHostsChange}. */
-export interface HostsChange {
-  /** `added` and `removed` change the host list; `token` stored or removed a host's token. */
-  readonly kind: 'added' | 'removed' | 'token'
-  /** Normalized address of the host. */
-  readonly url: string
-}
+/**
+ * One successful change reported to {@link DshRepoService.onHostsChange}:
+ * `added` and `removed` change the host list, `token` stored or removed a
+ * host's token, `mirror` moved the mirror directory.
+ */
+export type HostsChange =
+  | {
+    readonly kind: 'added' | 'removed' | 'token'
+    /** Normalized address of the host. */
+    readonly url: string
+  }
+  | {
+    readonly kind: 'mirror'
+    /** The new mirror directory. */
+    readonly dir: string
+  }
 
 /** Where local mirrors live. */
 export interface MirrorSettings {
   /** Absolute directory holding the mirrors; snapshots live under its `.snapshots/`. */
   readonly dir: string
+  /** The directory used while none is chosen: `$DSH_HOME/dsh-repo/mirrors`. */
+  readonly defaultDir: string
 }
 
 /** Options of {@link DshRepoService.syncMirror}. */
@@ -533,8 +544,8 @@ export interface DshRepoService {
    */
   setHostToken(url: string, token: string | undefined): Promise<HostInfo>
   /**
-   * Observe host changes made through {@link addHost}, {@link removeHost}, and
-   * {@link setHostToken}, whoever made them. The listener runs after the change
+   * Observe changes made through {@link addHost}, {@link removeHost},
+   * {@link setHostToken}, and {@link setMirrorDir}, whoever made them. The listener runs after the change
    * succeeded; a throwing listener does not affect the change or other listeners.
    * @param listener - receives the change.
    * @returns disposer that stops the observation.
@@ -543,6 +554,15 @@ export interface DshRepoService {
 
   /** @returns where mirrors live. */
   mirrorSettings(): MirrorSettings
+  /**
+   * Choose the mirror directory, or return to the default with undefined. The
+   * choice is kept with the added hosts. Existing mirrors are not moved: later
+   * syncs clone into the new directory, and held snapshots stay valid.
+   * @param dir - absolute directory (`~` expands to the home directory); created when missing.
+   * @returns the new settings.
+   * @throws `invalid` for a relative path or one that cannot be created or written, `unavailable` when the choice cannot be saved.
+   */
+  setMirrorDir(dir: string | undefined): Promise<MirrorSettings>
   /**
    * Clone the address as a fetch-only mirror, or fetch it, and resolve the
    * branch head. Calls for the same mirror run one at a time. HTTPS addresses

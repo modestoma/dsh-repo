@@ -76,7 +76,7 @@ describe('hosts', () => {
     const { service, errors } = setup()
     const seen: string[] = []
     service.onHostsChange(() => { throw new Error('boom') })
-    const stop = service.onHostsChange((change) => { seen.push(`${change.kind} ${change.url}`) })
+    const stop = service.onHostsChange((change) => { seen.push(`${change.kind} ${change.kind === 'mirror' ? change.dir : change.url}`) })
     await service.addHost({ url: 'https://git.example.com', token: 'abc' })
     await service.setHostToken('https://git.example.com', undefined)
     await expect(service.setHostToken('https://git.example.com', 'bad\ntoken')).rejects.toMatchObject({ code: 'invalid' })

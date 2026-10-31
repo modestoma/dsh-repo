@@ -64,8 +64,6 @@ const limitsSchema = z.object({
 })
 
 const mirrorSchema = z.object({
-  /** Directory holding the mirrors (`~` expands to the home directory); default `$DSH_HOME/dsh-repo/mirrors`. */
-  dir: z.string().trim().min(1, '镜像目录不能为空').optional(),
   /** Timeout of one git command (clone, fetch, worktree). */
   gitTimeoutMs: z.number().int().min(1000).max(MAX_TIMER_DELAY_MS).default(10 * 60 * 1000),
   /** Whether addresses on hosts outside `hosts` may be mirrored with the machine's own git credentials. */
@@ -165,13 +163,12 @@ export function expandHome(path: string): string {
 }
 
 /**
- * The mirror directory a configuration implies.
- * @param config - validated configuration.
+ * The mirror directory used until one is chosen at run time.
  * @param env - process environment.
- * @returns absolute directory.
+ * @returns `$DSH_HOME/dsh-repo/mirrors`.
  */
-export function mirrorDir(config: RepoConfig, env: NodeJS.ProcessEnv = process.env): string {
-  return config.mirror.dir === undefined ? join(resolveDshHome(env), 'dsh-repo', 'mirrors') : expandHome(config.mirror.dir)
+export function defaultMirrorDir(env: NodeJS.ProcessEnv = process.env): string {
+  return join(resolveDshHome(env), 'dsh-repo', 'mirrors')
 }
 
 /**
