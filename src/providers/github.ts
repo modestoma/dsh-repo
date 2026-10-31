@@ -175,6 +175,19 @@ export class GithubProvider implements Provider {
     return { items, ...nextPage(query, data.length) }
   }
 
+  async getBranch(ref: RepoRef, name: string, call: Call) {
+    const [branch, info] = await Promise.all([
+      this.octokit.rest.repos.getBranch({ ...split(ref.path), branch: name, request: { signal: call.signal } }).catch((error: unknown) => {
+        if ((error as { status?: number }).status === 404) return undefined
+        throw error
+      }),
+      this.repoInfo(ref, call),
+    ])
+    // GitHub answers a renamed branch with the branch it was renamed to.
+    if (branch === undefined || branch.data.name !== name) return undefined
+    return { name, commit: branch.data.commit.sha, protected: branch.data.protected, default: name === info.defaultBranch }
+  }
+
   async listCommits(ref: RepoRef, query: { page: number; perPage: number; ref?: string; path?: string }, call: Call) {
     const { data } = await this.octokit.rest.repos.listCommits({
       ...split(ref.path),
@@ -231,7 +244,7 @@ export class GithubProvider implements Provider {
     return { path, ref: target, binary: false, ...truncateBytes(raw, call.limits.maxFileBytes) }
   }
 
-  async commitFiles(ref: RepoRef, request: { branch: string; base?: string; message: string; files: readonly ({ action: 'write'; path: string; content: string } | { action: 'delete'; path: string })[] }, call: Call) {
+  async commitFiles(ref: RepoRef, request: { branch: string; base?: string; baseSha?: string; newBranch?: boolean; author?: { name: string; email: string }; message: string; files: readonly ({ action: 'write'; path: string; content: string } | { action: 'delete'; path: string })[] }, call: Call) {
     const repo = split(ref.path)
     const signal = call.signal
     const info = await this.repoInfo(ref, call)
@@ -240,8 +253,10 @@ export class GithubProvider implements Provider {
       if ((error as { status?: number }).status === 404) return undefined
       throw error
     })
+    if (existing !== undefined && request.newBranch === true) throw new RepoError('conflict', `分支 ${request.branch} 已存在`)
     if (existing?.data.protected === true) throw new RepoError('forbidden', `分支 ${request.branch} 受保护，不能直接提交`)
     const parent = existing?.data.commit.sha
+      ?? request.baseSha
       ?? (await this.octokit.rest.repos.getBranch({ ...repo, branch: request.base ?? info.defaultBranch, request: { signal } })).data.commit.sha
     const { data: parentCommit } = await this.octokit.rest.git.getCommit({ ...repo, commit_sha: parent, request: { signal } })
     // Keep the executable bit of files that already exist; refuse to replace links and directories.
@@ -266,9 +281,13 @@ export class GithubProvider implements Provider {
         : { path: file.path, mode: '100644' as const, type: 'blob' as const, sha: null }),
       request: { signal },
     })
-    const { data: commit } = await this.octokit.rest.git.createCommit({ ...repo, message: request.message, tree: tree.sha, parents: [parent], request: { signal } })
+    const { data: commit } = await this.octokit.rest.git.createCommit({ ...repo, message: request.message, tree: tree.sha, parents: [parent], ...request.author === undefined ? {} : { author: request.author }, request: { signal } })
     if (existing === undefined) {
-      await this.octokit.rest.git.createRef({ ...repo, ref: `refs/heads/${request.branch}`, sha: commit.sha, request: { signal } })
+      await this.octokit.rest.git.createRef({ ...repo, ref: `refs/heads/${request.branch}`, sha: commit.sha, request: { signal } }).catch((error: unknown) => {
+        // Another writer created the branch after the lookup above.
+        if ((error as { status?: number }).status === 422) throw new RepoError('conflict', `分支 ${request.branch} 已存在`)
+        throw error
+      })
     } else {
       await this.octokit.rest.git.updateRef({ ...repo, ref: `heads/${request.branch}`, sha: commit.sha, force: false, request: { signal } })
     }

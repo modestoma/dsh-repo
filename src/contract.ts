@@ -167,12 +167,24 @@ export type FileChange =
   | { readonly action: 'write'; readonly path: string; readonly content: string }
   | { readonly action: 'delete'; readonly path: string }
 
+/** Name and email recorded as a commit's author. */
+export interface CommitAuthor {
+  readonly name: string
+  readonly email: string
+}
+
 /** A multi-file commit. */
 export interface CommitRequest extends CallOptions {
   /** Target branch; created from {@link base} when it does not exist. Never the default or a protected branch. */
   readonly branch: string
-  /** Start point of a new branch; default: the repository's default branch. Ignored when the branch exists. */
+  /** Start branch of a new branch; default: the repository's default branch. Ignored when the branch exists. Not with {@link baseSha}. */
   readonly base?: string
+  /** Start commit of a new branch, as a full hexadecimal object id. Ignored when the branch exists. Not with {@link base}. */
+  readonly baseSha?: string
+  /** When true, the call fails with `conflict` instead of committing on top of a branch that already exists. */
+  readonly newBranch?: boolean
+  /** Commit author; default: the token's user. The committer is always the token's user. */
+  readonly author?: CommitAuthor
   readonly message: string
   readonly files: readonly FileChange[]
 }
@@ -365,6 +377,8 @@ export interface DshRepoService {
   repoInfo(repo: RepoTarget, options?: CallOptions): Promise<RepoInfo>
   /** @returns one page of branches. */
   listBranches(repo: RepoTarget, options?: PageOptions & { readonly search?: string }): Promise<Page<BranchInfo>>
+  /** @returns the branch, or undefined when the repository has no branch of that name. */
+  getBranch(repo: RepoTarget, name: string, options?: CallOptions): Promise<BranchInfo | undefined>
   /** @returns one page of commits, newest first. */
   listCommits(repo: RepoTarget, options?: PageOptions & { readonly ref?: string; readonly path?: string }): Promise<Page<CommitInfo>>
   /** @returns entries below `path` (default: root) at `ref` (default: the default branch). */
