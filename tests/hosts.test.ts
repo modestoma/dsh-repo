@@ -12,12 +12,14 @@ function setup(tokens: Record<string, string> = {}) {
   const config = testConfig()
   const store = credentials(tokens)
   const hosts = new HostStore(config.hosts, join(root, 'hosts.json'))
+  const errors: unknown[] = []
   const service = new RepoService(config, {
     credentials: store,
+    logger: { error: (_message, ...args) => { errors.push(...args) } },
     hosts,
     mirrors: new MirrorStore({ git: async () => '', root: join(root, 'mirrors'), timeoutMs: 1000, maxFileBytes: 10, maxTreeEntries: 10 }),
   })
-  return { root, store, service }
+  return { root, store, service, errors }
 }
 
 describe('hosts', () => {
@@ -68,5 +70,20 @@ describe('hosts', () => {
     await service.removeHost('https://git.example.com')
     expect(store.values[added.tokenRef]).toBeUndefined()
     expect(() => service.resolve('git.example.com/team/app')).toThrow(/没有为 git.example.com 配置主机/)
+  })
+
+  it('reports successful host changes to every listener and contains throwing ones', async () => {
+    const { service, errors } = setup()
+    const seen: string[] = []
+    service.onHostsChange(() => { throw new Error('boom') })
+    const stop = service.onHostsChange((change) => { seen.push(`${change.kind} ${change.url}`) })
+    await service.addHost({ url: 'https://git.example.com', token: 'abc' })
+    await service.setHostToken('https://git.example.com', undefined)
+    await expect(service.setHostToken('https://git.example.com', 'bad\ntoken')).rejects.toMatchObject({ code: 'invalid' })
+    await service.removeHost('https://git.example.com')
+    stop()
+    await service.addHost({ url: 'https://other.example.com' })
+    expect(seen).toEqual(['added https://git.example.com', 'token https://git.example.com', 'removed https://git.example.com'])
+    expect(errors).toEqual(['boom', 'boom', 'boom', 'boom'])
   })
 })
