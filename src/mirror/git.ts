@@ -94,7 +94,7 @@ export const runGit: GitRunner = (args, options) => new Promise((resolve, reject
       return
     }
     const stderr = Buffer.concat(err).toString('utf8').trim()
-    const output = stderr === '' ? stdout.trim() : stderr
+    const output = [stderr, stdout.trim()].filter(part => part !== '').join('\n')
     reject(new GitError(args, stopped === undefined ? output || `退出码 ${String(code)}` : `${stopped}${output === '' ? '' : `：${output}`}`))
   })
 })

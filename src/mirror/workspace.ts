@@ -261,11 +261,13 @@ export class WorkspaceStore {
       const ref = `refs/heads/${branch}`
       const lease = first ? [`--force-with-lease=${ref}:`] : []
       try {
-        await this.workspaceGit(ws, ['push', '--quiet', '--no-verify', ...lease, 'origin', `HEAD:${ref}`], request.env, request.signal)
+        const report = await this.workspaceGit(ws, ['push', '--porcelain', '--no-verify', ...lease, 'origin', `HEAD:${ref}`], request.env, request.signal)
+        // A lease does not reject a remote branch that already points at HEAD; git reports it as up to date (`=`).
+        if (first && report.split('\n').some(line => line.startsWith('=\t'))) throw new RepoError('conflict', `远端分支 ${branch} 已存在，没有推送`)
       } catch (error) {
         // Undo this call's commit so a retry records the changes with its own message.
         if (committed) await this.workspaceGit(ws, ['reset', '--quiet', '--soft', 'HEAD^'], {})
-        throw pushFailure(error, branch)
+        throw error instanceof RepoError ? error : pushFailure(error, branch)
       }
       if (first) await this.git(['config', `${SECTION}.${ws.id}.branch`, branch], ws.mirror)
       return { url: ws.url, branch, baseBranch: ws.baseBranch, commit: head, committed, created: first }

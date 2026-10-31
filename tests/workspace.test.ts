@@ -119,6 +119,21 @@ describe('workspaces', () => {
     await expect(service.pushWorkspace(dir, { message: 'mine', author: BOT })).rejects.toMatchObject({ code: 'conflict' })
   })
 
+  it('refuses a first push to an existing branch that already holds the same commit', async () => {
+    const { bare } = origin()
+    const { sandbox, service } = setup()
+    const one = join(sandbox, 'one')
+    const two = join(sandbox, 'two')
+    await service.openWorkspace(bare, { dir: one })
+    await service.openWorkspace(bare, { dir: two })
+    writeFileSync(join(one, 'app.ts'), 'same\n')
+    const pushed = await service.pushWorkspace(one, { branch: 'topic', message: 'same', author: BOT })
+    git(two, 'fetch', '--quiet', 'origin', pushed.commit)
+    git(two, 'reset', '--quiet', '--hard', pushed.commit)
+    await expect(service.pushWorkspace(two, { branch: 'topic', author: BOT })).rejects.toMatchObject({ code: 'conflict' })
+    expect((await service.workspaceChanges(two)).workspace.branch).toBeUndefined()
+  })
+
   it('refuses the remote default branch on the first push', async () => {
     const { bare } = origin()
     const { sandbox, service } = setup()
