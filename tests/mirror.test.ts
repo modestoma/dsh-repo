@@ -48,6 +48,8 @@ describe('mirror addresses', () => {
     expect(mirrorPath('https://code.example.com:8443/gitlab/team/app.git')).toBe('code.example.com_8443/gitlab/team/app')
     expect(mirrorPath('git@github.com:modestoma/dsh-repo.git')).toBe('github.com/modestoma/dsh-repo')
     expect(mirrorPath('/srv/repos/app.git')).toMatch(/^local\/app-[0-9a-f]{8}$/)
+    expect(mirrorPath('https://github.com/team/.github.git')).toMatch(/^github\.com\/team\/github-[0-9a-f]{6}$/)
+    expect(mirrorPath('https://github.com/team/github.git')).toBe('github.com/team/github')
   })
 
   it('hands the token of a configured host to HTTPS network commands only', async () => {
@@ -115,6 +117,31 @@ describe('mirror store', () => {
     b.release()
     await new Promise(resolve => setTimeout(resolve, 200))
     expect(existsSync(a.dir)).toBe(false)
+  })
+
+  it('keeps a lease taken before the first sync of this process, and follows a changed default branch', async () => {
+    const repo = origin()
+    const config = testConfig()
+    const root = mkdtempSync(join(tmpdir(), 'dsh-repo-restart-'))
+    const make = () => new RepoService(config, {
+      credentials: credentials({}),
+      hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
+      mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 64, maxTreeEntries: 10 }),
+    })
+    const leftover = await make().acquireSnapshot(repo.dir, (await make().syncMirror(repo.dir)).commit)
+    const restarted = make()
+    const lease = await restarted.acquireSnapshot(repo.dir, repo.commit)
+    expect(existsSync(leftover.dir)).toBe(false)
+    expect(existsSync(join(lease.dir, 'README.md'))).toBe(true)
+    await restarted.syncMirror(repo.dir)
+    expect(existsSync(join(lease.dir, 'README.md'))).toBe(true)
+
+    git(repo.dir, 'checkout', '--quiet', '-b', 'next')
+    writeFileSync(join(repo.dir, 'NEXT.md'), 'next\n')
+    git(repo.dir, 'add', '.')
+    git(repo.dir, 'commit', '--quiet', '-m', 'next')
+    expect(await restarted.syncMirror(repo.dir)).toMatchObject({ branch: 'next', commit: git(repo.dir, 'rev-parse', 'HEAD') })
+    lease.release()
   })
 
   it('reports a missing branch, an unsynced mirror, and a large file', async () => {

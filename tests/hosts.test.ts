@@ -43,6 +43,19 @@ describe('hosts', () => {
     await expect(service.addHost({ url: 'https://other.example.com', token: 'a\nb' })).rejects.toMatchObject({ code: 'invalid' })
   })
 
+  it('keeps every host when additions and removals overlap', async () => {
+    const { root, service } = setup()
+    await service.addHost({ url: 'https://old.example.com' })
+    await Promise.all([
+      service.addHost({ url: 'https://a.example.com' }),
+      service.addHost({ url: 'https://b.example.com' }),
+      service.removeHost('https://old.example.com'),
+      service.addHost({ url: 'https://c.example.com' }),
+    ])
+    const stored = JSON.parse(readFileSync(join(root, 'hosts.json'), 'utf8')) as { hosts: { url: string }[] }
+    expect(stored.hosts.map(host => host.url)).toEqual(['https://a.example.com', 'https://b.example.com', 'https://c.example.com'])
+  })
+
   it('sets and clears tokens, and removes only added hosts', async () => {
     const { store, service } = setup()
     const added = await service.addHost({ url: 'https://git.example.com' })

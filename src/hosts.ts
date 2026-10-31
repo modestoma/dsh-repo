@@ -6,7 +6,7 @@
  * @module dsh-repo/hosts
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
@@ -43,6 +43,8 @@ export function addedTokenRef(url: string): string {
 /** Configured and added hosts. */
 export class HostStore {
   private added: HostSpec[]
+  /** Tail of the queue that runs additions and removals one at a time. */
+  private queue: Promise<unknown> = Promise.resolve()
 
   /**
    * Read the added hosts. A missing file means none.
@@ -106,7 +108,11 @@ export class HostStore {
    * @returns the stored host.
    * @throws {RepoError} `invalid` for a bad address or alias, `conflict` when the address is taken, `unavailable` when the file cannot be written.
    */
-  async add(create: HostCreate): Promise<HostSpec> {
+  add(create: HostCreate): Promise<HostSpec> {
+    return this.enqueue(() => this.addNow(create))
+  }
+
+  private async addNow(create: HostCreate): Promise<HostSpec> {
     const url = normalizeHostUrl(create.url.trim())
     if (url === undefined) throw new RepoError('invalid', `主机地址不合法：${create.url}（填 https://主机[:端口][/路径]，不含用户名、查询参数或片段）`)
     const alias = create.alias?.trim()
@@ -123,17 +129,29 @@ export class HostStore {
    * @returns the removed host.
    * @throws {RepoError} `not-found`, `forbidden` for a configured host, `unavailable` when the file cannot be written.
    */
-  async remove(url: string): Promise<HostSpec> {
+  remove(url: string): Promise<HostSpec> {
+    return this.enqueue(() => this.removeNow(url))
+  }
+
+  private async removeNow(url: string): Promise<HostSpec> {
     const host = this.find(url)
     if (!this.isAdded(host.url)) throw new RepoError('forbidden', `${host.url} 配置在 cordis.yml 中，不能在运行时删除`)
     await this.write(this.added.filter(spec => spec.url !== host.url))
     return host
   }
 
+  /** Run a read-modify-write after every one queued before it. */
+  private enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(task)
+    // The queue only orders work; callers observe the failure through `run`.
+    this.queue = run.then(() => undefined, () => undefined)
+    return run
+  }
+
   private async write(hosts: HostSpec[]): Promise<void> {
     try {
       await mkdir(dirname(this.file), { recursive: true })
-      const temporary = `${this.file}.${process.pid}.${Date.now()}.tmp`
+      const temporary = `${this.file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
       await writeFile(temporary, `${JSON.stringify({ hosts }, undefined, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
       await rename(temporary, this.file)
     } catch (error) {

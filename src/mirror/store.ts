@@ -61,10 +61,20 @@ export function isAcceptedGitUrl(value: string): boolean {
   }
 }
 
+/**
+ * Directory-safe path segments. A segment that sanitizing changes (a leading
+ * dot, other characters) gets a hash of the original appended, so distinct
+ * names such as `.github` and `github` keep distinct directories.
+ */
 function cleanSegments(path: string): string[] {
   const segments = path.replace(/[?#].*$/, '').split(/[/\\]+/)
-    .map(segment => segment.replace(/\.git$/, '').replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+/, ''))
-    .filter(segment => segment !== '')
+    .map(segment => segment.replace(/\.git$/, ''))
+    .filter(segment => segment !== '' && segment !== '.')
+    .map((segment) => {
+      const clean = segment.replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+/, '')
+      if (clean === segment) return segment
+      return `${clean === '' ? 'x' : clean}-${createHash('sha1').update(segment).digest('hex').slice(0, 6)}`
+    })
   return segments.length === 0 ? ['repo'] : segments
 }
 
@@ -139,8 +149,8 @@ export class MirrorStore {
   private readonly mirrors = new Map<string, Mirror>()
   private readonly syncLocks = new Map<string, Promise<void>>()
   private readonly worktreeLocks = new Map<string, Promise<void>>()
-  /** Mirrors whose leftover snapshots were already deleted in this process. */
-  private readonly cleared = new Set<string>()
+  /** Per mirror, the one-time deletion of snapshots an earlier run left behind. */
+  private readonly cleared = new Map<string, Promise<void>>()
 
   /** @param deps - git runner, root, timeout, and limits. */
   constructor(private readonly deps: MirrorStoreDeps) {}
@@ -258,6 +268,7 @@ export class MirrorStore {
    */
   async acquire(url: string, commit: string, signal?: AbortSignal): Promise<SnapshotLease> {
     const dir = await this.existing(url, commit, signal)
+    await this.clearLeftovers(dir)
     const mirror = this.mirror(dir)
     const snapshot = this.snapshotFor(dir, mirror, commit)
     snapshot.users += 1
@@ -309,11 +320,7 @@ export class MirrorStore {
   }
 
   private async update(url: string, dir: string, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<void> {
-    const firstVisit = !this.cleared.has(dir)
-    if (firstVisit) {
-      this.cleared.add(dir)
-      await rm(this.snapshotRoot(dir), { recursive: true, force: true })
-    }
+    await this.clearLeftovers(dir)
     const kind = await pathKind(dir)
     if (kind === 'missing') {
       await mkdir(dirname(dir), { recursive: true })
@@ -337,18 +344,31 @@ export class MirrorStore {
     const origin = (await this.git(['remote', 'get-url', 'origin'], dir, {}, signal)).trim()
     if (origin !== url) await this.git(['remote', 'set-url', 'origin', url], dir, {}, signal)
     await this.git(['fetch', '--quiet', '--prune', 'origin'], dir, env, signal)
-    if (firstVisit) await this.git(['worktree', 'prune'], dir, {}, signal)
   }
 
-  private async remoteHead(dir: string, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string> {
-    const read = async (): Promise<string> => (await this.git(['symbolic-ref', 'refs/remotes/origin/HEAD'], dir, {}, signal)).trim().replace(/^refs\/remotes\/origin\//, '')
-    try {
-      return await read()
-    } catch (error) {
-      if (!(error instanceof GitError)) throw error
-      await this.git(['remote', 'set-head', 'origin', '--auto'], dir, env, signal)
-      return await read()
+  /**
+   * Delete, once per mirror and process, the snapshots an earlier run left
+   * behind, before this process creates any snapshot of that mirror, so a
+   * lease taken in this process is never deleted by the cleanup.
+   */
+  private clearLeftovers(dir: string): Promise<void> {
+    let cleared = this.cleared.get(dir)
+    if (cleared === undefined) {
+      cleared = serialize(this.worktreeLocks, dir, async () => {
+        await rm(this.snapshotRoot(dir), { recursive: true, force: true })
+        if (await pathKind(join(dir, '.git')) !== 'missing') await this.git(['worktree', 'prune'], dir, {})
+      })
+      // A failed cleanup is retried by the next caller.
+      cleared.catch(() => { this.cleared.delete(dir) })
+      this.cleared.set(dir, cleared)
     }
+    return cleared
+  }
+
+  /** The remote's current default branch, asked from the remote on every call so a changed default is followed. */
+  private async remoteHead(dir: string, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string> {
+    await this.git(['remote', 'set-head', 'origin', '--auto'], dir, env, signal)
+    return (await this.git(['symbolic-ref', 'refs/remotes/origin/HEAD'], dir, {}, signal)).trim().replace(/^refs\/remotes\/origin\//, '')
   }
 
   private snapshotFor(dir: string, mirror: Mirror, commit: string): Snapshot {
