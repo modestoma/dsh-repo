@@ -1,0 +1,144 @@
+/**
+ * Hosts: the ones configured in cordis.yml plus the ones added at run time,
+ * which are kept in a JSON file (written to a temporary file, then renamed)
+ * and carry tokens under generated credential references.
+ *
+ * @module dsh-repo/hosts
+ */
+
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { mkdir, rename, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
+import { z } from 'zod'
+import type { HostCreate } from './contract.ts'
+import { hostSpecSchema, normalizeHostUrl } from './config.ts'
+import type { HostSpec } from './config.ts'
+import { RepoError } from './errors.ts'
+
+/** Longest accepted token; personal access tokens are far shorter. */
+export const MAX_TOKEN_LENGTH = 4096
+
+const fileSchema = z.object({ hosts: z.array(hostSpecSchema) }).strict()
+
+/**
+ * Whether a token value can be handed to an SDK and to git: non-empty,
+ * bounded, and free of control characters.
+ * @param value - candidate token.
+ * @returns whether it is accepted.
+ */
+export function isAcceptedToken(value: string): boolean {
+  return value.length > 0 && value.length <= MAX_TOKEN_LENGTH && !/[\u0000-\u001f\u007f]/.test(value)
+}
+
+/**
+ * Credential reference of an added host, derived from its address.
+ * @param url - normalized host address.
+ * @returns `DSH_REPO_HOST_<hash>`.
+ */
+export function addedTokenRef(url: string): string {
+  return `DSH_REPO_HOST_${createHash('sha1').update(url).digest('hex').slice(0, 12).toUpperCase()}`
+}
+
+/** Configured and added hosts. */
+export class HostStore {
+  private added: HostSpec[]
+
+  /**
+   * Read the added hosts. A missing file means none.
+   * @param configured - hosts from cordis.yml.
+   * @param file - absolute path of the added-hosts file.
+   * @throws when the file exists but cannot be read or is invalid.
+   */
+  constructor(private readonly configured: readonly HostSpec[], readonly file: string) {
+    this.added = HostStore.read(file).filter(host => !configured.some(spec => spec.url === host.url))
+  }
+
+  private static read(file: string): HostSpec[] {
+    let text: string
+    try {
+      text = readFileSync(file, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+      throw new Error(`dsh-repo 无法读取主机文件 ${file}：${(error as Error).message}`)
+    }
+    let raw: unknown
+    try {
+      raw = JSON.parse(text)
+    } catch (error) {
+      throw new Error(`dsh-repo 主机文件 ${file} 不是合法 JSON：${(error as Error).message}`)
+    }
+    const parsed = fileSchema.safeParse(raw)
+    if (!parsed.success) throw new Error(`dsh-repo 主机文件 ${file} 内容不合法：${parsed.error.issues.map(issue => `${issue.path.join('.')}：${issue.message}`).join('；')}`)
+    return parsed.data.hosts
+  }
+
+  /** @returns every host, configured ones first. */
+  all(): readonly HostSpec[] {
+    return [...this.configured, ...this.added]
+  }
+
+  /**
+   * Whether a host was added at run time.
+   * @param url - normalized host address.
+   * @returns whether it is an added host.
+   */
+  isAdded(url: string): boolean {
+    return this.added.some(host => host.url === url)
+  }
+
+  /**
+   * The host with an address, after normalizing it.
+   * @param url - host address.
+   * @returns the host.
+   * @throws {RepoError} `not-found` when no host has that address.
+   */
+  find(url: string): HostSpec {
+    const normalized = normalizeHostUrl(url.trim()) ?? url
+    const host = this.all().find(spec => spec.url === normalized)
+    if (host === undefined) throw new RepoError('not-found', `没有地址为 ${url} 的主机`)
+    return host
+  }
+
+  /**
+   * Add and persist a host.
+   * @param create - kind, address, and alias.
+   * @returns the stored host.
+   * @throws {RepoError} `invalid` for a bad address or alias, `conflict` when the address is taken, `unavailable` when the file cannot be written.
+   */
+  async add(create: HostCreate): Promise<HostSpec> {
+    const url = normalizeHostUrl(create.url.trim())
+    if (url === undefined) throw new RepoError('invalid', `主机地址不合法：${create.url}（填 https://主机[:端口][/路径]，不含用户名、查询参数或片段）`)
+    const alias = create.alias?.trim()
+    if (alias !== undefined && (alias.length > 64 || /[\u0000-\u001f\u007f]/.test(alias))) throw new RepoError('invalid', '别名不能超过 64 个字符或包含控制字符')
+    if (this.all().some(host => host.url === url)) throw new RepoError('conflict', `主机 ${url} 已存在`)
+    const host: HostSpec = { kind: create.kind ?? 'gitlab', url, tokenRef: addedTokenRef(url), ...alias === undefined || alias === '' ? {} : { alias } }
+    await this.write([...this.added, host])
+    return host
+  }
+
+  /**
+   * Remove and persist an added host.
+   * @param url - host address.
+   * @returns the removed host.
+   * @throws {RepoError} `not-found`, `forbidden` for a configured host, `unavailable` when the file cannot be written.
+   */
+  async remove(url: string): Promise<HostSpec> {
+    const host = this.find(url)
+    if (!this.isAdded(host.url)) throw new RepoError('forbidden', `${host.url} 配置在 cordis.yml 中，不能在运行时删除`)
+    await this.write(this.added.filter(spec => spec.url !== host.url))
+    return host
+  }
+
+  private async write(hosts: HostSpec[]): Promise<void> {
+    try {
+      await mkdir(dirname(this.file), { recursive: true })
+      const temporary = `${this.file}.${process.pid}.${Date.now()}.tmp`
+      await writeFile(temporary, `${JSON.stringify({ hosts }, undefined, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+      await rename(temporary, this.file)
+    } catch (error) {
+      throw new RepoError('unavailable', `无法写入主机文件 ${this.file}：${(error as Error).message}`)
+    }
+    this.added = hosts
+  }
+}

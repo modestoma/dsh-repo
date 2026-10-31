@@ -1,12 +1,12 @@
 # dsh-repo
 
-面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的代码仓库插件。它用 GitHub 官方 SDK [Octokit](https://github.com/octokit/rest.js) 和 GitLab 文档推荐的 [GitBeaker](https://github.com/jdalrymple/gitbeaker) 抹平 GitHub 与 GitLab 的差异，对其他插件提供 `dshRepos` 服务，对模型提供代码、issue、PR/MR 工具。
+面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的代码仓库插件。它用 GitHub 官方 SDK [Octokit](https://github.com/octokit/rest.js) 和 GitLab 文档推荐的 [GitBeaker](https://github.com/jdalrymple/gitbeaker) 抹平 GitHub 与 GitLab 的差异，对其他插件提供 `dshRepos` 服务，对模型提供代码、issue、PR/MR 工具；需要本地代码目录的插件可以用它维护仓库的本地镜像和按提交的只读快照。
 
 支持的主机：github.com、GitHub Enterprise Server、gitlab.com、自建 GitLab（包括部署在子路径下的实例）。
 
 ## 项目状态
 
-初版（未发布到 npm）：提供统一接口和模型工具。仓库镜像、只读快照（观象现在自带的 git 能力）计划在后续版本迁入。接口仍可能调整。
+测试版：提供统一接口、模型工具、运行时主机管理和本地镜像。接口仍可能调整。
 
 ## 安装
 
@@ -46,6 +46,11 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
       maxTreeEntries: 1000              # 目录列表的上限，超出截断
       maxCommitFiles: 100               # 一次提交的文件数上限
       maxComments: 50                   # 读取 issue / PR/MR 时附带的评论条数
+    mirror:
+      dir: ~/.dsh/dsh-repo/mirrors      # 本地镜像目录，默认 $DSH_HOME/dsh-repo/mirrors
+      gitTimeoutMs: 600000              # 单条 git 命令（clone、fetch、worktree）的超时
+      otherHosts: true                  # false = 只镜像 hosts 中主机上的仓库
+    hostsFile: ~/.dsh/dsh-repo/hosts.json  # 运行时添加的主机，默认 $DSH_HOME/dsh-repo/hosts.json
     tools:
       enabled: true                     # false = 只提供 dshRepos 服务，不注册模型工具
       writes: ask                       # ask：每次写操作请用户审批；allow：不审批；off：不注册写工具
@@ -53,7 +58,11 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
       signature: ''                     # 非空时追加到模型写的 issue、PR/MR 正文和评论末尾
 ```
 
-配置在加载时校验，不合法时插件加载失败。没有配置任何主机时只提供服务，不注册工具。
+配置在加载时校验，不合法时插件加载失败；`hostsFile` 存在但无法读取或内容不合法时同样加载失败。没有任何主机时模型看不到代码仓库工具，添加主机后立即提供。
+
+### 运行时添加主机
+
+除了 cordis.yml 里的 `hosts`，其他插件（例如设置面板）可以调用 `addHost` 添加主机、`removeHost` 删除、`setHostToken` 保存或清除令牌。添加的主机保存在 `hostsFile`，令牌存入 DSH 凭据库，引用名由地址生成（`DSH_REPO_HOST_<哈希>`）。cordis.yml 中的主机只能改令牌，不能在运行时删除；`listHosts` 列出所有主机及令牌是否已设置，不返回令牌值。
 
 ### 令牌
 
@@ -98,7 +107,15 @@ if (repos?.version === 1) {
 }
 ```
 
-接口覆盖仓库信息、分支、提交、目录、文件、多文件提交、issue 与 PR/MR 的读写和合并，完整定义见 [`src/contract.ts`](src/contract.ts)。多文件提交可以用 `baseSha` 从指定提交建新分支，`newBranch: true` 时分支已存在就以 `conflict` 失败，不会在已有分支上追加提交；`author` 指定提交作者（提交者始终是令牌对应的用户）。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+接口覆盖仓库信息、分支、提交、目录、文件、多文件提交、issue 与 PR/MR 的读写和合并，以及主机管理和本地镜像，完整定义见 [`src/contract.ts`](src/contract.ts)。多文件提交可以用 `baseSha` 从指定提交建新分支，`newBranch: true` 时分支已存在就以 `conflict` 失败，不会在已有分支上追加提交；`author` 指定提交作者（提交者始终是令牌对应的用户）。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+
+## 本地镜像
+
+`syncMirror(url, { branch })` 把仓库拉取为只拉取、不检出的镜像，返回分支最新提交；`readMirrorFile`、`listMirrorTree` 直接从提交的 git 对象读文件和目录；`acquireSnapshot(url, commit)` 返回该提交的只读检出（`git worktree`），同一提交的持有者共用一份，全部 `release()` 且不再是最近一次同步的提交时删除。
+
+- 镜像位于 `<mirror.dir>/<主机>/<路径>`，本地路径位于 `<mirror.dir>/local/`；快照位于 `<mirror.dir>/.snapshots/` 下对应位置。新地址先克隆到临时目录再改名；同一镜像的 clone/fetch 依次执行。进程内第一次同步某个镜像时清理上次运行遗留的快照。
+- 地址可以是 HTTPS/SSH/git/file URL、`user@host:path` 或绝对路径。属于已配置主机的地址受 `repos` 范围限制；其中 HTTPS 地址自动使用该主机的令牌（GitLab 用户名 `oauth2`，GitHub 用户名 `x-access-token`），令牌经只对这次 git 进程生效的凭据助手传入，不出现在命令行、`.git/config` 或输出里。SSH 地址、其他主机和本地路径使用本机已有的 git 凭据（SSH key、凭据助手），`mirror.otherHosts: false` 时拒绝其他主机。
+- 需要本机安装 `git`；git 不会弹出交互式提示，SSH 以 batch 模式运行。
 
 ## GitHub 与 GitLab 的差异处理
 

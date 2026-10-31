@@ -44,9 +44,18 @@ export interface ToolDefinition<V = unknown> {
   isConcurrencySafe?(args: unknown): boolean
 }
 
+/** The step a tool's activation condition is evaluated for. */
+export interface ToolActivationContext {
+  readonly agent: Agent
+  readonly signal: AbortSignal
+}
+
 /** The `ctx.tools` registry slice. */
 export interface ToolRegistry {
-  register<V>(definition: ToolDefinition<V>): () => void
+  register<V>(
+    definition: ToolDefinition<V>,
+    options?: { when?: (context: ToolActivationContext) => boolean | Promise<boolean> },
+  ): () => void
 }
 
 /**
@@ -56,6 +65,16 @@ export interface ToolRegistry {
  */
 export interface HostCredentials {
   resolve(ref: string): Promise<{ readonly value: string; readonly source: string } | undefined>
+  describe(ref: string): Promise<HostCredentialInfo>
+  set(ref: string, value: string): Promise<void>
+  unset(ref: string): Promise<void>
+}
+
+/** Source and writability of one credential reference — never its value. */
+export interface HostCredentialInfo {
+  readonly configured: boolean
+  readonly source?: string
+  readonly writable: boolean
 }
 
 /**

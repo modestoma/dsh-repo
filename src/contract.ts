@@ -12,7 +12,10 @@
  * Every method rejects with an error whose `name` is `RepoError` and whose
  * `code` is a {@link RepoErrorCode}; nothing else is thrown for an expected
  * failure. A repository is addressed by a {@link RepoTarget}; only hosts and
- * repositories the deployment configured are reachable.
+ * repositories the deployment configured are reachable through the host APIs.
+ * Local mirrors ({@link DshRepoService.syncMirror}) also accept addresses on
+ * other hosts unless the deployment turned that off; those use the machine's
+ * own git credentials.
  *
  * @module dsh-repo/contract
  */
@@ -362,6 +365,91 @@ export interface MergeResult {
   readonly sha?: string
 }
 
+/** Whether a credential reference has a value — never the value. */
+export interface TokenStatus {
+  /** Whether resolving the reference currently returns a value. */
+  readonly configured: boolean
+  /** Credential store layer supplying the value (`file`, `env`, …); absent while unconfigured. */
+  readonly source?: string
+  /** Whether {@link DshRepoService.setHostToken} can store a value for this reference. */
+  readonly writable: boolean
+  /** Why the credential store could not describe the reference. */
+  readonly error?: string
+}
+
+/** One host as {@link DshRepoService.listHosts} reports it. */
+export interface HostInfo {
+  readonly kind: ForgeKind
+  /** Normalized `https://host[:port][/path]`. */
+  readonly url: string
+  readonly alias?: string
+  /** Credential reference holding the host's token. */
+  readonly tokenRef: string
+  /** `config`: from cordis.yml, read-only; `added`: added through {@link DshRepoService.addHost}, removable. */
+  readonly origin: 'config' | 'added'
+  readonly token: TokenStatus
+}
+
+/** Fields of a host added at run time. */
+export interface HostCreate {
+  /** Default `gitlab`. */
+  readonly kind?: ForgeKind
+  /** `https://host[:port][/path]`; must differ from every existing host's address. */
+  readonly url: string
+  /** Display name, at most 64 characters. */
+  readonly alias?: string
+  /** Token value stored under a generated credential reference; omitted leaves the token unset. */
+  readonly token?: string
+}
+
+/** Where local mirrors live. */
+export interface MirrorSettings {
+  /** Absolute directory holding the mirrors; snapshots live under its `.snapshots/`. */
+  readonly dir: string
+}
+
+/** Options of {@link DshRepoService.syncMirror}. */
+export interface MirrorSyncOptions extends CallOptions {
+  /** Remote branch to resolve; default: the remote's default branch. */
+  readonly branch?: string
+}
+
+/** A mirror after a successful clone or fetch. */
+export interface MirrorState {
+  /** The address as passed in. */
+  readonly url: string
+  /** Absolute directory of the fetch-only mirror (no checkout). */
+  readonly dir: string
+  /** The requested branch, or the remote's default branch. */
+  readonly branch: string
+  /** Commit the branch points to after the fetch. */
+  readonly commit: string
+  /** Committer date of {@link commit}, ISO 8601. */
+  readonly commitTime: string
+}
+
+/** One entry of a mirror tree listing. */
+export interface MirrorTreeEntry {
+  /** Path from the repository root, `/`-separated. */
+  readonly path: string
+  readonly type: 'file' | 'dir' | 'symlink' | 'submodule'
+  /** Whether the file is executable (`file` only). */
+  readonly executable?: boolean
+}
+
+/**
+ * A read-only checkout of one commit, shared by every holder of the same
+ * mirror and commit. The directory stays unchanged until every holder released
+ * it; release exactly once.
+ */
+export interface SnapshotLease {
+  readonly url: string
+  readonly commit: string
+  /** Absolute directory of the checkout. */
+  readonly dir: string
+  release(): void
+}
+
 /** The `dshRepos` service. */
 export interface DshRepoService {
   readonly version: DshReposVersion
@@ -415,4 +503,58 @@ export interface DshRepoService {
   commentChange(repo: RepoTarget, number: number, body: string, options?: CallOptions): Promise<CommentInfo>
   /** @returns the merge outcome. */
   mergeChange(repo: RepoTarget, number: number, options: MergeOptions): Promise<MergeResult>
+
+  /** @returns every host, configured ones first, with the status of its token. */
+  listHosts(): Promise<readonly HostInfo[]>
+  /**
+   * Add a host and persist it; with `token`, store it in DSH's credential store.
+   * @returns the added host.
+   * @throws `invalid` for a bad address or alias, `conflict` when the address is taken.
+   */
+  addHost(host: HostCreate): Promise<HostInfo>
+  /**
+   * Remove an added host and the token stored for it. Configured hosts cannot be removed.
+   * @throws `not-found` for an unknown address, `forbidden` for a configured host.
+   */
+  removeHost(url: string): Promise<void>
+  /**
+   * Store (string) or remove (undefined) a host's token in DSH's credential store;
+   * after removal an environment variable of the same name applies again.
+   * @returns the host with its new token status.
+   * @throws `not-found` for an unknown address, `invalid` for an unusable token, `unavailable` when the store cannot be written.
+   */
+  setHostToken(url: string, token: string | undefined): Promise<HostInfo>
+
+  /** @returns where mirrors live. */
+  mirrorSettings(): MirrorSettings
+  /**
+   * Clone the address as a fetch-only mirror, or fetch it, and resolve the
+   * branch head. Calls for the same mirror run one at a time. HTTPS addresses
+   * under a configured host carry its token; other addresses use the
+   * machine's git credentials (SSH keys, credential helpers).
+   * @param url - git address: HTTPS/SSH/git URL, `user@host:path`, or an absolute local path.
+   * @returns the mirror and the branch head.
+   * @throws `invalid` for an unsupported address or branch, `not-allowed` outside the configured repositories or on other hosts when they are refused, `not-found` for a missing branch, `unavailable` when git fails.
+   */
+  syncMirror(url: string, options?: MirrorSyncOptions): Promise<MirrorState>
+  /**
+   * Read one regular file of a commit from the mirror's object database.
+   * @param commit - full commit id fetched by an earlier {@link syncMirror}.
+   * @returns UTF-8 text, or undefined when the commit has no such path.
+   * @throws `invalid` when the path is not a regular file, `too-large` above the file limit, `not-found` when the mirror or commit is missing.
+   */
+  readMirrorFile(url: string, commit: string, path: string, options?: CallOptions): Promise<string | undefined>
+  /**
+   * List the entries below a directory of a commit, recursively.
+   * @param path - directory from the repository root; empty lists the whole tree.
+   * @returns entries (directories included), or an empty list when the path does not exist.
+   * @throws `not-found` when the mirror or commit is missing, `too-large` above the tree limit.
+   */
+  listMirrorTree(url: string, commit: string, path: string, options?: CallOptions): Promise<readonly MirrorTreeEntry[]>
+  /**
+   * Hold a read-only checkout of a commit, creating it on first use.
+   * @returns the lease.
+   * @throws `not-found` when the mirror or commit is missing, `unavailable` when the checkout cannot be created.
+   */
+  acquireSnapshot(url: string, commit: string, options?: CallOptions): Promise<SnapshotLease>
 }
