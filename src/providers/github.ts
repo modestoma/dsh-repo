@@ -8,7 +8,7 @@
 
 import { Octokit } from '@octokit/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CheckState, CommentInfo, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CheckState, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { nextPage, titleOf, truncateBytes } from './types.ts'
@@ -135,7 +135,7 @@ export class GithubProvider implements Provider {
    * @param baseUrl - REST base URL (`https://api.github.com` or `<url>/api/v3`).
    * @param token - resolves the host's token for every request.
    */
-  constructor(baseUrl: string, token: TokenSource) {
+  constructor(private readonly baseUrl: string, token: TokenSource) {
     this.octokit = new Octokit({
       baseUrl,
       userAgent: 'dsh-repo',
@@ -144,6 +144,13 @@ export class GithubProvider implements Provider {
     this.octokit.hook.before('request', async (options) => {
       options.headers.authorization = `token ${await token()}`
     })
+  }
+
+  async currentUser(call: Call): Promise<CommitAuthor> {
+    const { data } = await this.octokit.rest.users.getAuthenticated({ request: { signal: call.signal } })
+    const api = new URL(this.baseUrl)
+    const web = api.hostname === 'api.github.com' ? 'github.com' : api.host
+    return { name: data.name ?? data.login, email: data.email ?? `${data.id}+${data.login}@users.noreply.${web}` }
   }
 
   async repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo> {

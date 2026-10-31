@@ -22,7 +22,7 @@ export interface ContentBlock {
 export interface Agent {
   readonly id: string
   /** The Agent's Session; its header `cwd` is the original project directory and the sandbox's writable root. */
-  readonly session?: { readonly header: { readonly cwd?: string } }
+  readonly session?: { readonly header: { readonly id: string; readonly cwd?: string } }
 }
 
 /**

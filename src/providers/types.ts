@@ -6,7 +6,7 @@
  */
 
 import type {
-  BranchInfo, ChangeDetail, ChangeDiff, ChangeInfo, ChangeState, ChangeStatus, CommentInfo, CommitInfo,
+  BranchInfo, ChangeDetail, CommitAuthor, ChangeDiff, ChangeInfo, ChangeState, ChangeStatus, CommentInfo, CommitInfo,
   FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, TreeListing,
 } from '../contract.ts'
 import type { RepoLimits } from '../config.ts'
@@ -26,6 +26,8 @@ export interface Paging {
 
 /** One code host family. Methods throw SDK errors or {@link RepoError}; the service classifies them. */
 export interface Provider {
+  /** Commit identity of the account that owns the token. */
+  currentUser(call: Call): Promise<CommitAuthor>
   repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo>
   getBranch(ref: RepoRef, name: string, call: Call): Promise<BranchInfo | undefined>
   listBranches(ref: RepoRef, query: Paging & { readonly search?: string }, call: Call): Promise<Page<BranchInfo>>

@@ -2,12 +2,12 @@ import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HostStore } from '../src/hosts.ts'
 import { runGit } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import { credentials, testConfig, withMirrors } from './helpers.ts'
+import { credentials, fakeHttp, testConfig, TOKENS, withMirrors } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 const BOT = { name: 'Bot', email: 'bot@example.com' }
@@ -40,6 +40,16 @@ function setup(tokens: Record<string, string> = {}) {
   })
   const sandbox = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-session-'))
   return { root, sandbox, service: make(), make }
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.unstubAllEnvs()
+})
+
+/** The mirror directory behind a workspace checkout. */
+function mirrorOf(dir: string): string {
+  return readFileSync(join(dir, '.git'), 'utf8').replace(/^gitdir: /, '').trim().replace(/\/\.git\/worktrees\/.*$/, '')
 }
 
 describe('workspaces', () => {
@@ -149,12 +159,49 @@ describe('workspaces', () => {
     const dir = join(sandbox, 'app')
     await service.openWorkspace(bare, { dir })
     writeFileSync(join(dir, 'app.ts'), 'x\n')
-    const mirror = readFileSync(join(dir, '.git'), 'utf8').replace(/^gitdir: /, '').trim().replace(/\/\.git\/worktrees\/.*$/, '')
+    const mirror = mirrorOf(dir)
     expect(mirror.startsWith(realpathSync(root))).toBe(true)
     git(mirror, 'remote', 'set-url', 'origin', 'https://elsewhere.example.com/a/b.git')
     await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'unauthenticated' })
     git(mirror, 'remote', 'set-url', 'origin', 'https://github.com/modestoma/app.git')
     await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'unauthenticated' })
+  })
+
+  it('commits as the account that owns the host token and records the session', async () => {
+    const { bare, commit } = origin()
+    const { sandbox, service } = setup(TOKENS)
+    // Serve the github.com address from the local origin so the test stays offline.
+    const remote = 'https://github.com/modestoma/app.git'
+    vi.stubEnv('GIT_CONFIG_COUNT', '1')
+    vi.stubEnv('GIT_CONFIG_KEY_0', `url.${bare}.insteadOf`)
+    vi.stubEnv('GIT_CONFIG_VALUE_0', remote)
+    const dir = join(sandbox, 'app')
+    expect(await service.openWorkspace(remote, { dir })).toMatchObject({ url: remote, baseCommit: commit })
+    let reads = 0
+    const { requests } = fakeHttp([{ method: 'GET', path: '/user', reply: () => {
+      reads += 1
+      return reads === 1 ? { status: 403, body: { message: 'Resource not accessible by personal access token' } } : { body: { login: 'shared-bot', id: 42, name: null, email: null } }
+    } }])
+
+    writeFileSync(join(dir, 'app.ts'), 'export const a = 2\n')
+    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', session: 'a\nb' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('会话') })
+    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('令牌账号') })
+    expect(await service.workspaceChanges(dir)).toMatchObject({ uncommitted: true, commits: [] })
+
+    const pushed = await service.pushWorkspace(dir, { branch: 'fix/a', message: 'fix: a\n\nWhy.', session: 'sess-1' })
+    expect(requests[1]?.headers.get('authorization')).toBe('token gh-token')
+    expect(git(bare, 'log', '-1', '--format=%an <%ae>|%cn <%ce>', 'fix/a')).toBe('shared-bot <42+shared-bot@users.noreply.github.com>|shared-bot <42+shared-bot@users.noreply.github.com>')
+    expect(git(bare, 'log', '-1', '--format=%B', 'fix/a')).toBe('fix: a\n\nWhy.\n\nDSH-Session: sess-1')
+    expect(git(bare, 'rev-parse', 'fix/a^')).toBe(commit)
+
+    writeFileSync(join(dir, 'more.ts'), 'export {}\n')
+    const second = await service.pushWorkspace(dir, { message: 'feat: more', author: BOT })
+    expect(git(bare, 'log', '-1', '--format=%an %B', 'fix/a').trim()).toBe('Bot feat: more')
+    expect(second.commit).not.toBe(pushed.commit)
+    writeFileSync(join(dir, 'last.ts'), 'export {}\n')
+    await service.pushWorkspace(dir, { message: 'feat: last' })
+    expect(git(bare, 'log', '-1', '--format=%an', 'fix/a')).toBe('shared-bot')
+    expect(reads).toBe(2)
   })
 
   it('refuses directories that are not workspaces of this service, including forged links', async () => {
@@ -191,7 +238,7 @@ describe('workspaces', () => {
     const gone = join(sandbox, 'gone')
     await service.openWorkspace(bare, { dir: kept })
     await service.openWorkspace(bare, { dir: gone })
-    const mirror = readFileSync(join(kept, '.git'), 'utf8').replace(/^gitdir: /, '').trim().replace(/\/\.git\/worktrees\/.*$/, '')
+    const mirror = mirrorOf(kept)
     expect(git(mirror, 'for-each-ref', '--format=%(refname)', 'refs/heads/dsh-repo/').split('\n')).toHaveLength(2)
     rmSync(gone, { recursive: true })
     await make().syncMirror(bare)

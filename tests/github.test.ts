@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { GithubProvider } from '../src/providers/github.ts'
 import { createService, fakeHttp, testConfig, TOKENS } from './helpers.ts'
 
 const REPO = 'https://github.com/modestoma/dsh-repo'
@@ -121,5 +122,16 @@ describe('GitHub provider', () => {
     fakeHttp([{ method: 'GET', path: API, reply: { status: 404, body: { message: 'Not Found' } } }])
     await expect(createService(testConfig(), {}).repoInfo(REPO)).rejects.toMatchObject({ code: 'unauthenticated', message: expect.stringContaining('GITHUB_TOKEN') })
     await expect(createService(testConfig(), TOKENS).repoInfo(REPO)).rejects.toMatchObject({ code: 'not-found' })
+  })
+})
+
+describe('GitHub token account', () => {
+  const call = () => ({ signal: AbortSignal.timeout(5_000), limits: testConfig().limits })
+
+  it('commits as the token account, with its noreply address when the email is private', async () => {
+    fakeHttp([{ method: 'GET', path: '/api/v3/user', reply: { body: { login: 'bot', id: 7, name: null, email: null } } }])
+    expect(await new GithubProvider('https://ghe.example.com/api/v3', async () => 't').currentUser(call())).toEqual({ name: 'bot', email: '7+bot@users.noreply.ghe.example.com' })
+    fakeHttp([{ method: 'GET', path: '/user', reply: { body: { login: 'bot', id: 7, name: 'Shared Bot', email: 'bot@example.com' } } }])
+    expect(await new GithubProvider('https://api.github.com', async () => 't').currentUser(call())).toEqual({ name: 'Shared Bot', email: 'bot@example.com' })
   })
 })

@@ -502,8 +502,16 @@ export interface WorkspacePushOptions extends CallOptions {
   readonly branch?: string
   /** Message of the commit recording uncommitted changes; required when there are any. */
   readonly message?: string
-  /** Author and committer of that commit; default: the machine's git identity. */
+  /**
+   * Author and committer of that commit. Default: the account that owns the
+   * host's token, read from the host's current-user API (on GitHub a missing
+   * public email becomes the account's noreply address); the machine's git
+   * identity for local addresses. A token that cannot read its own account
+   * fails the push with `forbidden` or `unauthenticated`.
+   */
   readonly author?: CommitAuthor
+  /** Session that made the change, added to that commit's message as a `DSH-Session:` trailer. One line of at most 200 characters. */
+  readonly session?: string
 }
 
 /** Outcome of {@link DshRepoService.pushWorkspace}. */

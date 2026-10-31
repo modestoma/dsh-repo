@@ -181,7 +181,7 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
   const writes: ToolDefinition[] = [
     define(deps, {
       name: 'repo_workspace_push',
-      description: 'Commit the uncommitted changes of a workspace opened by repo_workspace_open and push it to a new remote branch, never forcing. The first push names the branch, which must not exist yet and cannot be the default or starting branch; later pushes go to the same branch. Open a PR/MR afterwards with repo_mr_create (sourceBranch = the branch, targetBranch = baseBranch). Requires user approval.',
+      description: 'Commit the uncommitted changes of a workspace opened by repo_workspace_open and push it to a new remote branch, never forcing. The commit is made as the account that owns the host token and records the id of this session. The first push names the branch, which must not exist yet and cannot be the default or starting branch; later pushes go to the same branch. Open a PR/MR afterwards with repo_mr_create (sourceBranch = the branch, targetBranch = baseBranch). Requires user approval.',
       schema: z.object({
         dir: z.string().min(1).optional().describe('Workspace directory or a directory inside it; default: the current working directory'),
         branch: z.string().min(1).optional().describe('New remote branch, e.g. fix/order-timeout; required on the first push'),
@@ -193,9 +193,11 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       },
       run: async (args, signal, exec) => {
         const root = await workspaceRoot(deps, args.dir, exec, signal)
+        const session = exec.agent?.session?.header.id
         return await service.pushWorkspace(root, {
           ...args.branch === undefined ? {} : { branch: args.branch },
           ...args.message === undefined ? {} : { message: args.message },
+          ...session === undefined ? {} : { session },
           signal,
         })
       },

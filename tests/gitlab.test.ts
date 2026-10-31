@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { GitlabProvider } from '../src/providers/gitlab.ts'
 import { createService, fakeHttp, testConfig, TOKENS } from './helpers.ts'
 
 const REPO = 'https://code.example.com/gitlab/team/backend/orders'
@@ -108,5 +109,20 @@ describe('GitLab provider', () => {
   it('classifies GitLab errors', async () => {
     fakeHttp([{ method: 'GET', path: API, reply: { status: 401, body: { message: '401 Unauthorized' } } }])
     await expect(createService(testConfig(), TOKENS).repoInfo(REPO)).rejects.toMatchObject({ code: 'unauthenticated', message: expect.stringContaining('401 Unauthorized') })
+  })
+})
+
+describe('GitLab token account', () => {
+  const call = () => ({ signal: AbortSignal.timeout(5_000), limits: testConfig().limits })
+  const provider = () => new GitlabProvider('https://code.example.com/gitlab', async () => 't', 5_000)
+  const account = { id: 9, username: 'bot', name: 'Shared Bot', public_email: '' }
+
+  it('commits as the token account with its commit email, then its email, then a noreply address', async () => {
+    fakeHttp([{ method: 'GET', path: '/gitlab/api/v4/user', reply: { body: { ...account, email: 'bot@example.com', commit_email: 'commits@example.com' } } }])
+    expect(await provider().currentUser(call())).toEqual({ name: 'Shared Bot', email: 'commits@example.com' })
+    fakeHttp([{ method: 'GET', path: '/gitlab/api/v4/user', reply: { body: { ...account, email: 'bot@example.com' } } }])
+    expect(await provider().currentUser(call())).toEqual({ name: 'Shared Bot', email: 'bot@example.com' })
+    fakeHttp([{ method: 'GET', path: '/gitlab/api/v4/user', reply: { body: account } }])
+    expect(await provider().currentUser(call())).toEqual({ name: 'Shared Bot', email: '9-bot@users.noreply.code.example.com' })
   })
 })

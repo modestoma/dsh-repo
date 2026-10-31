@@ -398,7 +398,7 @@ export class MirrorStore {
       await this.update(url, dir, env, signal)
       return
     }
-    const origin = (await this.git(['remote', 'get-url', 'origin'], dir, {}, signal)).trim()
+    const origin = (await this.git(['config', '--get', 'remote.origin.url'], dir, {}, signal)).trim()
     if (origin !== url) await this.git(['remote', 'set-url', 'origin', url], dir, {}, signal)
     await this.git(['fetch', '--quiet', '--prune', 'origin'], dir, env, signal)
   }

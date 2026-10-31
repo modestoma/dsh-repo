@@ -63,6 +63,8 @@ export interface PushRequest {
   readonly branch?: string
   readonly message?: string
   readonly author?: CommitAuthor
+  /** Session recorded as the commit's `DSH-Session:` trailer. */
+  readonly session?: string
   /** Credentials of the network commands. */
   readonly env: Readonly<Record<string, string>>
   readonly signal?: AbortSignal
@@ -226,7 +228,7 @@ export class WorkspaceStore {
   /**
    * Record uncommitted changes as a commit and push the local branch.
    * @param dir - workspace directory.
-   * @param request - remote branch, commit message and author, credentials.
+   * @param request - remote branch, commit message, author and session, credentials.
    * @param isDefaultBranch - asks the remote whether a branch is its default branch.
    * @returns the push outcome.
    * @throws {RepoError} see {@link DshRepoService.pushWorkspace}.
@@ -253,7 +255,8 @@ export class WorkspaceStore {
       if (pending !== '') {
         if (request.message === undefined || request.message.trim() === '') throw new RepoError('invalid', '工作区有未提交的改动，推送时要给出提交说明')
         const identity = request.author === undefined ? [] : ['-c', `user.name=${request.author.name}`, '-c', `user.email=${request.author.email}`]
-        await this.workspaceGit(ws, [...identity, 'commit', '--quiet', '--no-verify', '-m', request.message], {}, request.signal)
+        const trailers = request.session === undefined ? [] : ['--trailer', `DSH-Session: ${request.session}`]
+        await this.workspaceGit(ws, [...identity, 'commit', '--quiet', '--no-verify', '-m', request.message, ...trailers], {}, request.signal)
         committed = true
       }
       const head = (await this.workspaceGit(ws, ['rev-parse', 'HEAD'], {}, request.signal)).trim()
@@ -326,7 +329,7 @@ export class WorkspaceStore {
         }
       }
       const [url, baseBranch, baseCommit, branch] = await Promise.all([
-        this.git(['remote', 'get-url', 'origin'], mirror).then(value => value.trim()),
+        this.git(['config', '--get', 'remote.origin.url'], mirror).then(value => value.trim()),
         read('baseBranch'),
         read('baseCommit'),
         read('branch'),

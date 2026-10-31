@@ -9,7 +9,7 @@
 
 import { Gitlab } from '@gitbeaker/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CommentInfo, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { nextPage, titleOf, truncateBytes } from './types.ts'
@@ -114,8 +114,17 @@ export class GitlabProvider implements Provider {
    * @param token - resolves the host's token for every request.
    * @param timeoutMs - per-request timeout; GitBeaker takes no per-call signal.
    */
-  constructor(host: string, token: TokenSource, timeoutMs: number) {
+  constructor(private readonly host: string, token: TokenSource, timeoutMs: number) {
     this.api = new Gitlab({ host, token, queryTimeout: timeoutMs })
+  }
+
+  async currentUser(call: Call): Promise<CommitAuthor> {
+    call.signal.throwIfAborted()
+    const data = await this.api.Users.showCurrentUser()
+    // `commit_email` is returned for the token's own account but missing from GitBeaker's types.
+    const commitEmail: unknown = data.commit_email
+    const email = [commitEmail, data.email, data.public_email].find((value): value is string => typeof value === 'string' && value !== '')
+    return { name: data.name, email: email ?? `${data.id}-${data.username}@users.noreply.${new URL(this.host).host}` }
   }
 
   async repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo> {

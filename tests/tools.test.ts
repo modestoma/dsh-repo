@@ -28,7 +28,7 @@ function session(sub = '') {
   mkdirSync(current, { recursive: true })
   const set = vi.fn(async (_agent: unknown, path: string) => { current = path; return path })
   const workingDirectory: WorkingDirectoryService = { ensure: async () => current, set }
-  const agent = { id: 'agent-1', session: { header: { cwd: root } } }
+  const agent = { id: 'agent-1', session: { header: { id: 'session-1', cwd: root } } }
   return { root, set, workingDirectory, exec: { signal: new AbortController().signal, agent, callId: 'call-1' } }
 }
 
@@ -147,7 +147,7 @@ describe('createTools', () => {
     expect(reason).toContain('提交说明：fix: a')
     expect(reason).toContain('src/a.ts +3 −1')
     expect(reason).toContain('logo.png（二进制）')
-    expect(pushWorkspace).toHaveBeenCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: a\n\nbody', signal: run.signal })
+    expect(pushWorkspace).toHaveBeenCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: a\n\nbody', session: 'session-1', signal: run.signal })
     await expect(all.get('repo_workspace_changes')!.execute({ dir: tmpdir() }, run)).rejects.toThrow(/^\[not-found\]/)
   })
 })

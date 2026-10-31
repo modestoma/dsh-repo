@@ -14,7 +14,7 @@ import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type {
-  CallOptions, ChangeCreate, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
+  CallOptions, ChangeCreate, CommitAuthor, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
   HostCreate, HostInfo, HostsChange, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, PageOptions, RepoRef, RepoTarget,
   SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
 } from './contract.ts'
@@ -64,6 +64,14 @@ function requireText(value: string, label: string): void {
   if (value.trim() === '') throw new RepoError('invalid', `${label}不能为空`)
 }
 
+/** Rejects with the signal's reason once it aborts. */
+function abortion(signal: AbortSignal): Promise<never> {
+  return new Promise((_resolve, reject) => {
+    if (signal.aborted) reject(signal.reason)
+    else signal.addEventListener('abort', () => { reject(signal.reason) }, { once: true })
+  })
+}
+
 /** HTTP username git sends with a host's token. */
 function gitUsername(kind: HostSpec['kind']): string {
   return kind === 'gitlab' ? 'oauth2' : 'x-access-token'
@@ -98,6 +106,8 @@ export class RepoService implements DshRepoService {
   private readonly logger: HostLogger | undefined
   private readonly defaultMirrorDir: string
   private readonly hostListeners = new Set<(change: HostsChange) => void>()
+  /** Commit identity of each host's token account, keyed by host URL and checked against the token it was read with. */
+  private readonly identities = new Map<string, { readonly token: string; readonly author: Promise<CommitAuthor> }>()
 
   /**
    * @param config - validated configuration.
@@ -263,6 +273,7 @@ export class RepoService implements DshRepoService {
   async removeHost(url: string): Promise<void> {
     const spec = await this.hosts.remove(url)
     this.providers.delete(spec.url)
+    this.identities.delete(spec.url)
     try {
       await this.credentials.unset(spec.tokenRef)
     } catch (error) {
@@ -366,14 +377,17 @@ export class RepoService implements DshRepoService {
       if (!/^[^<>\n]+$/.test(options.author.name.trim())) throw new RepoError('invalid', '提交作者名不能为空，也不能包含 < > 或换行')
       if (!/^[^<>\s]+$/.test(options.author.email.trim())) throw new RepoError('invalid', '提交作者邮箱不能为空，也不能包含 < > 或空白')
     }
+    const session = options.session?.trim()
+    if (session !== undefined && (session === '' || session.length > 200 || /[\u0000-\u001f\u007f]/.test(session))) throw new RepoError('invalid', '会话 id 不能为空、超过 200 个字符或包含换行等控制字符')
     const { url } = await this.workspaces.locate(dir)
     const env = await this.mirrorAuth(url, true)
-    const author = options.author === undefined ? undefined : { name: options.author.name.trim(), email: options.author.email.trim() }
+    const author = options.author === undefined ? await this.tokenIdentity(url, options.signal) : { name: options.author.name.trim(), email: options.author.email.trim() }
     return await this.workspaces.push(dir, {
       env,
       ...options.branch === undefined ? {} : { branch: options.branch },
       ...options.message === undefined ? {} : { message: options.message },
       ...author === undefined ? {} : { author },
+      ...session === undefined ? {} : { session },
       ...options.signal === undefined ? {} : { signal: options.signal },
     }, async (remote, branch) => (await this.mirrors.remoteDefaultBranch(remote, env, options.signal)) === branch)
   }
@@ -397,6 +411,34 @@ export class RepoService implements DshRepoService {
     }
     resolveTarget(url, this.hosts.all(), this.config.repos)
     return credentialEnvironment(spec.url, gitUsername(spec.kind), await this.token(spec))
+  }
+
+  /**
+   * Commit identity of the token account of the host `url` belongs to; read
+   * once per token value.
+   * @param url - accepted git address that passed {@link mirrorAuth} for a push.
+   * @param signal - caller cancellation of the wait.
+   * @returns the identity, or `undefined` for a local address.
+   * @throws {RepoError} classified failure of the host's current-user API.
+   */
+  private async tokenIdentity(url: string, signal: AbortSignal | undefined): Promise<CommitAuthor | undefined> {
+    const spec = hostOf(url, this.hosts.all())
+    if (spec === undefined) return undefined
+    const token = await this.token(spec)
+    let entry = this.identities.get(spec.url)
+    if (entry?.token !== token) {
+      // Concurrent pushes share this read, so only the deadline cancels it.
+      const author = this.provider(spec).currentUser({ signal: AbortSignal.timeout(this.config.timeoutMs), limits: this.config.limits })
+      entry = { token, author }
+      this.identities.set(spec.url, entry)
+      // A failed read is not kept, so the next push asks again.
+      author.catch(() => { if (this.identities.get(spec.url) === entry) this.identities.delete(spec.url) })
+    }
+    try {
+      return await (signal === undefined ? entry.author : Promise.race([entry.author, abortion(signal)]))
+    } catch (error) {
+      throw toRepoError(error, `读取 ${spec.url} 令牌账号的提交身份（作者默认用令牌账号）`)
+    }
   }
 
   private async storeToken(spec: HostSpec, value: string): Promise<void> {
