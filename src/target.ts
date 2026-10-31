@@ -74,17 +74,8 @@ export function matchesPattern(key: string, pattern: string): boolean {
   return patternSegments.every((segment, index) => segment === '*' ? index === patternSegments.length - 1 : segment === keySegments[index])
 }
 
-/**
- * Resolve a repository target.
- * @param input - URL or `host/path`.
- * @param hosts - configured hosts.
- * @param patterns - configured repository patterns; empty allows every repository on the hosts.
- * @returns the host and repository path.
- * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no host or pattern admits it.
- */
-export function resolveTarget(input: string, hosts: readonly HostSpec[], patterns: readonly string[]): ResolvedTarget {
-  const parsed = parse(input)
-  if (parsed === undefined) throw new RepoError('invalid', `无法识别的仓库：${input}（填仓库网址、git 地址或 主机/路径）`)
+/** The host serving a parsed target and the path below the host's prefix. */
+function matchHost(parsed: ParsedTarget, hosts: readonly HostSpec[]): { spec: HostSpec; rest: string } | undefined {
   let best: { spec: HostSpec; rest: string; prefix: number } | undefined
   for (const spec of hosts) {
     const url = new URL(spec.url)
@@ -97,6 +88,32 @@ export function resolveTarget(input: string, hosts: readonly HostSpec[], pattern
       best = { spec, rest: parsed.pathname, prefix: 0 }
     }
   }
+  return best
+}
+
+/**
+ * The configured host a git address belongs to, if any.
+ * @param input - git address or `host/path`.
+ * @param hosts - configured hosts.
+ * @returns the host, or undefined when the address is unreadable or no host serves it.
+ */
+export function hostOf(input: string, hosts: readonly HostSpec[]): HostSpec | undefined {
+  const parsed = parse(input)
+  return parsed === undefined ? undefined : matchHost(parsed, hosts)?.spec
+}
+
+/**
+ * Resolve a repository target.
+ * @param input - URL or `host/path`.
+ * @param hosts - configured hosts.
+ * @param patterns - configured repository patterns; empty allows every repository on the hosts.
+ * @returns the host and repository path.
+ * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no host or pattern admits it.
+ */
+export function resolveTarget(input: string, hosts: readonly HostSpec[], patterns: readonly string[]): ResolvedTarget {
+  const parsed = parse(input)
+  if (parsed === undefined) throw new RepoError('invalid', `无法识别的仓库：${input}（填仓库网址、git 地址或 主机/路径）`)
+  const best = matchHost(parsed, hosts)
   if (best === undefined) throw new RepoError('not-allowed', `没有为 ${parsed.host} 配置主机，dsh-repo 不能访问 ${input}`)
   const path = repoPath(best.spec.kind, best.rest)
   if (path === undefined) {

@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { RepoService } from '../src/service.ts'
-import { credentials, fakeHttp, testConfig, TOKENS } from './helpers.ts'
+import { createService, fakeHttp, testConfig, TOKENS } from './helpers.ts'
 
 const REPO = 'https://github.com/modestoma/dsh-repo'
 const API = '/repos/modestoma/dsh-repo'
@@ -14,7 +13,7 @@ afterEach(() => { vi.unstubAllGlobals() })
 describe('GitHub provider', () => {
   it('reads repository metadata through the REST API with the host token', async () => {
     const { requests } = fakeHttp([{ method: 'GET', path: API, reply: { body: repoBody } }])
-    const info = await new RepoService(testConfig(), credentials(TOKENS)).repoInfo(REPO)
+    const info = await createService(testConfig(), TOKENS).repoInfo(REPO)
     expect(info).toMatchObject({ kind: 'github', path: 'modestoma/dsh-repo', defaultBranch: 'main', visibility: 'public', cloneUrl: `${REPO}.git` })
     expect(requests[0]?.url.origin).toBe('https://api.github.com')
     expect(requests[0]?.headers.get('authorization')).toBe('token gh-token')
@@ -22,7 +21,7 @@ describe('GitHub provider', () => {
 
   it('sends GitHub Enterprise Server requests to <url>/api/v3 with that host\'s token', async () => {
     const { requests } = fakeHttp([{ method: 'GET', path: '/api/v3/repos/platform/api', reply: { body: { ...repoBody, html_url: 'https://ghe.example.com/platform/api' } } }])
-    await new RepoService(testConfig(), credentials(TOKENS)).repoInfo('ghe.example.com/platform/api')
+    await createService(testConfig(), TOKENS).repoInfo('ghe.example.com/platform/api')
     expect(requests[0]?.url.href).toBe('https://ghe.example.com/api/v3/repos/platform/api')
     expect(requests[0]?.headers.get('authorization')).toBe('token ghe-token')
   })
@@ -33,7 +32,7 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/contents/README.md`, reply: { body: '你好世界' } },
       { method: 'GET', path: `${API}/contents/logo.png`, reply: { body: 'PNG\0data' } },
     ])
-    const service = new RepoService(testConfig({ limits: { maxFileBytes: 7 } }), credentials(TOKENS))
+    const service = createService(testConfig({ limits: { maxFileBytes: 7 } }), TOKENS)
     expect(await service.readFile(REPO, 'README.md')).toEqual({ path: 'README.md', ref: 'main', text: '你好', binary: false, truncated: true })
     expect(await service.readFile(REPO, 'logo.png', { ref: 'dev' })).toMatchObject({ ref: 'dev', binary: true, text: '' })
   })
@@ -44,7 +43,7 @@ describe('GitHub provider', () => {
       html_url: `${REPO}/issues/${number}`, ...pr ? { pull_request: {} } : {},
     })
     const { requests } = fakeHttp([{ method: 'GET', path: `${API}/issues`, reply: { body: [issue(1, false), issue(2, true)] } }])
-    const page = await new RepoService(testConfig(), credentials(TOKENS)).listIssues(REPO, { labels: ['bug'], perPage: 2 })
+    const page = await createService(testConfig(), TOKENS).listIssues(REPO, { labels: ['bug'], perPage: 2 })
     expect(page.items.map(item => item.number)).toEqual([1])
     expect(page.items[0]).toMatchObject({ body: '', labels: ['bug'], author: { username: 'modestoma' } })
     expect(page.nextPage).toBe(2)
@@ -62,7 +61,7 @@ describe('GitHub provider', () => {
       { method: 'POST', path: `${API}/git/commits`, reply: { status: 201, body: { sha: 'c1', html_url: `${REPO}/commit/c1` } } },
       { method: 'POST', path: `${API}/git/refs`, reply: { status: 201, body: {} } },
     ])
-    const result = await new RepoService(testConfig(), credentials(TOKENS)).commitFiles(REPO, {
+    const result = await createService(testConfig(), TOKENS).commitFiles(REPO, {
       branch: 'feature', message: 'docs: add', files: [{ action: 'write', path: 'docs/a.md', content: 'A' }, { action: 'delete', path: 'old.md' }],
     })
     expect(result).toEqual({ sha: 'c1', branch: 'feature', createdBranch: true, webUrl: `${REPO}/commit/c1` })
@@ -87,7 +86,7 @@ describe('GitHub provider', () => {
       { method: 'POST', path: `${API}/git/commits`, reply: { status: 201, body: { sha: 'c1', html_url: `${REPO}/commit/c1` } } },
       { method: 'POST', path: `${API}/git/refs`, reply: { status: 422, body: { message: 'Reference already exists' } } },
     ])
-    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const service = createService(testConfig(), TOKENS)
     const files = [{ action: 'write' as const, path: 'a.md', content: 'A' }]
     await expect(service.commitFiles(REPO, { branch: 'taken', newBranch: true, message: 'm', files })).rejects.toMatchObject({ code: 'conflict' })
     expect(requests.some(request => request.method === 'POST')).toBe(false)
@@ -97,7 +96,7 @@ describe('GitHub provider', () => {
   })
 
   it('rejects baseSha together with base, a baseSha that is not a full object id, and a malformed author', async () => {
-    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const service = createService(testConfig(), TOKENS)
     const files = [{ action: 'write' as const, path: 'a.md', content: 'A' }]
     await expect(service.commitFiles(REPO, { branch: 'f', base: 'dev', baseSha: SHA, message: 'm', files })).rejects.toMatchObject({ code: 'invalid' })
     await expect(service.commitFiles(REPO, { branch: 'f', baseSha: 'abc123', message: 'm', files })).rejects.toMatchObject({ code: 'invalid' })
@@ -111,7 +110,7 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/branches/gone`, reply: { status: 404, body: { message: 'Branch not found' } } },
       { method: 'GET', path: `${API}/branches/old`, reply: { body: { name: 'new', protected: false, commit: { sha: SHA } } } },
     ])
-    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const service = createService(testConfig(), TOKENS)
     expect(await service.getBranch(REPO, 'main')).toEqual({ name: 'main', commit: SHA, protected: true, default: true })
     expect(await service.getBranch(REPO, 'gone')).toBeUndefined()
     expect(await service.getBranch(REPO, 'old')).toBeUndefined()
@@ -122,7 +121,7 @@ describe('GitHub provider', () => {
       { method: 'GET', path: API, reply: { body: repoBody } },
       { method: 'GET', path: `${API}/branches/release`, reply: { body: { name: 'release', protected: true, commit: { sha: SHA } } } },
     ])
-    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const service = createService(testConfig(), TOKENS)
     const files = [{ action: 'write' as const, path: 'a', content: '' }]
     await expect(service.commitFiles(REPO, { branch: 'main', message: 'm', files })).rejects.toMatchObject({ name: 'RepoError', code: 'forbidden' })
     await expect(service.commitFiles(REPO, { branch: 'release', message: 'm', files })).rejects.toMatchObject({ code: 'forbidden' })
@@ -136,7 +135,7 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/pulls/5`, reply: { body: pr } },
       { method: 'PUT', path: `${API}/pulls/5/merge`, reply: { status: 409, body: { message: 'Head branch was modified' } } },
     ])
-    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const service = createService(testConfig(), TOKENS)
     const created = await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', labels: ['x'] })
     expect(created).toMatchObject({ number: 5, state: 'merged', labels: ['x'], assignees: [{ username: 'modestoma' }] })
     expect(requests.find(request => request.method === 'PATCH')?.body).toEqual({ labels: ['x'] })
@@ -153,7 +152,7 @@ describe('GitHub provider', () => {
         : { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure', html_url: 'u' }] } } },
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [{ context: 'ci/lint', state: 'pending', target_url: null }] } } },
     ])
-    const status = await new RepoService(testConfig(), credentials(TOKENS)).changeStatus(REPO, 5)
+    const status = await createService(testConfig(), TOKENS).changeStatus(REPO, 5)
     expect(status.checks).toHaveLength(102)
     expect(status.overall).toBe('failure')
   })
@@ -162,7 +161,7 @@ describe('GitHub provider', () => {
     const { requests } = fakeHttp([
       { method: 'GET', path: new RegExp(`${API}/git/trees/dev(:|%3A)src$`), reply: { body: { truncated: true, tree: [{ path: 'a.ts', type: 'blob', mode: '100644', size: 3 }, { path: 'lib', type: 'tree', mode: '040000' }] } } },
     ])
-    expect(await new RepoService(testConfig(), credentials(TOKENS)).listTree(REPO, { ref: 'dev', path: 'src/' })).toEqual({
+    expect(await createService(testConfig(), TOKENS).listTree(REPO, { ref: 'dev', path: 'src/' })).toEqual({
       ref: 'dev', truncated: true, entries: [{ path: 'src/a.ts', type: 'file', size: 3 }, { path: 'src/lib', type: 'dir' }],
     })
     expect(requests[0]?.url.searchParams.has('recursive')).toBe(false)
@@ -174,7 +173,7 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/commits/${SHA}/check-runs`, reply: { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'success', html_url: 'u' }] } } },
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [{ context: 'ci/lint', state: 'pending', target_url: null }] } } },
     ])
-    expect(await new RepoService(testConfig(), credentials(TOKENS)).changeStatus(REPO, 5)).toEqual({
+    expect(await createService(testConfig(), TOKENS).changeStatus(REPO, 5)).toEqual({
       headSha: SHA,
       checks: [{ name: 'test', state: 'success', webUrl: 'u' }, { name: 'ci/lint', state: 'pending' }],
       overall: 'pending',
@@ -184,7 +183,7 @@ describe('GitHub provider', () => {
 
   it('reports a missing token and host failures as RepoError codes', async () => {
     fakeHttp([{ method: 'GET', path: API, reply: { status: 404, body: { message: 'Not Found' } } }])
-    await expect(new RepoService(testConfig(), credentials({})).repoInfo(REPO)).rejects.toMatchObject({ code: 'unauthenticated', message: expect.stringContaining('GITHUB_TOKEN') })
-    await expect(new RepoService(testConfig(), credentials(TOKENS)).repoInfo(REPO)).rejects.toMatchObject({ code: 'not-found' })
+    await expect(createService(testConfig(), {}).repoInfo(REPO)).rejects.toMatchObject({ code: 'unauthenticated', message: expect.stringContaining('GITHUB_TOKEN') })
+    await expect(createService(testConfig(), TOKENS).repoInfo(REPO)).rejects.toMatchObject({ code: 'not-found' })
   })
 })

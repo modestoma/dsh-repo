@@ -10,18 +10,23 @@
  * @module dsh-repo/service
  */
 
+import { isAbsolute } from 'node:path'
 import type {
   CallOptions, ChangeCreate, ChangeListOptions, ChangeUpdate, CommitRequest, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
-  MergeOptions, PageOptions, RepoRef, RepoTarget,
+  HostCreate, HostInfo, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, PageOptions, RepoRef, RepoTarget,
+  SnapshotLease, TokenStatus,
 } from './contract.ts'
 import { apiBaseUrl } from './config.ts'
 import type { HostSpec, RepoConfig } from './config.ts'
 import { RepoError, toRepoError } from './errors.ts'
 import type { HostCredentials } from './host.ts'
+import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
+import { credentialEnvironment } from './mirror/git.ts'
+import type { MirrorStore } from './mirror/store.ts'
 import { GithubProvider } from './providers/github.ts'
 import { GitlabProvider } from './providers/gitlab.ts'
 import type { Call, Paging, Provider } from './providers/types.ts'
-import { resolveTarget } from './target.ts'
+import { hostOf, resolveTarget } from './target.ts'
 import type { ResolvedTarget } from './target.ts'
 
 /** Name the service is provided under. */
@@ -56,25 +61,45 @@ function requireText(value: string, label: string): void {
   if (value.trim() === '') throw new RepoError('invalid', `${label}不能为空`)
 }
 
+/** HTTP username git sends with a host's token. */
+function gitUsername(kind: HostSpec['kind']): string {
+  return kind === 'gitlab' ? 'oauth2' : 'x-access-token'
+}
+
+/** Collaborators of the service. */
+export interface RepoServiceDeps {
+  /** DSH credential store; tokens are resolved per request. */
+  readonly credentials: HostCredentials
+  /** Configured and added hosts. */
+  readonly hosts: HostStore
+  /** Local mirrors. */
+  readonly mirrors: MirrorStore
+  readonly factory?: ProviderFactory
+}
+
 /** The service implementation. */
 export class RepoService implements DshRepoService {
   readonly version = 1 as const
   private readonly providers = new Map<string, Provider>()
+  private readonly credentials: HostCredentials
+  private readonly hosts: HostStore
+  private readonly mirrors: MirrorStore
+  private readonly factory: ProviderFactory
 
   /**
    * @param config - validated configuration.
-   * @param credentials - DSH credential store; tokens are resolved per request.
-   * @param factory - provider factory.
+   * @param deps - credential store, hosts, mirrors, and provider factory.
    */
-  constructor(
-    private readonly config: RepoConfig,
-    private readonly credentials: HostCredentials,
-    private readonly factory: ProviderFactory = defaultProviderFactory,
-  ) {}
+  constructor(private readonly config: RepoConfig, deps: RepoServiceDeps) {
+    this.credentials = deps.credentials
+    this.hosts = deps.hosts
+    this.mirrors = deps.mirrors
+    this.factory = deps.factory ?? defaultProviderFactory
+  }
 
-  /** Whether any host is configured. */
+  /** Whether any host is configured or added. */
   get configured(): boolean {
-    return this.config.hosts.length > 0
+    return this.hosts.all().length > 0
   }
 
   resolve(repo: RepoTarget): RepoRef {
@@ -238,8 +263,121 @@ export class RepoService implements DshRepoService {
     return await this.run(repo, options, `合并 PR/MR #${number}`, (provider, ref, call) => provider.mergeChange(ref, number, request, call))
   }
 
+  async listHosts(): Promise<readonly HostInfo[]> {
+    return await Promise.all(this.hosts.all().map(spec => this.hostInfo(spec)))
+  }
+
+  async addHost(host: HostCreate): Promise<HostInfo> {
+    const token = host.token?.trim()
+    if (token !== undefined && !isAcceptedToken(token)) throw new RepoError('invalid', `令牌不能为空、超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`)
+    const spec = await this.hosts.add(host)
+    if (token !== undefined) await this.storeToken(spec, token)
+    return await this.hostInfo(spec)
+  }
+
+  async removeHost(url: string): Promise<void> {
+    const spec = await this.hosts.remove(url)
+    this.providers.delete(spec.url)
+    try {
+      await this.credentials.unset(spec.tokenRef)
+    } catch (error) {
+      throw new RepoError('unavailable', `已删除主机 ${spec.url}，但清除令牌 ${spec.tokenRef} 失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  async setHostToken(url: string, token: string | undefined): Promise<HostInfo> {
+    const spec = this.hosts.find(url)
+    if (token === undefined) {
+      try {
+        await this.credentials.unset(spec.tokenRef)
+      } catch (error) {
+        throw new RepoError('unavailable', `清除 ${spec.tokenRef} 失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+    } else {
+      const value = token.trim()
+      if (!isAcceptedToken(value)) throw new RepoError('invalid', `令牌不能为空、超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`)
+      await this.storeToken(spec, value)
+    }
+    return await this.hostInfo(spec)
+  }
+
+  mirrorSettings(): MirrorSettings {
+    return { dir: this.mirrors.root }
+  }
+
+  async syncMirror(url: string, options: MirrorSyncOptions = {}): Promise<MirrorState> {
+    const env = await this.mirrorAuth(url)
+    return await this.mirrors.sync(url, options.branch, env, options.signal)
+  }
+
+  async readMirrorFile(url: string, commit: string, path: string, options: CallOptions = {}): Promise<string | undefined> {
+    requireRepoPath(path, '文件路径')
+    return await this.mirrors.readFile(url, commit, path, options.signal)
+  }
+
+  async listMirrorTree(url: string, commit: string, path: string, options: CallOptions = {}): Promise<readonly MirrorTreeEntry[]> {
+    const directory = path.replace(/^\/+|\/+$/g, '')
+    if (directory !== '') requireRepoPath(directory, '目录')
+    return await this.mirrors.listTree(url, commit, directory, options.signal)
+  }
+
+  async acquireSnapshot(url: string, commit: string, options: CallOptions = {}): Promise<SnapshotLease> {
+    return await this.mirrors.acquire(url, commit, options.signal)
+  }
+
+  /**
+   * Environment of a mirror's network commands: the host's token for an
+   * HTTP(S) address under a known host, nothing otherwise.
+   * @throws {RepoError} `invalid` for an unsupported address, `not-allowed` outside the configured repositories or on another host when those are refused, `unauthenticated` when the host's token is unset.
+   */
+  private async mirrorAuth(url: string): Promise<Record<string, string>> {
+    this.mirrors.dirOf(url)
+    const local = isAbsolute(url) || url.startsWith('file:')
+    const spec = local ? undefined : hostOf(url, this.hosts.all())
+    if (spec === undefined) {
+      if (!this.config.mirror.otherHosts) throw new RepoError('not-allowed', `${url} 不属于已配置的主机，dsh-repo 不镜像其他主机上的仓库`)
+      return {}
+    }
+    resolveTarget(url, this.hosts.all(), this.config.repos)
+    if (!/^https?:/i.test(url)) return {}
+    return credentialEnvironment(spec.url, gitUsername(spec.kind), await this.token(spec))
+  }
+
+  private async storeToken(spec: HostSpec, value: string): Promise<void> {
+    try {
+      await this.credentials.set(spec.tokenRef, value)
+    } catch (error) {
+      throw new RepoError('unavailable', `保存 ${spec.tokenRef} 失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private async hostInfo(spec: HostSpec): Promise<HostInfo> {
+    let token: TokenStatus
+    try {
+      const info = await this.credentials.describe(spec.tokenRef)
+      token = { configured: info.configured, ...info.source === undefined ? {} : { source: info.source }, writable: info.writable }
+    } catch (error) {
+      token = { configured: false, writable: false, error: error instanceof Error ? error.message : String(error) }
+    }
+    return {
+      kind: spec.kind,
+      url: spec.url,
+      ...spec.alias === undefined ? {} : { alias: spec.alias },
+      tokenRef: spec.tokenRef,
+      origin: this.hosts.isAdded(spec.url) ? 'added' : 'config',
+      token,
+    }
+  }
+
+  private async token(spec: HostSpec): Promise<string> {
+    const resolved = await this.credentials.resolve(spec.tokenRef)
+    if (resolved === undefined || resolved.value === '') throw new RepoError('unauthenticated', `${spec.url} 的令牌 ${spec.tokenRef} 未设置（在 DSH 凭据库或同名环境变量中设置）`)
+    if (!isAcceptedToken(resolved.value)) throw new RepoError('unauthenticated', `${spec.tokenRef} 的值不能用作令牌：不能超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`)
+    return resolved.value
+  }
+
   private target(repo: RepoTarget): ResolvedTarget {
-    return resolveTarget(repo, this.config.hosts, this.config.repos)
+    return resolveTarget(repo, this.hosts.all(), this.config.repos)
   }
 
   private paging(options: PageOptions): Paging {
@@ -255,12 +393,7 @@ export class RepoService implements DshRepoService {
   private provider(spec: HostSpec): Provider {
     const existing = this.providers.get(spec.url)
     if (existing !== undefined) return existing
-    const token = async (): Promise<string> => {
-      const resolved = await this.credentials.resolve(spec.tokenRef)
-      if (resolved === undefined || resolved.value === '') throw new RepoError('unauthenticated', `${spec.url} 的令牌 ${spec.tokenRef} 未设置（在 DSH 凭据库或同名环境变量中设置）`)
-      return resolved.value
-    }
-    const created = this.factory(spec, token, this.config.timeoutMs)
+    const created = this.factory(spec, () => this.token(spec), this.config.timeoutMs)
     this.providers.set(spec.url, created)
     return created
   }

@@ -1,7 +1,13 @@
 import { vi } from 'vitest'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { resolveConfig } from '../src/config.ts'
 import type { RepoConfig } from '../src/config.ts'
 import type { HostCredentials } from '../src/host.ts'
+import { HostStore } from '../src/hosts.ts'
+import { runGit } from '../src/mirror/git.ts'
+import { MirrorStore } from '../src/mirror/store.ts'
+import { RepoService } from '../src/service.ts'
 
 /** One recorded request. */
 export interface Recorded {
@@ -43,9 +49,28 @@ export function fakeHttp(routes: Route[]): { requests: Recorded[] } {
   return { requests }
 }
 
-/** Credentials answering fixed values. */
-export function credentials(values: Record<string, string>): HostCredentials {
-  return { resolve: async ref => values[ref] === undefined ? undefined : { value: values[ref], source: 'test' } }
+/** In-memory credential store seeded with fixed values. */
+export function credentials(values: Record<string, string>): HostCredentials & { readonly values: Record<string, string> } {
+  const store = { ...values }
+  return {
+    values: store,
+    resolve: async ref => store[ref] === undefined ? undefined : { value: store[ref], source: 'file' },
+    describe: async ref => ({ configured: store[ref] !== undefined, ...store[ref] === undefined ? {} : { source: 'file' }, writable: true }),
+    set: async (ref, value) => { store[ref] = value },
+    unset: async (ref) => { delete store[ref] },
+  }
+}
+
+/**
+ * Service over a configuration, fixed tokens, an added-hosts file and mirror
+ * root under `root` (default: a path that does not exist).
+ */
+export function createService(config: RepoConfig, tokens: Record<string, string> = {}, root = join(tmpdir(), 'dsh-repo-test-missing')): RepoService {
+  return new RepoService(config, {
+    credentials: credentials(tokens),
+    hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
+    mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: config.limits.maxFileBytes, maxTreeEntries: config.limits.maxTreeEntries }),
+  })
 }
 
 /** Configuration with a github.com host, a GitHub Enterprise host, and a self-managed GitLab under a path prefix. */

@@ -4,6 +4,8 @@
  * @module dsh-repo/config
  */
 
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { ForgeKind } from './contract.ts'
 
@@ -61,6 +63,15 @@ const limitsSchema = z.object({
   if (limits.perPage > limits.maxPerPage) issues.addIssue({ code: 'custom', path: ['perPage'], message: 'perPage 不能大于 maxPerPage' })
 })
 
+const mirrorSchema = z.object({
+  /** Directory holding the mirrors (`~` expands to the home directory); default `$DSH_HOME/dsh-repo/mirrors`. */
+  dir: z.string().trim().min(1, '镜像目录不能为空').optional(),
+  /** Timeout of one git command (clone, fetch, worktree). */
+  gitTimeoutMs: z.number().int().min(1000).max(MAX_TIMER_DELAY_MS).default(10 * 60 * 1000),
+  /** Whether addresses on hosts outside `hosts` may be mirrored with the machine's own git credentials. */
+  otherHosts: z.boolean().default(true),
+}).strict()
+
 const toolsSchema = z.object({
   enabled: z.boolean().default(true),
   /** `ask`: every write asks the user once; `allow`: writes run without asking; `off`: write tools are not registered. */
@@ -85,19 +96,26 @@ export const pluginConfigSchema = z.object({
   timeoutMs: z.number().int().min(1000).max(MAX_TIMER_DELAY_MS).default(30_000),
   limits: limitsSchema.default({ perPage: 30, maxPerPage: 100, maxFileBytes: 1024 * 1024, maxDiffBytes: 512 * 1024, maxTreeEntries: 1000, maxCommitFiles: 100, maxComments: 50 }),
   tools: toolsSchema.default({ enabled: true, writes: 'ask', merge: false, signature: '' }),
+  mirror: mirrorSchema.default({ gitTimeoutMs: 10 * 60 * 1000, otherHosts: true }),
+  /** File holding hosts added at run time; default `$DSH_HOME/dsh-repo/hosts.json`. */
+  hostsFile: z.string().trim().min(1, '主机文件路径不能为空').optional(),
 }).strict().default({
   hosts: [],
   repos: [],
   timeoutMs: 30_000,
   limits: { perPage: 30, maxPerPage: 100, maxFileBytes: 1024 * 1024, maxDiffBytes: 512 * 1024, maxTreeEntries: 1000, maxCommitFiles: 100, maxComments: 50 },
   tools: { enabled: true, writes: 'ask', merge: false, signature: '' },
+  mirror: { gitTimeoutMs: 10 * 60 * 1000, otherHosts: true },
 })
 
 /** Validated configuration. */
 export type RepoConfig = z.output<typeof pluginConfigSchema>
 
-/** One configured host. */
+/** One host: configured in cordis.yml or added at run time. */
 export type HostSpec = RepoConfig['hosts'][number]
+
+/** Schema of one host, shared by the configuration and the added-hosts file. */
+export const hostSpecSchema = hostSchema
 
 /** Size and paging limits. */
 export type RepoLimits = RepoConfig['limits']
@@ -123,4 +141,45 @@ export function apiBaseUrl(host: { readonly kind: ForgeKind; readonly url: strin
   if (host.kind === 'gitlab') return host.url
   if (host.apiUrl !== undefined) return host.apiUrl
   return new URL(host.url).host === 'github.com' ? 'https://api.github.com' : `${host.url}/api/v3`
+}
+
+/**
+ * `$DSH_HOME`, defaulting to `~/.dsh`.
+ * @param env - process environment.
+ * @returns the DSH home directory.
+ */
+export function resolveDshHome(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.DSH_HOME?.trim()
+  return configured !== undefined && configured !== '' ? configured : join(homedir(), '.dsh')
+}
+
+/**
+ * Expand `~` and make a configured path absolute.
+ * @param path - configured path.
+ * @returns absolute path.
+ */
+export function expandHome(path: string): string {
+  if (path === '~') return homedir()
+  if (path.startsWith('~/')) return join(homedir(), path.slice(2))
+  return resolve(path)
+}
+
+/**
+ * The mirror directory a configuration implies.
+ * @param config - validated configuration.
+ * @param env - process environment.
+ * @returns absolute directory.
+ */
+export function mirrorDir(config: RepoConfig, env: NodeJS.ProcessEnv = process.env): string {
+  return config.mirror.dir === undefined ? join(resolveDshHome(env), 'dsh-repo', 'mirrors') : expandHome(config.mirror.dir)
+}
+
+/**
+ * The added-hosts file a configuration implies.
+ * @param config - validated configuration.
+ * @param env - process environment.
+ * @returns absolute path.
+ */
+export function hostsFile(config: RepoConfig, env: NodeJS.ProcessEnv = process.env): string {
+  return config.hostsFile === undefined ? join(resolveDshHome(env), 'dsh-repo', 'hosts.json') : expandHome(config.hostsFile)
 }

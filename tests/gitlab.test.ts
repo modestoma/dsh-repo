@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { RepoService } from '../src/service.ts'
-import { credentials, fakeHttp, testConfig, TOKENS } from './helpers.ts'
+import { createService, fakeHttp, testConfig, TOKENS } from './helpers.ts'
 
 const REPO = 'https://code.example.com/gitlab/team/backend/orders'
 const API = '/gitlab/api/v4/projects/team%2Fbackend%2Forders'
@@ -23,7 +22,7 @@ function path(request: { url: URL }): string {
 describe('GitLab provider', () => {
   it('calls a self-managed instance under its path prefix with the encoded project path and PRIVATE-TOKEN', async () => {
     const { requests } = fakeHttp([{ method: 'GET', path: API, reply: { body: project } }])
-    const info = await new RepoService(testConfig(), credentials(TOKENS)).repoInfo(REPO)
+    const info = await createService(testConfig(), TOKENS).repoInfo(REPO)
     expect(info).toMatchObject({ kind: 'gitlab', path: 'team/backend/orders', defaultBranch: 'main', visibility: 'internal' })
     expect(info.description).toBeUndefined()
     expect(requests[0]?.url.origin).toBe('https://code.example.com')
@@ -32,7 +31,7 @@ describe('GitLab provider', () => {
 
   it('asks for exactly one page', async () => {
     const { requests } = fakeHttp([{ method: 'GET', path: `${API}/repository/branches`, reply: { body: [{ name: 'main', commit: { id: SHA }, protected: true, default: true }] } }])
-    const page = await new RepoService(testConfig(), credentials(TOKENS)).listBranches(REPO, { page: 2, perPage: 10 })
+    const page = await createService(testConfig(), TOKENS).listBranches(REPO, { page: 2, perPage: 10 })
     expect(page).toEqual({ items: [{ name: 'main', commit: SHA, protected: true, default: true }] })
     expect(requests).toHaveLength(1)
     expect(Object.fromEntries(requests[0]!.url.searchParams)).toMatchObject({ page: '2', per_page: '10' })
@@ -47,7 +46,7 @@ describe('GitLab provider', () => {
         : { status: 404, body: { message: '404 Tree Not Found' } } },
       { method: 'POST', path: `${API}/repository/commits`, reply: { status: 201, body: { id: 'c1', web_url: `${REPO}/-/commit/c1` } } },
     ])
-    const result = await new RepoService(testConfig(), credentials(TOKENS)).commitFiles(REPO, {
+    const result = await createService(testConfig(), TOKENS).commitFiles(REPO, {
       branch: 'feature',
       base: 'dev',
       message: 'docs: update',
@@ -79,7 +78,7 @@ describe('GitLab provider', () => {
       { method: 'POST', path: `${API}/repository/commits`, reply: { status: 400, body: { message: 'A branch called \'feature\' already exists.' } } },
     ])
     const files = [{ action: 'write' as const, path: 'a.md', content: 'A' }]
-    await expect(new RepoService(testConfig(), credentials(TOKENS)).commitFiles(REPO, { branch: 'feature', baseSha: SHA, newBranch: true, author: { name: 'Bot', email: 'bot@example.com' }, message: 'm', files }))
+    await expect(createService(testConfig(), TOKENS).commitFiles(REPO, { branch: 'feature', baseSha: SHA, newBranch: true, author: { name: 'Bot', email: 'bot@example.com' }, message: 'm', files }))
       .rejects.toMatchObject({ code: 'conflict' })
     expect(requests.find(request => path(request).endsWith('/repository/tree'))?.url.searchParams.get('ref')).toBe(SHA)
     expect(requests.at(-1)?.body).toMatchObject({ start_sha: SHA, author_name: 'Bot', author_email: 'bot@example.com', actions: [{ action: 'update', file_path: 'a.md' }] })
@@ -90,7 +89,7 @@ describe('GitLab provider', () => {
       { method: 'GET', path: `${API}/repository/branches/feature`, reply: { body: { name: 'feature', protected: false, default: false, commit: { id: SHA } } } },
       { method: 'GET', path: `${API}/repository/branches/gone`, reply: { status: 404, body: { message: '404 Branch Not Found' } } },
     ])
-    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const service = createService(testConfig(), TOKENS)
     expect(await service.getBranch(REPO, 'feature')).toEqual({ name: 'feature', commit: SHA, protected: false, default: false })
     expect(await service.getBranch(REPO, 'gone')).toBeUndefined()
   })
@@ -100,7 +99,7 @@ describe('GitLab provider', () => {
       { method: 'GET', path: API, reply: { body: project } },
       { method: 'GET', path: `${API}/repository/branches/feature`, reply: { body: { name: 'feature', protected: false, commit: { id: SHA } } } },
     ])
-    await expect(new RepoService(testConfig(), credentials(TOKENS)).commitFiles(REPO, { branch: 'feature', newBranch: true, message: 'm', files: [{ action: 'delete', path: 'a' }] }))
+    await expect(createService(testConfig(), TOKENS).commitFiles(REPO, { branch: 'feature', newBranch: true, message: 'm', files: [{ action: 'delete', path: 'a' }] }))
       .rejects.toMatchObject({ code: 'conflict' })
     expect(requests.some(request => request.method === 'POST')).toBe(false)
   })
@@ -112,7 +111,7 @@ describe('GitLab provider', () => {
       { method: 'PUT', path: `${API}/issues/3`, reply: { body: issue } },
       { method: 'GET', path: `${API}/issues`, reply: { body: [issue] } },
     ])
-    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const service = createService(testConfig(), TOKENS)
     expect(await service.updateIssue(REPO, 3, { state: 'closed', assignees: ['dev'], labels: ['bug', 'p1'] })).toMatchObject({ number: 3, state: 'closed', assignees: [{ username: 'dev' }] })
     expect(requests.find(request => request.method === 'PUT')?.body).toEqual({ state_event: 'close', assignee_ids: [42], labels: 'bug,p1' })
     await service.listIssues(REPO, { state: 'open', assignee: 'dev' })
@@ -125,7 +124,7 @@ describe('GitLab provider', () => {
       { method: 'POST', path: `${API}/merge_requests`, reply: { status: 201, body: mr({ title: 'Draft: T', draft: true }) } },
       { method: 'GET', path: `${API}/merge_requests`, reply: { body: [mr({ state: 'merged' })] } },
     ])
-    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const service = createService(testConfig(), TOKENS)
     expect(await service.createChange(REPO, { title: 'T', sourceBranch: 'f', draft: true })).toMatchObject({ number: 7, draft: true, targetBranch: 'main', body: '' })
     expect(requests.find(request => request.method === 'POST')?.body).toMatchObject({ source_branch: 'f', target_branch: 'main', title: 'Draft: T' })
     expect((await service.listChanges(REPO, { state: 'merged' })).items[0]?.state).toBe('merged')
@@ -137,7 +136,7 @@ describe('GitLab provider', () => {
       { method: 'GET', path: `${API}/merge_requests/7`, reply: { body: mr({ head_pipeline: { id: 9, status: 'failed', web_url: 'p' }, detailed_merge_status: 'mergeable' }) } },
       { method: 'PUT', path: `${API}/merge_requests/7/merge`, reply: { body: mr({ state: 'merged', merge_commit_sha: 'm1' }) } },
     ])
-    const service = new RepoService(testConfig({ tools: { merge: true } }), credentials(TOKENS))
+    const service = createService(testConfig({ tools: { merge: true } }), TOKENS)
     expect(await service.changeStatus(REPO, 7)).toEqual({ headSha: SHA, checks: [{ name: 'pipeline #9', state: 'failure', webUrl: 'p' }], overall: 'failure', mergeable: true })
     expect(await service.mergeChange(REPO, 7, { headSha: SHA, method: 'squash' })).toEqual({ sha: 'm1' })
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, squash: true })
@@ -149,7 +148,7 @@ describe('GitLab provider', () => {
       { old_path: 'a.txt', new_path: 'a.txt', new_file: false, deleted_file: false, diff: '@@ -1 +1 @@\n-a\n+b\n' },
       { old_path: 'n.txt', new_path: 'n.txt', new_file: true, deleted_file: false, diff: '@@ -0,0 +1 @@\n+n\n' },
     ] } }])
-    const { diff, truncated } = await new RepoService(testConfig(), credentials(TOKENS)).changeDiff(REPO, 7)
+    const { diff, truncated } = await createService(testConfig(), TOKENS).changeDiff(REPO, 7)
     expect(truncated).toBe(false)
     expect(diff).toBe('diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/n.txt b/n.txt\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+n\n')
   })
@@ -158,13 +157,13 @@ describe('GitLab provider', () => {
     fakeHttp([{ method: 'GET', path: `${API}/merge_requests/7/diffs`, reply: { body: [
       { old_path: 'big.json', new_path: 'big.json', new_file: false, deleted_file: false, too_large: true, collapsed: false, diff: '' },
     ] } }])
-    const { diff, truncated } = await new RepoService(testConfig(), credentials(TOKENS)).changeDiff(REPO, 7)
+    const { diff, truncated } = await createService(testConfig(), TOKENS).changeDiff(REPO, 7)
     expect(truncated).toBe(true)
     expect(diff).toContain('GitLab 未返回这个文件的 diff')
   })
 
   it('classifies GitLab errors', async () => {
     fakeHttp([{ method: 'GET', path: API, reply: { status: 401, body: { message: '401 Unauthorized' } } }])
-    await expect(new RepoService(testConfig(), credentials(TOKENS)).repoInfo(REPO)).rejects.toMatchObject({ code: 'unauthenticated', message: expect.stringContaining('401 Unauthorized') })
+    await expect(createService(testConfig(), TOKENS).repoInfo(REPO)).rejects.toMatchObject({ code: 'unauthenticated', message: expect.stringContaining('401 Unauthorized') })
   })
 })
