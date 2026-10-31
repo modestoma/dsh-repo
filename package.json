@@ -1,0 +1,85 @@
+{
+  "name": "dsh-repo",
+  "version": "0.0.0",
+  "description": "DeepSeek Harness (DSH) 代码仓库插件：用 GitHub 官方 Octokit 和 GitBeaker 抹平 GitHub / GitLab（含 GitHub Enterprise 与自建 GitLab）差异，对外提供 dshRepos 服务，并为模型提供代码、issue、PR/MR 工具",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modestoma/dsh-repo.git"
+  },
+  "packageManager": "pnpm@12.15.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./lib/index.js"
+    },
+    "./contract": {
+      "types": "./src/contract.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "lib",
+    "README.md",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsdown --config tsdown.config.ts",
+    "verify:host": "node scripts/verify-host-loader.mjs",
+    "prepack": "pnpm build",
+    "check": "pnpm typecheck && pnpm test && pnpm build && pnpm verify:host"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "github",
+    "gitlab",
+    "octokit",
+    "gitbeaker"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@gitbeaker/rest": "^43.8.0",
+    "@octokit/rest": "^22.0.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@semantic-release/commit-analyzer": "^13.0.1",
+    "@semantic-release/github": "^12.0.10",
+    "@semantic-release/npm": "^13.2.0",
+    "@semantic-release/release-notes-generator": "^14.1.1",
+    "@types/node": "^26.6.6",
+    "conventional-changelog-conventionalcommits": "9.3.1",
+    "semantic-release": "^25.0.9",
+    "tsdown": "0.22.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": false
+    }
+  }
+}
