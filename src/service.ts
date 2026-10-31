@@ -363,8 +363,9 @@ export class RepoService implements DshRepoService {
   async openWorkspace(url: string, options: WorkspaceOpenOptions): Promise<WorkspaceInfo> {
     if (options.commit !== undefined && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(options.commit)) throw new RepoError('invalid', `起点提交必须是完整的十六进制提交 id：${options.commit}`)
     if (!isAbsolute(options.dir)) throw new RepoError('invalid', `工作区目录必须是绝对路径：${options.dir}`)
-    const state = await this.syncMirror(url, { ...options.baseBranch === undefined ? {} : { branch: options.baseBranch }, ...options.signal === undefined ? {} : { signal: options.signal } })
-    return await this.workspaces.open(url, options.dir, options.commit ?? state.commit, state.branch, options.signal)
+    const env = await this.mirrorAuth(url)
+    const state = await this.mirrors.sync(url, options.baseBranch, env, options.signal)
+    return await this.workspaces.open(url, options.dir, options.commit ?? state.commit, state.branch, env, options.signal)
   }
 
   async workspaceChanges(dir: string, options: CallOptions = {}): Promise<WorkspaceChanges> {

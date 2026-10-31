@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HostStore } from '../src/hosts.ts'
 import { runGit } from '../src/mirror/git.ts'
+import type { GitRunner } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
 import { credentials, fakeHttp, testConfig, TOKENS, withMirrors } from './helpers.ts'
@@ -41,13 +42,13 @@ function origin(): { bare: string; commit: string } {
   return { bare, commit: git(work, 'rev-parse', 'HEAD') }
 }
 
-function setup(tokens: Record<string, string> = {}) {
+function setup(tokens: Record<string, string> = {}, git: GitRunner = runGit) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-'))
   const config = testConfig()
   const make = () => new RepoService(config, {
     credentials: credentials(tokens),
     hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
-    ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 1024, maxTreeEntries: 100 }), runGit, 200),
+    ...withMirrors(new MirrorStore({ git, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 1024, maxTreeEntries: 100 }), git, 200),
   })
   const sandbox = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-session-'))
   return { root, sandbox, service: make(), make }
@@ -184,7 +185,11 @@ describe('workspaces', () => {
 
   it('commits as the account that owns the host token and records the session', async () => {
     const { bare, commit } = origin()
-    const { sandbox, service } = setup(TOKENS)
+    const checkouts: Readonly<Record<string, string>>[] = []
+    const { sandbox, service } = setup(TOKENS, async (args, options) => {
+      if (args[0] === 'worktree' && args[1] === 'add') checkouts.push(options.env ?? {})
+      return await runGit(args, options)
+    })
     // Serve the github.com address from the local origin so the test stays offline.
     const remote = 'https://github.com/modestoma/app.git'
     vi.stubEnv('GIT_CONFIG_COUNT', '1')
@@ -192,6 +197,8 @@ describe('workspaces', () => {
     vi.stubEnv('GIT_CONFIG_VALUE_0', remote)
     const dir = join(sandbox, 'app')
     expect(await service.openWorkspace(remote, { dir })).toMatchObject({ url: remote, baseCommit: commit })
+    // Checkout runs the Git LFS smudge filter, which may download with the host token.
+    expect(checkouts).toEqual([expect.objectContaining({ DSH_REPO_GIT_TOKEN: 'gh-token' })])
     let reads = 0
     const { requests } = fakeHttp([{ method: 'GET', path: '/user', reply: () => {
       reads += 1

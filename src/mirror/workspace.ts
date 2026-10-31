@@ -199,11 +199,12 @@ export class WorkspaceStore {
    * @param dir - absolute directory that must not exist.
    * @param commit - full commit id present in the mirror.
    * @param baseBranch - branch the work starts from.
-   * @param signal - cancellation before the checkout starts.
+   * @param env - credentials of the checkout, whose Git LFS smudge filter may download files.
+   * @param signal - cancellation.
    * @returns the workspace.
    * @throws {RepoError} `invalid` for a relative or existing directory, `not-found` for a missing mirror or commit, `unavailable` when git fails.
    */
-  async open(url: string, dir: string, commit: string, baseBranch: string, signal?: AbortSignal): Promise<WorkspaceInfo> {
+  async open(url: string, dir: string, commit: string, baseBranch: string, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<WorkspaceInfo> {
     if (!isAbsolute(dir)) throw new RepoError('invalid', `工作区目录必须是绝对路径：${dir}`)
     const target = resolve(dir)
     if (await exists(target)) throw new RepoError('invalid', `工作区目录已存在：${target}`)
@@ -213,7 +214,7 @@ export class WorkspaceStore {
       await mkdir(dirname(target), { recursive: true })
       await this.deps.mirrors.withWorktreeLock(mirror, async () => {
         signal?.throwIfAborted()
-        await this.git(['worktree', 'add', '--quiet', '-b', `${BRANCH_PREFIX}${id}`, target, commit], mirror)
+        await this.deps.git(['worktree', 'add', '--quiet', '-b', `${BRANCH_PREFIX}${id}`, target, commit], { cwd: mirror, timeoutMs: this.deps.timeoutMs, env, ...signal === undefined ? {} : { signal } })
         await this.git(['config', `${SECTION}.${id}.baseBranch`, baseBranch], mirror)
         await this.git(['config', `${SECTION}.${id}.baseCommit`, commit], mirror)
       })
