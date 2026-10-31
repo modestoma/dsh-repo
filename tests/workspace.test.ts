@@ -12,6 +12,17 @@ import { credentials, fakeHttp, testConfig, TOKENS, withMirrors } from './helper
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 const BOT = { name: 'Bot', email: 'bot@example.com' }
 
+/** Whether the machine has Git LFS. */
+const HAS_LFS = (() => {
+  try {
+    execFileSync('git', ['lfs', 'version'], { stdio: 'ignore' })
+    return true
+  } catch {
+    // No `git lfs` command on this machine.
+    return false
+  }
+})()
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, env: { ...process.env, ...AUTHOR }, encoding: 'utf8' }).trim()
 }
@@ -66,6 +77,8 @@ describe('workspaces', () => {
     writeFileSync(join(dir, 'app.ts'), 'export const a = 2\nexport const b = 3\n')
     writeFileSync(join(dir, 'new.ts'), 'export {}\n')
     writeFileSync(join(dir, 'blob.bin'), Buffer.from([0, 1, 2, 0]))
+    writeFileSync(join(dir, 'tab\tname.txt'), 'a\nb\n')
+    writeFileSync(join(dir, 'tab\tblob.bin'), Buffer.from([0, 1]))
     rmSync(join(dir, 'old.txt'))
     const changes = await service.workspaceChanges(join(dir))
     expect(changes.uncommitted).toBe(true)
@@ -75,6 +88,8 @@ describe('workspaces', () => {
       { path: 'new.ts', status: 'added', binary: false, additions: 1, deletions: 0 },
       { path: 'old.txt', status: 'deleted', binary: false, additions: 0, deletions: 1 },
       { path: 'blob.bin', status: 'added', binary: true },
+      { path: 'tab\tname.txt', status: 'added', binary: false, additions: 2, deletions: 0 },
+      { path: 'tab\tblob.bin', status: 'added', binary: true },
     ]))
     expect(changes.diff).toContain('+export const b = 3')
     expect(changes.truncated).toBe(true)
@@ -202,6 +217,26 @@ describe('workspaces', () => {
     await service.pushWorkspace(dir, { message: 'feat: last' })
     expect(git(bare, 'log', '-1', '--format=%an', 'fix/a')).toBe('shared-bot')
     expect(reads).toBe(2)
+  })
+
+  it.skipIf(!HAS_LFS)('uploads the Git LFS objects of pushed commits', async () => {
+    const lfs = { 'filter.lfs.clean': 'git-lfs clean -- %f', 'filter.lfs.smudge': 'git-lfs smudge -- %f', 'filter.lfs.process': 'git-lfs filter-process', 'filter.lfs.required': 'true' }
+    vi.stubEnv('GIT_CONFIG_COUNT', String(Object.keys(lfs).length))
+    Object.entries(lfs).forEach(([key, value], index) => {
+      vi.stubEnv(`GIT_CONFIG_KEY_${index}`, key)
+      vi.stubEnv(`GIT_CONFIG_VALUE_${index}`, value)
+    })
+    const { bare } = origin()
+    const { sandbox, service } = setup()
+    const dir = join(sandbox, 'app')
+    await service.openWorkspace(bare, { dir })
+    writeFileSync(join(dir, '.gitattributes'), '*.bin filter=lfs diff=lfs merge=lfs -text\n')
+    writeFileSync(join(dir, 'model.bin'), 'large content\n')
+    const pushed = await service.pushWorkspace(dir, { branch: 'lfs', message: 'add model', author: BOT })
+    expect(git(bare, 'cat-file', '-p', `${pushed.commit}:model.bin`)).toContain('version https://git-lfs.github.com/spec/v1')
+    const clone = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-lfs-'))
+    git(clone, 'clone', '--quiet', '--branch', 'lfs', bare, '.')
+    expect(readFileSync(join(clone, 'model.bin'), 'utf8')).toBe('large content\n')
   })
 
   it('refuses directories that are not workspaces of this service, including forged links', async () => {

@@ -104,7 +104,12 @@ function parseChanges(names: string, numbers: string): WorkspaceFileChange[] {
   for (let index = 0; index < numberFields.length; index += 1) {
     const field = numberFields[index] ?? ''
     if (field === '') continue
-    const [added = '', deleted = '', path = ''] = field.split('\t')
+    // Only the first two tabs separate fields; a path may contain tabs.
+    const first = field.indexOf('\t')
+    const second = field.indexOf('\t', first + 1)
+    const added = field.slice(0, first)
+    const deleted = field.slice(first + 1, second)
+    const path = field.slice(second + 1)
     // A rename reports an empty path followed by the old and new paths.
     const target = path === '' ? numberFields[index + 2] ?? '' : path
     if (path === '') index += 2
@@ -175,7 +180,18 @@ export class WorkspaceStore {
   private readonly locks = new Map<string, Promise<void>>()
 
   /** @param deps - git runner, mirrors, timeout, and diff limit. */
+  /** Whether `git lfs` is installed; asked once per store. */
+  private lfs: Promise<boolean> | undefined
+
   constructor(private readonly deps: WorkspaceStoreDeps) {}
+
+  /** Whether Git LFS is installed and some LFS file differs between the workspace's base commit and HEAD. */
+  private async changesLfsFiles(ws: Located, signal?: AbortSignal): Promise<boolean> {
+    // A missing `git lfs` command is the only expected failure of `git lfs version`.
+    this.lfs ??= this.deps.git(['lfs', 'version'], { timeoutMs: this.deps.timeoutMs }).then(() => true, () => false)
+    if (!await this.lfs) return false
+    return (await this.workspaceGit(ws, ['lfs', 'ls-files', '--name-only', ws.baseCommit, 'HEAD'], {}, signal)).trim() !== ''
+  }
 
   /**
    * Check out a commit of a synced mirror at a new directory on a fresh local branch.
@@ -264,6 +280,8 @@ export class WorkspaceStore {
       const ref = `refs/heads/${branch}`
       const lease = first ? [`--force-with-lease=${ref}:`] : []
       try {
+        // `--no-verify` also skips the Git LFS pre-push hook, so upload the LFS objects of the new commits first.
+        if (await this.changesLfsFiles(ws, request.signal)) await this.workspaceGit(ws, ['lfs', 'push', 'origin', 'HEAD'], request.env, request.signal)
         const report = await this.workspaceGit(ws, ['push', '--porcelain', '--no-verify', ...lease, 'origin', `HEAD:${ref}`], request.env, request.signal)
         // A lease does not reject a remote branch that already points at HEAD; git reports it as up to date (`=`).
         if (first && report.split('\n').some(line => line.startsWith('=\t'))) throw new RepoError('conflict', `远端分支 ${branch} 已存在，没有推送`)
