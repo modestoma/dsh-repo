@@ -157,3 +157,25 @@ describe('mirror store', () => {
     await expect(service.readMirrorFile(repo.dir, state.commit, 'big.txt')).rejects.toMatchObject({ code: 'too-large' })
   })
 })
+
+describe('mirror directory changes', () => {
+  it('clones into the new directory and keeps held snapshots beside the old mirror', async () => {
+    const { dir: source, commit } = origin()
+    const { root, service } = setup()
+    const first = await service.syncMirror(source)
+    expect(first.dir.startsWith(join(root, 'mirrors'))).toBe(true)
+    const lease = await service.acquireSnapshot(source, commit)
+    expect(lease.dir.startsWith(join(root, 'mirrors', '.snapshots'))).toBe(true)
+
+    const moved = join(root, 'moved')
+    expect(await service.setMirrorDir(moved)).toEqual({ dir: moved, defaultDir: join(root, 'mirrors') })
+    expect(existsSync(lease.dir)).toBe(true)
+    const second = await service.syncMirror(source)
+    expect(second.dir.startsWith(moved)).toBe(true)
+    expect(second.commit).toBe(commit)
+    expect(existsSync(first.dir)).toBe(true)
+    lease.release()
+    expect((await service.acquireSnapshot(source, commit)).dir.startsWith(join(moved, '.snapshots'))).toBe(true)
+    await expect(service.setMirrorDir('~nobody/x')).rejects.toMatchObject({ code: 'invalid' })
+  })
+})

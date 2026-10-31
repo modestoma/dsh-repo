@@ -12,7 +12,9 @@ import type { RepoErrorCode } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { RepoService } from '../service.ts'
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, STATE_ROUTE } from './contract.ts'
+import type { DirectoryPicker } from './directory-picker.ts'
+import { hostDirectoryPicker } from './directory-picker.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, STATE_ROUTE } from './contract.ts'
 import type { SettingsState } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
@@ -28,6 +30,7 @@ const hostAddSchema = z.object({
 }).strict()
 const hostUrlSchema = z.object({ url: z.string() }).strict()
 const hostTokenSchema = z.object({ url: z.string(), value: z.string() }).strict()
+const mirrorSchema = z.object({ dir: z.string() }).strict()
 
 /** HTTP status of each service failure the routes can surface. */
 const STATUS: Readonly<Record<RepoErrorCode, number>> = {
@@ -135,10 +138,11 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
 /**
  * The settings page's view of the service.
  * @param service - the `dshRepos` implementation.
- * @returns hosts with token status, and the mirror directory.
+ * @param picker - the Host's directory dialog.
+ * @returns hosts with token status, the mirror directory, and whether a directory dialog is available.
  */
-export async function settingsState(service: RepoService): Promise<SettingsState> {
-  return { hosts: await service.listHosts(), mirrorDir: service.mirrorSettings().dir }
+export async function settingsState(service: RepoService, picker: DirectoryPicker): Promise<SettingsState> {
+  return { hosts: await service.listHosts(), mirror: service.mirrorSettings(), pickerAvailable: picker.available }
 }
 
 /**
@@ -146,15 +150,16 @@ export async function settingsState(service: RepoService): Promise<SettingsState
  * @param server - host web server.
  * @param gate - host request gate.
  * @param service - the `dshRepos` implementation.
+ * @param picker - the Host's directory dialog.
  * @returns disposer removing every route.
  */
-export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService): () => void {
-  const reply = async (res: ServerResponse): Promise<void> => { sendJson(res, 200, { ok: true, state: await settingsState(service) }) }
+export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService, picker: DirectoryPicker): () => void {
+  const reply = async (res: ServerResponse): Promise<void> => { sendJson(res, 200, { ok: true, state: await settingsState(service, picker) }) }
   const disposers = [
     server.register({
       kind: 'exact',
       path: STATE_ROUTE,
-      handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await settingsState(service)) }),
+      handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await settingsState(service, picker)) }),
     }),
     server.register({
       kind: 'exact',
@@ -182,6 +187,30 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
         await reply(res)
       }),
     }),
+    server.register({
+      kind: 'exact',
+      path: MIRROR_ROUTE,
+      handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
+        await service.setMirrorDir(req.method?.toUpperCase() === 'DELETE' ? undefined : (await readJsonBody(req, mirrorSchema)).dir)
+        await reply(res)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: PICK_DIRECTORY_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        const abort = new AbortController()
+        const onClose = (): void => { abort.abort() }
+        res.on('close', onClose)
+        try {
+          sendJson(res, 200, { ok: true, path: await picker.pick(abort.signal) })
+        } catch (error) {
+          throw new HttpError(409, error instanceof Error ? error.message : String(error))
+        } finally {
+          res.off('close', onClose)
+        }
+      }),
+    }),
   ]
   return () => { for (const dispose of disposers) dispose() }
 }
@@ -196,7 +225,7 @@ export function mountSettingsRoutes(ctx: HostContext, service: RepoService): voi
     const server = webCtx.get?.('webServer') as HostWebServer | undefined
     const gate = webCtx.get?.('connection') as HostRequestGate | undefined
     if (server === undefined || gate === undefined) return
-    webCtx.effect(() => registerSettingsRoutes(server, gate, service), 'dsh-repo: settings routes')
+    webCtx.effect(() => registerSettingsRoutes(server, gate, service, hostDirectoryPicker(webCtx)), 'dsh-repo: settings routes')
   }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer', 'connection'], attach)

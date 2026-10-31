@@ -5,7 +5,7 @@
  * @module dsh-repo/settings/contract
  */
 
-import type { ForgeKind, HostInfo } from '../contract.ts'
+import type { ForgeKind, HostInfo, MirrorSettings } from '../contract.ts'
 
 /** GET：{@link SettingsState}。 */
 export const STATE_ROUTE = '/dsh-repo/state'
@@ -13,6 +13,10 @@ export const STATE_ROUTE = '/dsh-repo/state'
 export const HOSTS_ROUTE = '/dsh-repo/hosts'
 /** PUT：body `{ url, value }` 保存主机令牌；DELETE：body `{ url }` 清除保存的令牌。 */
 export const HOST_TOKEN_ROUTE = '/dsh-repo/host-token'
+/** PUT：body `{ dir }` 选择镜像目录；DELETE：恢复默认目录。 */
+export const MIRROR_ROUTE = '/dsh-repo/mirror'
+/** POST：打开宿主机的系统目录选择框，响应 {@link PickedDirectory}。 */
+export const PICK_DIRECTORY_ROUTE = '/dsh-repo/pick-directory'
 
 /** Body of a host addition. */
 export interface HostAddRequest {
@@ -27,8 +31,15 @@ export interface HostAddRequest {
 export interface SettingsState {
   /** Configured hosts first, with token status — never token values. */
   hosts: readonly HostInfo[]
-  /** Absolute directory of the local mirrors. */
-  mirrorDir: string
+  mirror: MirrorSettings
+  /** Whether the Host can open a system directory dialog. */
+  pickerAvailable: boolean
+}
+
+/** `POST /dsh-repo/pick-directory` response: the chosen path, or null when cancelled. */
+export interface PickedDirectory {
+  ok: true
+  path: string | null
 }
 
 /** Successful mutation response. */

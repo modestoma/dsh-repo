@@ -29,7 +29,7 @@ import type { GitRunner } from './git.ts'
 /** Collaborators and limits of the store. */
 export interface MirrorStoreDeps {
   readonly git: GitRunner
-  /** Absolute directory holding the mirrors. */
+  /** Absolute directory holding the mirrors at start; {@link MirrorStore.setRoot} changes it. */
   readonly root: string
   /** Timeout of one git command. */
   readonly timeoutMs: number
@@ -151,13 +151,27 @@ export class MirrorStore {
   private readonly worktreeLocks = new Map<string, Promise<void>>()
   /** Per mirror, the one-time deletion of snapshots an earlier run left behind. */
   private readonly cleared = new Map<string, Promise<void>>()
+  /** Root each mirror directory was resolved under, so its snapshots stay beside it after a root change. */
+  private readonly roots = new Map<string, string>()
+  private currentRoot: string
 
   /** @param deps - git runner, root, timeout, and limits. */
-  constructor(private readonly deps: MirrorStoreDeps) {}
+  constructor(private readonly deps: MirrorStoreDeps) {
+    this.currentRoot = deps.root
+  }
 
   /** @returns the mirror root. */
   get root(): string {
-    return this.deps.root
+    return this.currentRoot
+  }
+
+  /**
+   * Resolve later addresses under another root. Existing mirrors and held
+   * snapshots stay where they are; a later sync clones into the new root.
+   * @param root - absolute directory.
+   */
+  setRoot(root: string): void {
+    this.currentRoot = root
   }
 
   /**
@@ -168,7 +182,10 @@ export class MirrorStore {
    */
   dirOf(url: string): string {
     if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${url}（支持 https/ssh/git/file URL、user@host:path 或绝对路径）`)
-    return join(this.deps.root, ...mirrorPath(url).split('/'))
+    const root = this.currentRoot
+    const dir = join(root, ...mirrorPath(url).split('/'))
+    this.roots.set(dir, root)
+    return dir
   }
 
   /**
@@ -298,7 +315,8 @@ export class MirrorStore {
   }
 
   private snapshotRoot(dir: string): string {
-    return join(this.deps.root, '.snapshots', relative(this.deps.root, dir))
+    const root = this.roots.get(dir) ?? this.currentRoot
+    return join(root, '.snapshots', relative(root, dir))
   }
 
   private git(args: readonly string[], cwd: string | undefined, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string> {

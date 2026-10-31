@@ -1,7 +1,8 @@
 /**
  * Hosts: the ones configured in cordis.yml plus the ones added at run time,
  * which are kept in a JSON file (written to a temporary file, then renamed)
- * and carry tokens under generated credential references.
+ * and carry tokens under generated credential references. The same file
+ * keeps the mirror directory chosen at run time.
  *
  * @module dsh-repo/hosts
  */
@@ -9,7 +10,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { dirname, isAbsolute } from 'node:path'
 import { z } from 'zod'
 import type { HostCreate } from './contract.ts'
 import { hostSpecSchema, normalizeHostUrl } from './config.ts'
@@ -19,7 +20,7 @@ import { RepoError } from './errors.ts'
 /** Longest accepted token; personal access tokens are far shorter. */
 export const MAX_TOKEN_LENGTH = 4096
 
-const fileSchema = z.object({ hosts: z.array(hostSpecSchema) }).strict()
+const fileSchema = z.object({ hosts: z.array(hostSpecSchema), mirrorDir: z.string().min(1).refine(isAbsolute, '镜像目录必须是绝对路径').optional() }).strict()
 
 /**
  * Whether a token value can be handed to an SDK and to git: non-empty,
@@ -43,6 +44,7 @@ export function addedTokenRef(url: string): string {
 /** Configured and added hosts. */
 export class HostStore {
   private added: HostSpec[]
+  private chosenMirrorDir: string | undefined
   /** Tail of the queue that runs additions and removals one at a time. */
   private queue: Promise<unknown> = Promise.resolve()
 
@@ -53,15 +55,17 @@ export class HostStore {
    * @throws when the file exists but cannot be read or is invalid.
    */
   constructor(private readonly configured: readonly HostSpec[], readonly file: string) {
-    this.added = HostStore.read(file).filter(host => !configured.some(spec => spec.url === host.url))
+    const stored = HostStore.read(file)
+    this.added = stored.hosts.filter(host => !configured.some(spec => spec.url === host.url))
+    this.chosenMirrorDir = stored.mirrorDir
   }
 
-  private static read(file: string): HostSpec[] {
+  private static read(file: string): z.infer<typeof fileSchema> {
     let text: string
     try {
       text = readFileSync(file, 'utf8')
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { hosts: [] }
       throw new Error(`dsh-repo 无法读取主机文件 ${file}：${(error as Error).message}`)
     }
     let raw: unknown
@@ -72,7 +76,21 @@ export class HostStore {
     }
     const parsed = fileSchema.safeParse(raw)
     if (!parsed.success) throw new Error(`dsh-repo 主机文件 ${file} 内容不合法：${parsed.error.issues.map(issue => `${issue.path.join('.')}：${issue.message}`).join('；')}`)
-    return parsed.data.hosts
+    return parsed.data
+  }
+
+  /** @returns the mirror directory chosen at run time, or undefined for the default. */
+  mirrorDir(): string | undefined {
+    return this.chosenMirrorDir
+  }
+
+  /**
+   * Persist the mirror directory, or clear it to return to the default.
+   * @param dir - absolute directory, or undefined.
+   * @throws {RepoError} `unavailable` when the file cannot be written.
+   */
+  setMirrorDir(dir: string | undefined): Promise<void> {
+    return this.enqueue(() => this.write(this.added, dir))
   }
 
   /** @returns every host, configured ones first. */
@@ -119,7 +137,7 @@ export class HostStore {
     if (alias !== undefined && (alias.length > 64 || /[\u0000-\u001f\u007f]/.test(alias))) throw new RepoError('invalid', '别名不能超过 64 个字符或包含控制字符')
     if (this.all().some(host => host.url === url)) throw new RepoError('conflict', `主机 ${url} 已存在`)
     const host: HostSpec = { kind: create.kind ?? 'gitlab', url, tokenRef: addedTokenRef(url), ...alias === undefined || alias === '' ? {} : { alias } }
-    await this.write([...this.added, host])
+    await this.write([...this.added, host], this.chosenMirrorDir)
     return host
   }
 
@@ -136,7 +154,7 @@ export class HostStore {
   private async removeNow(url: string): Promise<HostSpec> {
     const host = this.find(url)
     if (!this.isAdded(host.url)) throw new RepoError('forbidden', `${host.url} 配置在 cordis.yml 中，不能在运行时删除`)
-    await this.write(this.added.filter(spec => spec.url !== host.url))
+    await this.write(this.added.filter(spec => spec.url !== host.url), this.chosenMirrorDir)
     return host
   }
 
@@ -148,15 +166,16 @@ export class HostStore {
     return run
   }
 
-  private async write(hosts: HostSpec[]): Promise<void> {
+  private async write(hosts: HostSpec[], mirrorDir: string | undefined): Promise<void> {
     try {
       await mkdir(dirname(this.file), { recursive: true })
       const temporary = `${this.file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
-      await writeFile(temporary, `${JSON.stringify({ hosts }, undefined, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+      await writeFile(temporary, `${JSON.stringify({ hosts, ...mirrorDir === undefined ? {} : { mirrorDir } }, undefined, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
       await rename(temporary, this.file)
     } catch (error) {
       throw new RepoError('unavailable', `无法写入主机文件 ${this.file}：${(error as Error).message}`)
     }
     this.added = hosts
+    this.chosenMirrorDir = mirrorDir
   }
 }

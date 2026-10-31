@@ -4,8 +4,8 @@
  * @module dsh-repo/client/api
  */
 
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, STATE_ROUTE } from '../settings/contract.ts'
-import type { HostAddRequest, MutationError, MutationOk, SettingsState } from '../settings/contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, STATE_ROUTE } from '../settings/contract.ts'
+import type { HostAddRequest, MutationError, MutationOk, PickedDirectory, SettingsState } from '../settings/contract.ts'
 
 /**
  * Error text of a value thrown by a request.
@@ -48,8 +48,8 @@ async function request<T>(route: string, init?: RequestInit): Promise<T> {
   return body as T
 }
 
-async function mutate(route: string, method: string, body: object): Promise<SettingsState> {
-  return (await request<MutationOk>(route, { method, body: JSON.stringify(body) })).state
+async function mutate(route: string, method: string, body?: object): Promise<SettingsState> {
+  return (await request<MutationOk>(route, { method, ...body === undefined ? {} : { body: JSON.stringify(body) } })).state
 }
 
 /** @returns hosts and the mirror directory. */
@@ -92,4 +92,23 @@ export function saveHostToken(url: string, value: string): Promise<SettingsState
  */
 export function clearHostToken(url: string): Promise<SettingsState> {
   return mutate(HOST_TOKEN_ROUTE, 'DELETE', { url })
+}
+
+/**
+ * Choose the mirror directory.
+ * @param dir - absolute directory on the Host.
+ * @returns the new state.
+ */
+export function saveMirrorDir(dir: string): Promise<SettingsState> {
+  return mutate(MIRROR_ROUTE, 'PUT', { dir })
+}
+
+/** @returns the state after returning to the default mirror directory. */
+export function resetMirrorDir(): Promise<SettingsState> {
+  return mutate(MIRROR_ROUTE, 'DELETE')
+}
+
+/** @returns the directory chosen in the Host's system dialog, or null when cancelled. */
+export async function pickDirectory(): Promise<string | null> {
+  return (await request<PickedDirectory>(PICK_DIRECTORY_ROUTE, { method: 'POST' })).path
 }

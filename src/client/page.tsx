@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { ForgeKind, TokenStatus } from '../contract.ts'
 import type { HostAddRequest, SettingsState } from '../settings/contract.ts'
-import { addHost, clearHostToken, fetchState, messageOf, removeHost, saveHostToken } from './api.ts'
+import { addHost, clearHostToken, fetchState, messageOf, pickDirectory, removeHost, resetMirrorDir, saveHostToken, saveMirrorDir } from './api.ts'
 
 /** Owner props of `plugins.bundle.config`: bundle configuration renders only `page`. */
 export interface BundleConfigProps {
@@ -52,6 +52,7 @@ function HostsPanel(): JSX.Element {
   const [alias, setAlias] = useState('')
   const [token, setToken] = useState('')
   const [values, setValues] = useState<Record<string, string>>({})
+  const [mirrorDraft, setMirrorDraft] = useState<string | undefined>()
 
   const reload = useCallback(async () => {
     try {
@@ -110,6 +111,16 @@ function HostsPanel(): JSX.Element {
     })
   }
   const submitOnEnter = (event: { key: string }): void => { if (event.key === 'Enter') add() }
+  const mirrorValue = mirrorDraft ?? state.mirror.dir
+  const saveMirror = (): void => {
+    const dir = mirrorValue.trim()
+    if (dir === '' || dir === state.mirror.dir || busy) return
+    void run(() => saveMirrorDir(dir), `镜像目录已改为 ${dir}`).then((ok) => { if (ok) setMirrorDraft(undefined) })
+  }
+  const choose = (): void => {
+    setNotice(undefined)
+    void pickDirectory().then((path) => { if (path !== null) setMirrorDraft(path) }, (error: unknown) => { setNotice({ kind: 'error', text: messageOf(error) }) })
+  }
 
   return (
     <div className="dr">
@@ -159,7 +170,20 @@ function HostsPanel(): JSX.Element {
       </section>
       <section className="dr__sec">
         <h2 className="dr__secTitle">本地镜像</h2>
-        <div className="dr__list"><div className="dr__row"><div className="dr__rowText"><div className="dr__rowLabel dr__mono">{state.mirrorDir}</div><div className="dr__rowSummary">代码仓库的只读本地副本（只 fetch，不检出），需要读取仓库文件或按提交建只读快照的插件经它取代码，不必每次走主机接口。目录在 DSH 主目录下，不在插件安装目录里，升级、卸载或重装插件都不会清空；默认位置一般不用改，确需改到别处时在 cordis.yml 的 <span className="dr__mono">mirror.dir</span> 中设置。</div></div></div></div>
+        <div className="dr__list">
+          <div className="dr__row">
+            <div className="dr__rowText">
+              <div className="dr__rowLabel"><span className="dr__mono">{state.mirror.dir}</span>{state.mirror.dir === state.mirror.defaultDir ? <span className="dr__tag">默认</span> : null}</div>
+              <div className="dr__inline">
+                <input className="dr__input dr__mono" spellCheck={false} aria-label="镜像目录" placeholder={state.mirror.defaultDir} value={mirrorValue} onChange={(event) => { setMirrorDraft(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') saveMirror() }} />
+                {state.pickerAvailable ? <button type="button" className="dr__btn" disabled={busy} onClick={choose}>选择…</button> : null}
+                <button type="button" className="dr__btn" disabled={busy || mirrorValue.trim() === '' || mirrorValue.trim() === state.mirror.dir} onClick={saveMirror}>保存</button>
+                {state.mirror.dir === state.mirror.defaultDir ? null : <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={() => { void run(resetMirrorDir, '已恢复默认镜像目录').then((ok) => { if (ok) setMirrorDraft(undefined) }) }}>恢复默认</button>}
+              </div>
+            </div>
+          </div>
+        </div>
+        <p className="dr__secFoot">代码仓库的只读本地副本（只 fetch，不检出），需要读取仓库文件或按提交建只读快照的插件经它取代码，不必每次走主机接口。所选目录和运行时添加的主机一起保存在 <span className="dr__mono">$DSH_HOME/dsh-repo/hosts.json</span>，升级、卸载或重装插件都不会清空。换目录后旧目录里的镜像不会搬过去，也不会删除，之后在新目录重新克隆。</p>
       </section>
     </div>
   )

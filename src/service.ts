@@ -10,13 +10,15 @@
  * @module dsh-repo/service
  */
 
+import { constants } from 'node:fs'
+import { access, mkdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type {
   CallOptions, ChangeCreate, ChangeListOptions, ChangeUpdate, CommitRequest, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
   HostCreate, HostInfo, HostsChange, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, PageOptions, RepoRef, RepoTarget,
   SnapshotLease, TokenStatus,
 } from './contract.ts'
-import { apiBaseUrl } from './config.ts'
+import { apiBaseUrl, expandHome } from './config.ts'
 import type { HostSpec, RepoConfig } from './config.ts'
 import { RepoError, toRepoError } from './errors.ts'
 import type { HostCredentials, HostLogger } from './host.ts'
@@ -75,6 +77,8 @@ export interface RepoServiceDeps {
   /** Local mirrors. */
   readonly mirrors: MirrorStore
   readonly factory?: ProviderFactory
+  /** Mirror directory used while none is chosen; default: the mirrors' starting root. */
+  readonly defaultMirrorDir?: string
   /** Reports a throwing {@link RepoService.onHostsChange} listener. */
   readonly logger?: HostLogger
 }
@@ -88,6 +92,7 @@ export class RepoService implements DshRepoService {
   private readonly mirrors: MirrorStore
   private readonly factory: ProviderFactory
   private readonly logger: HostLogger | undefined
+  private readonly defaultMirrorDir: string
   private readonly hostListeners = new Set<(change: HostsChange) => void>()
 
   /**
@@ -100,6 +105,7 @@ export class RepoService implements DshRepoService {
     this.mirrors = deps.mirrors
     this.factory = deps.factory ?? defaultProviderFactory
     this.logger = deps.logger
+    this.defaultMirrorDir = deps.defaultMirrorDir ?? deps.mirrors.root
   }
 
   /** Whether any host is configured or added. */
@@ -330,7 +336,27 @@ export class RepoService implements DshRepoService {
   }
 
   mirrorSettings(): MirrorSettings {
-    return { dir: this.mirrors.root }
+    return { dir: this.mirrors.root, defaultDir: this.defaultMirrorDir }
+  }
+
+  async setMirrorDir(dir: string | undefined): Promise<MirrorSettings> {
+    let target = this.defaultMirrorDir
+    if (dir !== undefined) {
+      const trimmed = dir.trim()
+      if (trimmed === '' || /[\u0000-\u001f\u007f]/.test(trimmed)) throw new RepoError('invalid', '镜像目录不能为空或包含控制字符')
+      if (!isAbsolute(trimmed) && trimmed !== '~' && !trimmed.startsWith('~/')) throw new RepoError('invalid', `镜像目录必须是绝对路径：${trimmed}`)
+      target = expandHome(trimmed)
+    }
+    try {
+      await mkdir(target, { recursive: true })
+      await access(target, constants.W_OK)
+    } catch (error) {
+      throw new RepoError('invalid', `无法创建或写入镜像目录 ${target}：${error instanceof Error ? error.message : String(error)}`)
+    }
+    await this.hosts.setMirrorDir(target === this.defaultMirrorDir ? undefined : target)
+    this.mirrors.setRoot(target)
+    this.emitHostsChange({ kind: 'mirror', dir: target })
+    return this.mirrorSettings()
   }
 
   async syncMirror(url: string, options: MirrorSyncOptions = {}): Promise<MirrorState> {
