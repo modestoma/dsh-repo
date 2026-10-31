@@ -1,5 +1,5 @@
 {
-  "name": "@modesto_ma/dsh-repo",
+  "name": "dsh-repo",
   "version": "0.0.0",
   "description": "DeepSeek Harness (DSH) 代码仓库插件：用 GitHub 官方 Octokit 和 GitBeaker 抹平 GitHub / GitLab（含 GitHub Enterprise 与自建 GitLab）差异，对外提供 dshRepos 服务，并为模型提供代码、issue、PR/MR 工具",
   "repository": {

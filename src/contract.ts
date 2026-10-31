@@ -4,7 +4,7 @@
  * and GitLab (gitlab.com and self-managed instances).
  *
  * This module has no runtime exports, and the package subpath
- * `@modesto_ma/dsh-repo/contract` exposes only its types. A consumer imports
+ * `dsh-repo/contract` exposes only its types. A consumer imports
  * them with `import type`, looks the service up per call with
  * `ctx.get('dshRepos')` (absent while dsh-repo is not loaded or reloading),
  * and checks {@link DshRepoService.version} before calling.

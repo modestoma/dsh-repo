@@ -16,7 +16,7 @@ pnpm build   # 本地 checkout 需要先构建
 DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 ```
 
-包内的 `cordis.patch.yml` 把 `@modesto_ma/dsh-repo` 加入 profile 的 bundle 列表，Loader 行的稳定 id 是 `dsh-repo`。插件需要宿主提供 `tools` 和 `credentials` 服务；写操作审批使用 `approval` 服务（`@deepseek-ai/dsh-user-approval`），dsh-channels 会把审批渲染成飞书卡片。
+包内的 `cordis.patch.yml` 把 `dsh-repo` 加入 profile 的 bundle 列表，Loader 行的稳定 id 是 `dsh-repo`。插件需要宿主提供 `tools` 和 `credentials` 服务；写操作审批使用 `approval` 服务（`@deepseek-ai/dsh-user-approval`），dsh-channels 会把审批渲染成飞书卡片。
 
 ## 配置
 
@@ -87,10 +87,10 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 
 ## `dshRepos` 服务
 
-其他插件经 `ctx.get('dshRepos')` 取得服务，类型从 `@modesto_ma/dsh-repo/contract` 用 `import type` 引入，调用前检查 `version`：
+其他插件经 `ctx.get('dshRepos')` 取得服务，类型从 `dsh-repo/contract` 用 `import type` 引入，调用前检查 `version`：
 
 ```ts
-import type { DshRepoService } from '@modesto_ma/dsh-repo/contract'
+import type { DshRepoService } from 'dsh-repo/contract'
 
 const repos = ctx.get('dshRepos') as DshRepoService | undefined
 if (repos?.version === 1) {

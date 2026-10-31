@@ -3,7 +3,7 @@
  *
  * 用 GitHub 官方 SDK（Octokit）和 GitLab 文档推荐的 GitBeaker 抹平
  * GitHub（含 GitHub Enterprise Server）与 GitLab（含自建实例）的差异：
- * 对其他插件提供 `dshRepos` 服务（类型见 `@modesto_ma/dsh-repo/contract`），
+ * 对其他插件提供 `dshRepos` 服务（类型见 `dsh-repo/contract`），
  * 对模型提供代码、issue、PR/MR 工具，写操作逐次经用户审批。
  *
  * @module dsh-repo
