@@ -166,7 +166,7 @@ function HostsPanel(): JSX.Element {
             <button type="button" className="dr__btn dr__btn--end" disabled={busy || !complete} onClick={add}>添加</button>
           </div>
         </div>
-        <p className="dr__secFoot">添加、删除和保存令牌立即生效。该主机下的 https 仓库地址使用对应令牌，ssh 地址和其他主机使用本机已有的 git 凭据。GitLab 只读镜像需要 read_repository 权限，issue、合并请求和提交需要 api 权限；GitHub 需要 Contents、Issues 与 Pull requests 权限，只读时给只读即可。令牌保存在 DSH 凭据库（默认 $DSH_HOME/.credentials.yaml，仅本机用户可读）。cordis.yml 中配置的主机不能在这里删除，只能更新令牌。</p>
+        <p className="dr__secFoot">添加、删除和保存令牌立即生效。镜像和工作区只接受 https 仓库地址，该主机下的地址拉取和推送都使用对应令牌。GitLab 只读镜像需要 read_repository 权限，推送需要 write_repository，issue 和合并请求需要 api 权限；GitHub 需要 Contents、Issues 与 Pull requests 权限，只读时给只读即可。令牌保存在 DSH 凭据库（默认 $DSH_HOME/.credentials.yaml，仅本机用户可读）。cordis.yml 中配置的主机不能在这里删除，只能更新令牌。</p>
       </section>
       <section className="dr__sec">
         <h2 className="dr__secTitle">本地镜像</h2>

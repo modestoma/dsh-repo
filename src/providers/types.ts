@@ -6,8 +6,8 @@
  */
 
 import type {
-  BranchInfo, ChangeDetail, ChangeDiff, ChangeInfo, ChangeState, ChangeStatus, CommentInfo, CommitAuthor, CommitInfo, CommitResult,
-  FileChange, FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, TreeListing,
+  BranchInfo, ChangeDetail, CommitAuthor, ChangeDiff, ChangeInfo, ChangeState, ChangeStatus, CommentInfo, CommitInfo,
+  FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, TreeListing,
 } from '../contract.ts'
 import type { RepoLimits } from '../config.ts'
 
@@ -26,13 +26,14 @@ export interface Paging {
 
 /** One code host family. Methods throw SDK errors or {@link RepoError}; the service classifies them. */
 export interface Provider {
+  /** Commit identity of the account that owns the token. */
+  currentUser(call: Call): Promise<CommitAuthor>
   repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo>
   getBranch(ref: RepoRef, name: string, call: Call): Promise<BranchInfo | undefined>
   listBranches(ref: RepoRef, query: Paging & { readonly search?: string }, call: Call): Promise<Page<BranchInfo>>
   listCommits(ref: RepoRef, query: Paging & { readonly ref?: string; readonly path?: string }, call: Call): Promise<Page<CommitInfo>>
   listTree(ref: RepoRef, query: { readonly ref?: string; readonly path: string; readonly recursive: boolean }, call: Call): Promise<TreeListing>
   readFile(ref: RepoRef, path: string, at: string | undefined, call: Call): Promise<FileContent>
-  commitFiles(ref: RepoRef, request: { readonly branch: string; readonly base?: string; readonly baseSha?: string; readonly newBranch?: boolean; readonly author?: CommitAuthor; readonly message: string; readonly files: readonly FileChange[] }, call: Call): Promise<CommitResult>
 
   listIssues(ref: RepoRef, query: Paging & { readonly state: IssueState | 'all'; readonly labels?: readonly string[]; readonly assignee?: string }, call: Call): Promise<Page<IssueInfo>>
   getIssue(ref: RepoRef, number: number, call: Call): Promise<IssueDetail>

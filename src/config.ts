@@ -57,7 +57,6 @@ const limitsSchema = z.object({
   maxFileBytes: z.number().int().min(1).max(64 * 1024 * 1024).default(1024 * 1024),
   maxDiffBytes: z.number().int().min(1).max(64 * 1024 * 1024).default(512 * 1024),
   maxTreeEntries: z.number().int().min(1).max(100_000).default(1000),
-  maxCommitFiles: z.number().int().min(1).max(1000).default(100),
   maxComments: z.number().int().min(1).max(100).default(50),
 }).strict().superRefine((limits, issues) => {
   if (limits.perPage > limits.maxPerPage) issues.addIssue({ code: 'custom', path: ['perPage'], message: 'perPage 不能大于 maxPerPage' })
@@ -92,7 +91,7 @@ export const pluginConfigSchema = z.object({
   /** Reachable repositories; omitted or empty = every repository on the configured hosts. */
   repos: z.array(z.string().trim().toLowerCase().regex(REPO_PATTERN, '仓库格式：主机/路径，末段可以是 *（一层）或 **（任意层），例如 github.com/modestoma/*')).default([]),
   timeoutMs: z.number().int().min(1000).max(MAX_TIMER_DELAY_MS).default(30_000),
-  limits: limitsSchema.default({ perPage: 30, maxPerPage: 100, maxFileBytes: 1024 * 1024, maxDiffBytes: 512 * 1024, maxTreeEntries: 1000, maxCommitFiles: 100, maxComments: 50 }),
+  limits: limitsSchema.default({ perPage: 30, maxPerPage: 100, maxFileBytes: 1024 * 1024, maxDiffBytes: 512 * 1024, maxTreeEntries: 1000, maxComments: 50 }),
   tools: toolsSchema.default({ enabled: true, writes: 'ask', merge: false, signature: '' }),
   mirror: mirrorSchema.default({ gitTimeoutMs: 10 * 60 * 1000, otherHosts: true }),
   /** File holding hosts added at run time; default `$DSH_HOME/dsh-repo/hosts.json`. */
@@ -101,7 +100,7 @@ export const pluginConfigSchema = z.object({
   hosts: [],
   repos: [],
   timeoutMs: 30_000,
-  limits: { perPage: 30, maxPerPage: 100, maxFileBytes: 1024 * 1024, maxDiffBytes: 512 * 1024, maxTreeEntries: 1000, maxCommitFiles: 100, maxComments: 50 },
+  limits: { perPage: 30, maxPerPage: 100, maxFileBytes: 1024 * 1024, maxDiffBytes: 512 * 1024, maxTreeEntries: 1000, maxComments: 50 },
   tools: { enabled: true, writes: 'ask', merge: false, signature: '' },
   mirror: { gitTimeoutMs: 10 * 60 * 1000, otherHosts: true },
 })

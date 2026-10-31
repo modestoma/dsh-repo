@@ -9,7 +9,7 @@
 
 import { Gitlab } from '@gitbeaker/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CommentInfo, CommitInfo, FileChange, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { nextPage, titleOf, truncateBytes } from './types.ts'
@@ -105,11 +105,6 @@ function paging(query: Paging): { page: number; perPage: number; maxPages: numbe
   return { page: query.page, perPage: query.perPage, maxPages: 1 }
 }
 
-function dirname(path: string): string {
-  const slash = path.lastIndexOf('/')
-  return slash < 0 ? '' : path.slice(0, slash)
-}
-
 /** GitLab provider bound to one host. */
 export class GitlabProvider implements Provider {
   private readonly api: InstanceType<typeof Gitlab<false>>
@@ -119,8 +114,17 @@ export class GitlabProvider implements Provider {
    * @param token - resolves the host's token for every request.
    * @param timeoutMs - per-request timeout; GitBeaker takes no per-call signal.
    */
-  constructor(host: string, token: TokenSource, timeoutMs: number) {
+  constructor(private readonly host: string, token: TokenSource, timeoutMs: number) {
     this.api = new Gitlab({ host, token, queryTimeout: timeoutMs })
+  }
+
+  async currentUser(call: Call): Promise<CommitAuthor> {
+    call.signal.throwIfAborted()
+    const data = await this.api.Users.showCurrentUser()
+    // `commit_email` is returned for the token's own account but missing from GitBeaker's types.
+    const commitEmail: unknown = data.commit_email
+    const email = [commitEmail, data.email, data.public_email].find((value): value is string => typeof value === 'string' && value !== '')
+    return { name: data.name, email: email ?? `${data.id}-${data.username}@users.noreply.${new URL(this.host).host}` }
   }
 
   async repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo> {
@@ -195,43 +199,6 @@ export class GitlabProvider implements Provider {
     const text = typeof raw === 'string' ? raw : await raw.text()
     if (text.includes('\0')) return { path, ref: target, text: '', binary: true, truncated: false }
     return { path, ref: target, binary: false, ...truncateBytes(text, call.limits.maxFileBytes) }
-  }
-
-  async commitFiles(ref: RepoRef, request: { branch: string; base?: string; baseSha?: string; newBranch?: boolean; author?: { name: string; email: string }; message: string; files: readonly FileChange[] }, call: Call) {
-    const info = await this.repoInfo(ref, call)
-    if (request.branch === info.defaultBranch) throw new RepoError('forbidden', `不允许直接提交到默认分支 ${request.branch}；请提交到新分支后开 MR`)
-    const existing = await this.api.Branches.show(ref.path, request.branch).catch((error: unknown) => {
-      if ((error as { cause?: { response?: { status?: number } } }).cause?.response?.status === 404) return undefined
-      throw error
-    })
-    if (existing !== undefined && request.newBranch === true) throw new RepoError('conflict', `分支 ${request.branch} 已存在`)
-    if (existing?.protected === true) throw new RepoError('forbidden', `分支 ${request.branch} 受保护，不能直接提交`)
-    const start = existing === undefined ? request.baseSha ?? request.base ?? info.defaultBranch : request.branch
-    // GitLab needs `create` or `update` per file, so list each touched directory at the start point.
-    const present = new Set<string>()
-    for (const dir of new Set(request.files.filter(file => file.action === 'write').map(file => dirname(file.path)))) {
-      call.signal.throwIfAborted()
-      const listing = await this.api.Repositories.allRepositoryTrees(ref.path, { ref: start, ...dir === '' ? {} : { path: dir }, perPage: MAX_PAGE }).catch((error: unknown) => {
-        // A directory that does not exist yet holds no files.
-        if ((error as { cause?: { response?: { status?: number } } }).cause?.response?.status === 404) return []
-        throw error
-      })
-      for (const entry of listing) if (entry.type === 'blob') present.add(entry.path)
-    }
-    const actions = request.files.map(file => file.action === 'delete'
-      ? { action: 'delete' as const, filePath: file.path }
-      : { action: present.has(file.path) ? 'update' as const : 'create' as const, filePath: file.path, content: file.content })
-    call.signal.throwIfAborted()
-    const startOption = existing !== undefined ? {} : request.baseSha === undefined ? { startBranch: start } : { startSha: request.baseSha }
-    const authorOption = request.author === undefined ? {} : { authorName: request.author.name, authorEmail: request.author.email }
-    const commit = await this.api.Commits.create(ref.path, request.branch, request.message, actions, { ...startOption, ...authorOption }).catch((error: unknown) => {
-      // GitLab answers 400 when another writer created the branch after the lookup above.
-      if (existing === undefined && (error as { cause?: { response?: { status?: number } } }).cause?.response?.status === 400 && error instanceof Error && /already exists/i.test(error.message)) {
-        throw new RepoError('conflict', `分支 ${request.branch} 已存在`)
-      }
-      throw error
-    })
-    return { sha: commit.id, branch: request.branch, createdBranch: existing === undefined, webUrl: commit.web_url }
   }
 
   async listIssues(ref: RepoRef, query: Paging & { state: 'open' | 'closed' | 'all'; labels?: readonly string[]; assignee?: string }, call: Call) {

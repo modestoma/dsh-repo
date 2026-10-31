@@ -33,7 +33,7 @@ describe('plugin', () => {
     plugin.apply(ctx, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
     const service = provided.get('dshRepos')
     expect(service).toBeInstanceOf(RepoService)
-    expect((service as RepoService).version).toBe(1)
+    expect((service as RepoService).version).toBe(2)
     expect((service as RepoService).mirrorSettings().dir).toBe(join(env.DSH_HOME, 'dsh-repo', 'mirrors'))
     expect(registered.length).toBeGreaterThan(10)
     expect(await registered[0]?.when?.()).toBe(true)

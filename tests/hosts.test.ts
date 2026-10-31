@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest'
 import { HostStore, addedTokenRef } from '../src/hosts.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import { credentials, testConfig } from './helpers.ts'
+import { credentials, testConfig, withMirrors } from './helpers.ts'
 
 function setup(tokens: Record<string, string> = {}) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-hosts-'))
@@ -17,7 +17,7 @@ function setup(tokens: Record<string, string> = {}) {
     credentials: store,
     logger: { error: (_message, ...args) => { errors.push(...args) } },
     hosts,
-    mirrors: new MirrorStore({ git: async () => '', root: join(root, 'mirrors'), timeoutMs: 1000, maxFileBytes: 10, maxTreeEntries: 10 }),
+    ...withMirrors(new MirrorStore({ git: async () => '', root: join(root, 'mirrors'), timeoutMs: 1000, maxFileBytes: 10, maxTreeEntries: 10 })),
   })
   return { root, store, service, errors }
 }

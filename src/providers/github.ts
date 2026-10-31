@@ -8,7 +8,7 @@
 
 import { Octokit } from '@octokit/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CheckState, CommentInfo, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CheckState, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { nextPage, titleOf, truncateBytes } from './types.ts'
@@ -29,11 +29,6 @@ function user(value: GithubUser | null | undefined): RepoUser {
 
 function labelNames(labels: ReadonlyArray<string | GithubLabel>): string[] {
   return labels.map(label => typeof label === 'string' ? label : label.name ?? '').filter(name => name !== '')
-}
-
-function dirname(path: string): string {
-  const slash = path.lastIndexOf('/')
-  return slash < 0 ? '' : path.slice(0, slash)
 }
 
 function split(path: string): { owner: string; repo: string } {
@@ -140,7 +135,7 @@ export class GithubProvider implements Provider {
    * @param baseUrl - REST base URL (`https://api.github.com` or `<url>/api/v3`).
    * @param token - resolves the host's token for every request.
    */
-  constructor(baseUrl: string, token: TokenSource) {
+  constructor(private readonly baseUrl: string, token: TokenSource) {
     this.octokit = new Octokit({
       baseUrl,
       userAgent: 'dsh-repo',
@@ -149,6 +144,13 @@ export class GithubProvider implements Provider {
     this.octokit.hook.before('request', async (options) => {
       options.headers.authorization = `token ${await token()}`
     })
+  }
+
+  async currentUser(call: Call): Promise<CommitAuthor> {
+    const { data } = await this.octokit.rest.users.getAuthenticated({ request: { signal: call.signal } })
+    const api = new URL(this.baseUrl)
+    const web = api.hostname === 'api.github.com' ? 'github.com' : api.host
+    return { name: data.name ?? data.login, email: data.email ?? `${data.id}+${data.login}@users.noreply.${web}` }
   }
 
   async repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo> {
@@ -242,56 +244,6 @@ export class GithubProvider implements Provider {
     if (typeof raw !== 'string') throw new RepoError('invalid', `${path} 不是文件`)
     if (raw.includes('\0')) return { path, ref: target, text: '', binary: true, truncated: false }
     return { path, ref: target, binary: false, ...truncateBytes(raw, call.limits.maxFileBytes) }
-  }
-
-  async commitFiles(ref: RepoRef, request: { branch: string; base?: string; baseSha?: string; newBranch?: boolean; author?: { name: string; email: string }; message: string; files: readonly ({ action: 'write'; path: string; content: string } | { action: 'delete'; path: string })[] }, call: Call) {
-    const repo = split(ref.path)
-    const signal = call.signal
-    const info = await this.repoInfo(ref, call)
-    if (request.branch === info.defaultBranch) throw new RepoError('forbidden', `不允许直接提交到默认分支 ${request.branch}；请提交到新分支后开 PR`)
-    const existing = await this.octokit.rest.repos.getBranch({ ...repo, branch: request.branch, request: { signal } }).catch((error: unknown) => {
-      if ((error as { status?: number }).status === 404) return undefined
-      throw error
-    })
-    if (existing !== undefined && request.newBranch === true) throw new RepoError('conflict', `分支 ${request.branch} 已存在`)
-    if (existing?.data.protected === true) throw new RepoError('forbidden', `分支 ${request.branch} 受保护，不能直接提交`)
-    const parent = existing?.data.commit.sha
-      ?? request.baseSha
-      ?? (await this.octokit.rest.repos.getBranch({ ...repo, branch: request.base ?? info.defaultBranch, request: { signal } })).data.commit.sha
-    const { data: parentCommit } = await this.octokit.rest.git.getCommit({ ...repo, commit_sha: parent, request: { signal } })
-    // Keep the executable bit of files that already exist; refuse to replace links and directories.
-    const modes = new Map<string, string>()
-    for (const dir of new Set(request.files.filter(file => file.action === 'write').map(file => dirname(file.path)))) {
-      const listing = await this.octokit.rest.git.getTree({ ...repo, tree_sha: dir === '' ? parent : `${parent}:${dir}`, request: { signal } }).catch((error: unknown) => {
-        // A directory that does not exist yet holds no files.
-        if ((error as { status?: number }).status === 404) return undefined
-        throw error
-      })
-      for (const entry of listing?.data.tree ?? []) modes.set(dir === '' ? entry.path ?? '' : `${dir}/${entry.path ?? ''}`, entry.mode ?? '')
-    }
-    for (const file of request.files) {
-      const mode = modes.get(file.path)
-      if (mode === '120000' || mode === '040000' || mode === '160000') throw new RepoError('invalid', `${file.path} 在仓库中不是普通文件，不能用文件内容覆盖`)
-    }
-    const { data: tree } = await this.octokit.rest.git.createTree({
-      ...repo,
-      base_tree: parentCommit.tree.sha,
-      tree: request.files.map(file => file.action === 'write'
-        ? { path: file.path, mode: modes.get(file.path) === '100755' ? '100755' as const : '100644' as const, type: 'blob' as const, content: file.content }
-        : { path: file.path, mode: '100644' as const, type: 'blob' as const, sha: null }),
-      request: { signal },
-    })
-    const { data: commit } = await this.octokit.rest.git.createCommit({ ...repo, message: request.message, tree: tree.sha, parents: [parent], ...request.author === undefined ? {} : { author: request.author }, request: { signal } })
-    if (existing === undefined) {
-      await this.octokit.rest.git.createRef({ ...repo, ref: `refs/heads/${request.branch}`, sha: commit.sha, request: { signal } }).catch((error: unknown) => {
-        // Another writer created the branch after the lookup above.
-        if ((error as { status?: number }).status === 422) throw new RepoError('conflict', `分支 ${request.branch} 已存在`)
-        throw error
-      })
-    } else {
-      await this.octokit.rest.git.updateRef({ ...repo, ref: `heads/${request.branch}`, sha: commit.sha, force: false, request: { signal } })
-    }
-    return { sha: commit.sha, branch: request.branch, createdBranch: existing === undefined, webUrl: commit.html_url }
   }
 
   async listIssues(ref: RepoRef, query: { page: number; perPage: number; state: 'open' | 'closed' | 'all'; labels?: readonly string[]; assignee?: string }, call: Call) {
