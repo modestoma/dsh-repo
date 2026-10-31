@@ -71,6 +71,40 @@ describe('GitLab provider', () => {
     })
   })
 
+  it('starts a new branch at baseSha and reports a branch created concurrently as a conflict', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: API, reply: { body: project } },
+      { method: 'GET', path: `${API}/repository/branches/feature`, reply: { status: 404, body: { message: '404 Branch Not Found' } } },
+      { method: 'GET', path: `${API}/repository/tree`, reply: { body: [{ path: 'a.md', type: 'blob', mode: '100644' }] } },
+      { method: 'POST', path: `${API}/repository/commits`, reply: { status: 400, body: { message: 'A branch called \'feature\' already exists.' } } },
+    ])
+    const files = [{ action: 'write' as const, path: 'a.md', content: 'A' }]
+    await expect(new RepoService(testConfig(), credentials(TOKENS)).commitFiles(REPO, { branch: 'feature', baseSha: SHA, newBranch: true, author: { name: 'Bot', email: 'bot@example.com' }, message: 'm', files }))
+      .rejects.toMatchObject({ code: 'conflict' })
+    expect(requests.find(request => path(request).endsWith('/repository/tree'))?.url.searchParams.get('ref')).toBe(SHA)
+    expect(requests.at(-1)?.body).toMatchObject({ start_sha: SHA, author_name: 'Bot', author_email: 'bot@example.com', actions: [{ action: 'update', file_path: 'a.md' }] })
+  })
+
+  it('reads one branch and reports a missing one as absent', async () => {
+    fakeHttp([
+      { method: 'GET', path: `${API}/repository/branches/feature`, reply: { body: { name: 'feature', protected: false, default: false, commit: { id: SHA } } } },
+      { method: 'GET', path: `${API}/repository/branches/gone`, reply: { status: 404, body: { message: '404 Branch Not Found' } } },
+    ])
+    const service = new RepoService(testConfig(), credentials(TOKENS))
+    expect(await service.getBranch(REPO, 'feature')).toEqual({ name: 'feature', commit: SHA, protected: false, default: false })
+    expect(await service.getBranch(REPO, 'gone')).toBeUndefined()
+  })
+
+  it('refuses to commit on top of an existing branch when newBranch is set', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: API, reply: { body: project } },
+      { method: 'GET', path: `${API}/repository/branches/feature`, reply: { body: { name: 'feature', protected: false, commit: { id: SHA } } } },
+    ])
+    await expect(new RepoService(testConfig(), credentials(TOKENS)).commitFiles(REPO, { branch: 'feature', newBranch: true, message: 'm', files: [{ action: 'delete', path: 'a' }] }))
+      .rejects.toMatchObject({ code: 'conflict' })
+    expect(requests.some(request => request.method === 'POST')).toBe(false)
+  })
+
   it('maps issue states and closes through state events', async () => {
     const issue = { iid: 3, title: 'Bug', description: 'd', state: 'closed', author, labels: ['bug'], assignees: [author], created_at: 'c', updated_at: 'u', web_url: `${REPO}/-/issues/3` }
     const { requests } = fakeHttp([

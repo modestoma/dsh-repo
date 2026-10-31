@@ -98,7 +98,7 @@ if (repos?.version === 1) {
 }
 ```
 
-接口覆盖仓库信息、分支、提交、目录、文件、多文件提交、issue 与 PR/MR 的读写和合并，完整定义见 [`src/contract.ts`](src/contract.ts)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+接口覆盖仓库信息、分支、提交、目录、文件、多文件提交、issue 与 PR/MR 的读写和合并，完整定义见 [`src/contract.ts`](src/contract.ts)。多文件提交可以用 `baseSha` 从指定提交建新分支，`newBranch: true` 时分支已存在就以 `conflict` 失败，不会在已有分支上追加提交；`author` 指定提交作者（提交者始终是令牌对应的用户）。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
 
 ## GitHub 与 GitLab 的差异处理
 

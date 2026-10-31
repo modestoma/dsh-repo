@@ -144,6 +144,15 @@ export class GitlabProvider implements Provider {
     return { items, ...nextPage(query, data.length) }
   }
 
+  async getBranch(ref: RepoRef, name: string, call: Call) {
+    call.signal.throwIfAborted()
+    const branch = await this.api.Branches.show(ref.path, name).catch((error: unknown) => {
+      if ((error as { cause?: { response?: { status?: number } } }).cause?.response?.status === 404) return undefined
+      throw error
+    })
+    return branch === undefined ? undefined : { name: branch.name, commit: String(branch.commit.id), protected: branch.protected, default: branch.default }
+  }
+
   async listCommits(ref: RepoRef, query: Paging & { ref?: string; path?: string }, call: Call) {
     call.signal.throwIfAborted()
     const data = await this.api.Commits.all(ref.path, {
@@ -188,15 +197,16 @@ export class GitlabProvider implements Provider {
     return { path, ref: target, binary: false, ...truncateBytes(text, call.limits.maxFileBytes) }
   }
 
-  async commitFiles(ref: RepoRef, request: { branch: string; base?: string; message: string; files: readonly FileChange[] }, call: Call) {
+  async commitFiles(ref: RepoRef, request: { branch: string; base?: string; baseSha?: string; newBranch?: boolean; author?: { name: string; email: string }; message: string; files: readonly FileChange[] }, call: Call) {
     const info = await this.repoInfo(ref, call)
     if (request.branch === info.defaultBranch) throw new RepoError('forbidden', `不允许直接提交到默认分支 ${request.branch}；请提交到新分支后开 MR`)
     const existing = await this.api.Branches.show(ref.path, request.branch).catch((error: unknown) => {
       if ((error as { cause?: { response?: { status?: number } } }).cause?.response?.status === 404) return undefined
       throw error
     })
+    if (existing !== undefined && request.newBranch === true) throw new RepoError('conflict', `分支 ${request.branch} 已存在`)
     if (existing?.protected === true) throw new RepoError('forbidden', `分支 ${request.branch} 受保护，不能直接提交`)
-    const start = existing === undefined ? request.base ?? info.defaultBranch : request.branch
+    const start = existing === undefined ? request.baseSha ?? request.base ?? info.defaultBranch : request.branch
     // GitLab needs `create` or `update` per file, so list each touched directory at the start point.
     const present = new Set<string>()
     for (const dir of new Set(request.files.filter(file => file.action === 'write').map(file => dirname(file.path)))) {
@@ -212,7 +222,15 @@ export class GitlabProvider implements Provider {
       ? { action: 'delete' as const, filePath: file.path }
       : { action: present.has(file.path) ? 'update' as const : 'create' as const, filePath: file.path, content: file.content })
     call.signal.throwIfAborted()
-    const commit = await this.api.Commits.create(ref.path, request.branch, request.message, actions, existing === undefined ? { startBranch: start } : {})
+    const startOption = existing !== undefined ? {} : request.baseSha === undefined ? { startBranch: start } : { startSha: request.baseSha }
+    const authorOption = request.author === undefined ? {} : { authorName: request.author.name, authorEmail: request.author.email }
+    const commit = await this.api.Commits.create(ref.path, request.branch, request.message, actions, { ...startOption, ...authorOption }).catch((error: unknown) => {
+      // GitLab answers 400 when another writer created the branch after the lookup above.
+      if (existing === undefined && (error as { cause?: { response?: { status?: number } } }).cause?.response?.status === 400 && error instanceof Error && /already exists/i.test(error.message)) {
+        throw new RepoError('conflict', `分支 ${request.branch} 已存在`)
+      }
+      throw error
+    })
     return { sha: commit.id, branch: request.branch, createdBranch: existing === undefined, webUrl: commit.web_url }
   }
 

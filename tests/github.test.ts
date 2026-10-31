@@ -75,6 +75,48 @@ describe('GitHub provider', () => {
     expect(requests.at(-1)?.body).toEqual({ ref: 'refs/heads/feature', sha: 'c1' })
   })
 
+  it('starts a new branch at baseSha, and with newBranch refuses an existing or concurrently created branch', async () => {
+    const BASE = 'c'.repeat(40)
+    const { requests } = fakeHttp([
+      { method: 'GET', path: API, reply: { body: repoBody } },
+      { method: 'GET', path: `${API}/branches/taken`, reply: { body: { name: 'taken', protected: false, commit: { sha: SHA } } } },
+      { method: 'GET', path: `${API}/branches/feature`, reply: { status: 404, body: { message: 'Branch not found' } } },
+      { method: 'GET', path: `${API}/git/commits/${BASE}`, reply: { body: { sha: BASE, tree: { sha: 'tree0' } } } },
+      { method: 'GET', path: `${API}/git/trees/${BASE}`, reply: { body: { tree: [] } } },
+      { method: 'POST', path: `${API}/git/trees`, reply: { status: 201, body: { sha: 'tree1' } } },
+      { method: 'POST', path: `${API}/git/commits`, reply: { status: 201, body: { sha: 'c1', html_url: `${REPO}/commit/c1` } } },
+      { method: 'POST', path: `${API}/git/refs`, reply: { status: 422, body: { message: 'Reference already exists' } } },
+    ])
+    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const files = [{ action: 'write' as const, path: 'a.md', content: 'A' }]
+    await expect(service.commitFiles(REPO, { branch: 'taken', newBranch: true, message: 'm', files })).rejects.toMatchObject({ code: 'conflict' })
+    expect(requests.some(request => request.method === 'POST')).toBe(false)
+    await expect(service.commitFiles(REPO, { branch: 'feature', baseSha: BASE, newBranch: true, author: { name: ' Bot ', email: 'bot@example.com' }, message: 'm', files })).rejects.toMatchObject({ code: 'conflict' })
+    expect(requests.some(request => request.url.pathname.endsWith('/branches/main'))).toBe(false)
+    expect(requests.find(request => request.url.pathname.endsWith('/git/commits') && request.method === 'POST')?.body).toMatchObject({ parents: [BASE], author: { name: 'Bot', email: 'bot@example.com' } })
+  })
+
+  it('rejects baseSha together with base, a baseSha that is not a full object id, and a malformed author', async () => {
+    const service = new RepoService(testConfig(), credentials(TOKENS))
+    const files = [{ action: 'write' as const, path: 'a.md', content: 'A' }]
+    await expect(service.commitFiles(REPO, { branch: 'f', base: 'dev', baseSha: SHA, message: 'm', files })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(service.commitFiles(REPO, { branch: 'f', baseSha: 'abc123', message: 'm', files })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(service.commitFiles(REPO, { branch: 'f', author: { name: 'a', email: 'a b@x' }, message: 'm', files })).rejects.toMatchObject({ code: 'invalid' })
+  })
+
+  it('reads one branch, and reports a missing or renamed branch as absent', async () => {
+    fakeHttp([
+      { method: 'GET', path: API, reply: { body: repoBody } },
+      { method: 'GET', path: `${API}/branches/main`, reply: { body: { name: 'main', protected: true, commit: { sha: SHA } } } },
+      { method: 'GET', path: `${API}/branches/gone`, reply: { status: 404, body: { message: 'Branch not found' } } },
+      { method: 'GET', path: `${API}/branches/old`, reply: { body: { name: 'new', protected: false, commit: { sha: SHA } } } },
+    ])
+    const service = new RepoService(testConfig(), credentials(TOKENS))
+    expect(await service.getBranch(REPO, 'main')).toEqual({ name: 'main', commit: SHA, protected: true, default: true })
+    expect(await service.getBranch(REPO, 'gone')).toBeUndefined()
+    expect(await service.getBranch(REPO, 'old')).toBeUndefined()
+  })
+
   it('refuses commits to the default branch and to protected branches', async () => {
     fakeHttp([
       { method: 'GET', path: API, reply: { body: repoBody } },

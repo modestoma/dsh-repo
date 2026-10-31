@@ -91,6 +91,11 @@ export class RepoService implements DshRepoService {
     return await this.run(repo, options, '列出分支', (provider, ref, call) => provider.listBranches(ref, query, call))
   }
 
+  async getBranch(repo: RepoTarget, name: string, options: CallOptions = {}) {
+    requireBranch(name, '分支名')
+    return await this.run(repo, options, `读取分支 ${name}`, (provider, ref, call) => provider.getBranch(ref, name, call))
+  }
+
   async listCommits(repo: RepoTarget, options: PageOptions & { readonly ref?: string; readonly path?: string } = {}) {
     if (options.path !== undefined) requireRepoPath(options.path, '路径')
     const query = { ...this.paging(options), ...options.ref === undefined ? {} : { ref: options.ref }, ...options.path === undefined ? {} : { path: options.path } }
@@ -112,7 +117,15 @@ export class RepoService implements DshRepoService {
   async commitFiles(repo: RepoTarget, request: CommitRequest) {
     requireBranch(request.branch, '分支名')
     if (request.base !== undefined) requireBranch(request.base, '起点分支名')
+    if (request.baseSha !== undefined) {
+      if (request.base !== undefined) throw new RepoError('invalid', 'base 和 baseSha 只能给一个')
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(request.baseSha)) throw new RepoError('invalid', `起点提交必须是完整的十六进制提交 id：${request.baseSha}`)
+    }
     requireText(request.message, '提交说明')
+    if (request.author !== undefined) {
+      if (!/^[^<>\n]+$/.test(request.author.name.trim())) throw new RepoError('invalid', '提交作者名不能为空，也不能包含 < > 或换行')
+      if (!/^[^<>\s]+$/.test(request.author.email.trim())) throw new RepoError('invalid', '提交作者邮箱不能为空，也不能包含 < > 或空白')
+    }
     if (request.files.length === 0) throw new RepoError('invalid', '提交至少要包含一个文件')
     if (request.files.length > this.config.limits.maxCommitFiles) throw new RepoError('too-large', `一次提交最多 ${this.config.limits.maxCommitFiles} 个文件`)
     const seen = new Set<string>()
@@ -124,7 +137,15 @@ export class RepoService implements DshRepoService {
         throw new RepoError('too-large', `${file.path} 超过单文件上限 ${this.config.limits.maxFileBytes} 字节`)
       }
     }
-    const fields = { branch: request.branch, message: request.message, files: request.files, ...request.base === undefined ? {} : { base: request.base } }
+    const fields = {
+      branch: request.branch,
+      message: request.message,
+      files: request.files,
+      ...request.base === undefined ? {} : { base: request.base },
+      ...request.baseSha === undefined ? {} : { baseSha: request.baseSha },
+      ...request.newBranch === true ? { newBranch: true } : {},
+      ...request.author === undefined ? {} : { author: { name: request.author.name.trim(), email: request.author.email.trim() } },
+    }
     return await this.run(repo, request, `提交到分支 ${request.branch}`, (provider, ref, call) => provider.commitFiles(ref, fields, call))
   }
 
