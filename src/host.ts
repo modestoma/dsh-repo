@@ -3,10 +3,13 @@
  *
  * 只声明本插件实际调用的字段，不在运行时 import 任何 `@deepseek-ai/dsh-*`
  * 包；字段含义以 DSH 源码为准（`packages/core/tools`、
- * `packages/credentials/credentials`、`packages/interaction/user-approval`）。
+ * `packages/credentials/credentials`、`packages/interaction/user-approval`、
+ * `packages/api/gateway`）。
  *
  * @module dsh-repo/host
  */
+
+import type { IncomingMessage, ServerResponse } from 'node:http'
 
 /** One model-facing content block (text is the only kind this plugin produces). */
 export interface ContentBlock {
@@ -101,6 +104,20 @@ export interface HostApproval {
   request(req: ApprovalRequest): Promise<ApprovalOutcome>
 }
 
+/** The optional `ctx.webServer` slice. */
+export interface HostWebServer {
+  register(route: {
+    kind: 'exact'
+    path: string
+    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+  }): () => void
+}
+
+/** The optional `ctx.connection` slice: DSH's Host/Origin fence plus login check. */
+export interface HostRequestGate {
+  requestRejection(request: { readonly headers: IncomingMessage['headers'] }): 401 | 403 | undefined
+}
+
 /** Cordis logger slice. */
 export interface HostLogger {
   info?(message: string, ...args: unknown[]): void
@@ -116,4 +133,6 @@ export interface HostContext {
   get?(name: string): unknown
   provide?(name: string, value: unknown): void
   effect(callback: () => (() => void) | void, label?: string): () => unknown
+  /** Run `callback` with a context that has every named service, again whenever they are replaced. */
+  inject?(dependencies: string[], callback: (child: HostContext) => void): unknown
 }

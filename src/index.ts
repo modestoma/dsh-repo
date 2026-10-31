@@ -4,7 +4,8 @@
  * 用 GitHub 官方 SDK（Octokit）和 GitLab 文档推荐的 GitBeaker 抹平
  * GitHub（含 GitHub Enterprise Server）与 GitLab（含自建实例）的差异：
  * 对其他插件提供 `dshRepos` 服务（类型见 `dsh-repo/contract`），
- * 对模型提供代码、issue、PR/MR 工具，写操作逐次经用户审批。
+ * 对模型提供代码、issue、PR/MR 工具，写操作逐次经用户审批。Web 组合中
+ * 另在「插件 → dsh-repo」页面提供主机与令牌设置（见 `dsh-repo/client`）。
  *
  * @module dsh-repo
  */
@@ -17,6 +18,7 @@ import type { GitRunner } from './mirror/git.ts'
 import { MirrorStore } from './mirror/store.ts'
 import { DSH_REPOS_SERVICE, RepoService } from './service.ts'
 import type { ProviderFactory } from './service.ts'
+import { mountSettingsRoutes } from './settings/routes.ts'
 import { createTools } from './tools.ts'
 
 export type * from './contract.ts'
@@ -34,6 +36,9 @@ export { GitlabProvider } from './providers/gitlab.ts'
 export type { Provider } from './providers/types.ts'
 export { hostOf, matchesPattern, resolveTarget } from './target.ts'
 export { createTools } from './tools.ts'
+export { HOST_TOKEN_ROUTE, HOSTS_ROUTE, STATE_ROUTE } from './settings/contract.ts'
+export type { HostAddRequest, MutationError, MutationOk, SettingsState } from './settings/contract.ts'
+export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes, settingsState } from './settings/routes.ts'
 export type { Declined, ToolDeps } from './tools.ts'
 
 /** Cordis plugin name. */
@@ -56,8 +61,9 @@ export interface RepoPluginOptions {
 }
 
 /**
- * Provide the `dshRepos` service and register the model tools, which are
- * offered only while at least one host is configured or added.
+ * Provide the `dshRepos` service, mount the settings routes while the Host
+ * serves the Web, and register the model tools, which are offered only while
+ * at least one host is configured or added.
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
  * @param options - test seams.
@@ -78,9 +84,11 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     credentials: ctx.credentials,
     hosts,
     mirrors,
+    ...ctx.logger === undefined ? {} : { logger: ctx.logger },
     ...options.providerFactory === undefined ? {} : { factory: options.providerFactory },
   })
   ctx.provide?.(DSH_REPOS_SERVICE, service)
+  mountSettingsRoutes(ctx, service)
   if (!resolved.tools.enabled) return
   if (!service.configured) ctx.logger?.info?.('dsh-repo: 还没有主机，代码仓库工具在添加主机后提供')
   for (const definition of createTools({ service, config: resolved, approval: () => ctx.get?.('approval') as HostApproval | undefined })) {

@@ -13,13 +13,13 @@
 import { isAbsolute } from 'node:path'
 import type {
   CallOptions, ChangeCreate, ChangeListOptions, ChangeUpdate, CommitRequest, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
-  HostCreate, HostInfo, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, PageOptions, RepoRef, RepoTarget,
+  HostCreate, HostInfo, HostsChange, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, PageOptions, RepoRef, RepoTarget,
   SnapshotLease, TokenStatus,
 } from './contract.ts'
 import { apiBaseUrl } from './config.ts'
 import type { HostSpec, RepoConfig } from './config.ts'
 import { RepoError, toRepoError } from './errors.ts'
-import type { HostCredentials } from './host.ts'
+import type { HostCredentials, HostLogger } from './host.ts'
 import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
 import { credentialEnvironment } from './mirror/git.ts'
 import type { MirrorStore } from './mirror/store.ts'
@@ -75,6 +75,8 @@ export interface RepoServiceDeps {
   /** Local mirrors. */
   readonly mirrors: MirrorStore
   readonly factory?: ProviderFactory
+  /** Reports a throwing {@link RepoService.onHostsChange} listener. */
+  readonly logger?: HostLogger
 }
 
 /** The service implementation. */
@@ -85,6 +87,8 @@ export class RepoService implements DshRepoService {
   private readonly hosts: HostStore
   private readonly mirrors: MirrorStore
   private readonly factory: ProviderFactory
+  private readonly logger: HostLogger | undefined
+  private readonly hostListeners = new Set<(change: HostsChange) => void>()
 
   /**
    * @param config - validated configuration.
@@ -95,6 +99,7 @@ export class RepoService implements DshRepoService {
     this.hosts = deps.hosts
     this.mirrors = deps.mirrors
     this.factory = deps.factory ?? defaultProviderFactory
+    this.logger = deps.logger
   }
 
   /** Whether any host is configured or added. */
@@ -271,7 +276,11 @@ export class RepoService implements DshRepoService {
     const token = host.token?.trim()
     if (token !== undefined && !isAcceptedToken(token)) throw new RepoError('invalid', `令牌不能为空、超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`)
     const spec = await this.hosts.add(host)
-    if (token !== undefined) await this.storeToken(spec, token)
+    try {
+      if (token !== undefined) await this.storeToken(spec, token)
+    } finally {
+      this.emitHostsChange({ kind: 'added', url: spec.url })
+    }
     return await this.hostInfo(spec)
   }
 
@@ -282,6 +291,8 @@ export class RepoService implements DshRepoService {
       await this.credentials.unset(spec.tokenRef)
     } catch (error) {
       throw new RepoError('unavailable', `已删除主机 ${spec.url}，但清除令牌 ${spec.tokenRef} 失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      this.emitHostsChange({ kind: 'removed', url: spec.url })
     }
   }
 
@@ -298,7 +309,24 @@ export class RepoService implements DshRepoService {
       if (!isAcceptedToken(value)) throw new RepoError('invalid', `令牌不能为空、超过 ${MAX_TOKEN_LENGTH} 个字符或包含换行等控制字符`)
       await this.storeToken(spec, value)
     }
+    this.emitHostsChange({ kind: 'token', url: spec.url })
     return await this.hostInfo(spec)
+  }
+
+  onHostsChange(listener: (change: HostsChange) => void): () => void {
+    const entry = (change: HostsChange): void => { listener(change) }
+    this.hostListeners.add(entry)
+    return () => { this.hostListeners.delete(entry) }
+  }
+
+  private emitHostsChange(change: HostsChange): void {
+    for (const listener of [...this.hostListeners]) {
+      try {
+        listener(change)
+      } catch (error) {
+        this.logger?.error?.('dsh-repo: 主机变更监听器出错：%s', error instanceof Error ? error.message : String(error))
+      }
+    }
   }
 
   mirrorSettings(): MirrorSettings {

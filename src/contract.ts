@@ -402,6 +402,14 @@ export interface HostCreate {
   readonly token?: string
 }
 
+/** One successful host change reported to {@link DshRepoService.onHostsChange}. */
+export interface HostsChange {
+  /** `added` and `removed` change the host list; `token` stored or removed a host's token. */
+  readonly kind: 'added' | 'removed' | 'token'
+  /** Normalized address of the host. */
+  readonly url: string
+}
+
 /** Where local mirrors live. */
 export interface MirrorSettings {
   /** Absolute directory holding the mirrors; snapshots live under its `.snapshots/`. */
@@ -524,6 +532,14 @@ export interface DshRepoService {
    * @throws `not-found` for an unknown address, `invalid` for an unusable token, `unavailable` when the store cannot be written.
    */
   setHostToken(url: string, token: string | undefined): Promise<HostInfo>
+  /**
+   * Observe host changes made through {@link addHost}, {@link removeHost}, and
+   * {@link setHostToken}, whoever made them. The listener runs after the change
+   * succeeded; a throwing listener does not affect the change or other listeners.
+   * @param listener - receives the change.
+   * @returns disposer that stops the observation.
+   */
+  onHostsChange(listener: (change: HostsChange) => void): () => void
 
   /** @returns where mirrors live. */
   mirrorSettings(): MirrorSettings

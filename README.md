@@ -6,7 +6,7 @@
 
 ## 项目状态
 
-测试版：提供统一接口、模型工具、运行时主机管理和本地镜像。接口仍可能调整。
+测试版：提供统一接口、模型工具、运行时主机管理、本地镜像和 Web 设置页。接口仍可能调整。
 
 ## 安装
 
@@ -62,7 +62,9 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 
 ### 运行时添加主机
 
-除了 cordis.yml 里的 `hosts`，其他插件（例如设置面板）可以调用 `addHost` 添加主机、`removeHost` 删除、`setHostToken` 保存或清除令牌。添加的主机保存在 `hostsFile`，令牌存入 DSH 凭据库，引用名由地址生成（`DSH_REPO_HOST_<哈希>`）。cordis.yml 中的主机只能改令牌，不能在运行时删除；`listHosts` 列出所有主机及令牌是否已设置，不返回令牌值。
+除了 cordis.yml 里的 `hosts`，还可以在运行时添加主机：Web 组合中打开左侧栏「插件」，进入 dsh-repo 的详情页即可添加、删除主机和保存、清除令牌，改动立即生效；其他插件也可以调用 `addHost` 添加主机、`removeHost` 删除、`setHostToken` 保存或清除令牌。添加的主机保存在 `hostsFile`，令牌存入 DSH 凭据库，引用名由地址生成（`DSH_REPO_HOST_<哈希>`）。cordis.yml 中的主机只能改令牌，不能在运行时删除；`listHosts` 列出所有主机及令牌是否已设置，不返回令牌值。`onHostsChange` 在每次主机或令牌变更成功后通知监听者，例如需要在令牌更新后重新拉取镜像的插件。
+
+设置页的数据来自宿主 `webServer` 上的 `/dsh-repo/state`、`/dsh-repo/hosts`、`/dsh-repo/host-token` 路由，请求经宿主 `connection` 做与 DSH `/api` 相同的来源校验和登录鉴权，写操作另外要求同源。没有 Web 的组合不挂载这些路由。
 
 ### 令牌
 
@@ -141,7 +143,9 @@ if (repos?.version === 1) {
 
 ```bash
 pnpm install
-pnpm check    # 类型检查、测试、构建、加载校验
+pnpm check    # 类型检查、测试、构建、Host 与 client 加载校验
 ```
+
+`src/client` 是浏览器端代码，单独用 `tsconfig.client.json` 检查，打包成 `lib/client.js` 经 DSH 的 `__ModuleLoader__` 加载，react 来自 Web 外壳的模块表。
 
 测试用替换全局 `fetch` 的方式驱动真实的 Octokit 和 GitBeaker，不访问网络。
