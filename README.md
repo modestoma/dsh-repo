@@ -115,6 +115,7 @@ if (repos?.version === 1) {
 
 `syncMirror(url, { branch })` 把仓库拉取为只拉取、不检出的镜像，返回分支最新提交；`readMirrorFile`、`listMirrorTree` 直接从提交的 git 对象读文件和目录；`acquireSnapshot(url, commit)` 返回该提交的只读检出（`git worktree`），同一提交的持有者共用一份，全部 `release()` 且不再是最近一次同步的提交时删除。
 
+- `mirror.dir` 默认是 `$DSH_HOME/dsh-repo/mirrors`，一般不用配置。镜像和运行时添加的主机都在 DSH 主目录下，不在插件的安装目录里，升级、卸载或重装插件不会删除它们；改动 `mirror.dir` 后旧目录里的镜像不会搬过去，下次使用时在新目录重新克隆。
 - 镜像位于 `<mirror.dir>/<主机>/<路径>`，本地路径位于 `<mirror.dir>/local/`；快照位于 `<mirror.dir>/.snapshots/` 下对应位置。新地址先克隆到临时目录再改名；同一镜像的 clone/fetch 依次执行。进程内第一次同步某个镜像时清理上次运行遗留的快照。
 - 地址可以是 HTTPS/SSH/git/file URL、`user@host:path` 或绝对路径。属于已配置主机的地址受 `repos` 范围限制；其中 HTTPS 地址自动使用该主机的令牌（GitLab 用户名 `oauth2`，GitHub 用户名 `x-access-token`），令牌经只对这次 git 进程生效的凭据助手传入，不出现在命令行、`.git/config` 或输出里。SSH 地址、其他主机和本地路径使用本机已有的 git 凭据（SSH key、凭据助手），`mirror.otherHosts: false` 时拒绝其他主机。
 - 需要本机安装 `git`；git 不会弹出交互式提示，SSH 以 batch 模式运行。

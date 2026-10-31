@@ -159,7 +159,7 @@ function HostsPanel(): JSX.Element {
       </section>
       <section className="dr__sec">
         <h2 className="dr__secTitle">本地镜像</h2>
-        <div className="dr__list"><div className="dr__row"><div className="dr__rowText"><div className="dr__rowLabel dr__mono">{state.mirrorDir}</div><div className="dr__rowSummary">镜像目录，在 cordis.yml 的 <span className="dr__mono">mirror.dir</span> 中修改。</div></div></div></div>
+        <div className="dr__list"><div className="dr__row"><div className="dr__rowText"><div className="dr__rowLabel dr__mono">{state.mirrorDir}</div><div className="dr__rowSummary">代码仓库的只读本地副本（只 fetch，不检出），需要读取仓库文件或按提交建只读快照的插件经它取代码，不必每次走主机接口。目录在 DSH 主目录下，不在插件安装目录里，升级、卸载或重装插件都不会清空；默认位置一般不用改，确需改到别处时在 cordis.yml 的 <span className="dr__mono">mirror.dir</span> 中设置。</div></div></div></div>
       </section>
     </div>
   )
