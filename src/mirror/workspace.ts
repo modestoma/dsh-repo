@@ -341,7 +341,7 @@ export class WorkspaceStore {
     const [names, numbers, patch, log, pending] = await Promise.all([
       this.workspaceGit(ws, ['diff', '--cached', '-z', '--name-status', '-M', ws.baseCommit], {}, signal),
       this.workspaceGit(ws, ['diff', '--cached', '-z', '--numstat', '-M', ws.baseCommit], {}, signal),
-      this.workspaceGit(ws, ['diff', '--cached', '-M', ws.baseCommit], {}, signal),
+      this.workspaceGit(ws, ['diff', '--cached', '-M', ws.baseCommit], {}, signal, this.deps.maxDiffBytes + 1),
       this.workspaceGit(ws, ['log', '--reverse', '--format=%H%x1f%s', `${ws.baseCommit}..HEAD`], {}, signal),
       this.workspaceGit(ws, ['diff', '--cached', '--name-only', '-z', 'HEAD'], {}, signal),
     ])
@@ -371,8 +371,14 @@ export class WorkspaceStore {
   }
 
   /** Run git on a located workspace with its metadata named explicitly. */
-  private workspaceGit(ws: Located, args: readonly string[], env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string> {
-    return this.deps.git([`--git-dir=${ws.gitDir}`, `--work-tree=${ws.dir}`, ...args], { cwd: ws.dir, timeoutMs: this.deps.timeoutMs, env, ...signal === undefined ? {} : { signal } })
+  private workspaceGit(ws: Located, args: readonly string[], env: Readonly<Record<string, string>>, signal?: AbortSignal, maxOutputBytes?: number): Promise<string> {
+    return this.deps.git([`--git-dir=${ws.gitDir}`, `--work-tree=${ws.dir}`, ...args], {
+      cwd: ws.dir,
+      timeoutMs: this.deps.timeoutMs,
+      env,
+      ...signal === undefined ? {} : { signal },
+      ...maxOutputBytes === undefined ? {} : { maxOutputBytes },
+    })
   }
 
   private git(args: readonly string[], cwd: string): Promise<string> {

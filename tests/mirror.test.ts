@@ -79,6 +79,17 @@ describe('mirror addresses', () => {
     await expect(service.syncMirror('ext::sh')).rejects.toMatchObject({ code: 'invalid' })
   })
 
+  it('cuts stdout at maxOutputBytes and lets git finish, and reports failures with their output', async () => {
+    const { dir } = origin()
+    const big = 'x'.repeat(200_000)
+    writeFileSync(join(dir, 'big.txt'), big)
+    const full = await runGit(['diff', '--no-index', '--', '/dev/null', 'big.txt'], { cwd: dir, timeoutMs: 30_000 }).catch((error: unknown) => (error as { output: string }).output)
+    expect(full.length).toBeGreaterThan(200_000)
+    await expect(runGit(['hash-object', 'big.txt'], { cwd: dir, timeoutMs: 30_000, maxOutputBytes: 8 })).resolves.toHaveLength(8)
+    await expect(runGit(['cat-file', '-p', 'HEAD:missing'], { cwd: dir, timeoutMs: 30_000 })).rejects.toMatchObject({ output: expect.stringContaining('missing') })
+    await expect(runGit(['status'], { cwd: dir, timeoutMs: 30_000, signal: AbortSignal.abort() })).rejects.toMatchObject({ output: expect.stringContaining('取消') })
+  })
+
   it('builds the credential helper environment after existing config entries', () => {
     expect(credentialEnvironment('https://h.example.com/x', 'oauth2', 't', { GIT_CONFIG_COUNT: '1' })).toMatchObject({
       GIT_CONFIG_COUNT: '3',
