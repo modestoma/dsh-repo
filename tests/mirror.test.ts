@@ -8,7 +8,7 @@ import { credentialEnvironment, runGit } from '../src/mirror/git.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
 import { isAcceptedGitUrl, mirrorPath, MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import { credentials, testConfig } from './helpers.ts'
+import { credentials, testConfig, withMirrors } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 
@@ -35,18 +35,23 @@ function setup(options: { git?: GitRunner; otherHosts?: boolean; tokens?: Record
   const service = new RepoService(config, {
     credentials: credentials(options.tokens ?? {}),
     hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
-    mirrors: new MirrorStore({ git: options.git ?? runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 64, maxTreeEntries: 10 }),
+    ...withMirrors(new MirrorStore({ git: options.git ?? runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 64, maxTreeEntries: 10 }), options.git ?? runGit),
   })
   return { root, service }
 }
 
 describe('mirror addresses', () => {
-  it('accepts git transports and lays mirrors out by host and path', () => {
-    expect(isAcceptedGitUrl('git@github.com:modestoma/dsh-repo.git')).toBe(true)
+  it('accepts only HTTPS, file URLs, and local paths, and lays mirrors out by host and path', () => {
+    expect(isAcceptedGitUrl('https://github.com/modestoma/dsh-repo.git')).toBe(true)
+    expect(isAcceptedGitUrl('file:///srv/repos/app.git')).toBe(true)
+    expect(isAcceptedGitUrl('/srv/repos/app.git')).toBe(true)
+    expect(isAcceptedGitUrl('git@github.com:modestoma/dsh-repo.git')).toBe(false)
+    expect(isAcceptedGitUrl('ssh://git@github.com/modestoma/dsh-repo.git')).toBe(false)
+    expect(isAcceptedGitUrl('git://github.com/modestoma/dsh-repo.git')).toBe(false)
+    expect(isAcceptedGitUrl('http://github.com/modestoma/dsh-repo.git')).toBe(false)
     expect(isAcceptedGitUrl('ext::sh -c id')).toBe(false)
     expect(isAcceptedGitUrl('-u')).toBe(false)
     expect(mirrorPath('https://code.example.com:8443/gitlab/team/app.git')).toBe('code.example.com_8443/gitlab/team/app')
-    expect(mirrorPath('git@github.com:modestoma/dsh-repo.git')).toBe('github.com/modestoma/dsh-repo')
     expect(mirrorPath('/srv/repos/app.git')).toMatch(/^local\/app-[0-9a-f]{8}$/)
     expect(mirrorPath('https://github.com/team/.github.git')).toMatch(/^github\.com\/team\/github-[0-9a-f]{6}$/)
     expect(mirrorPath('https://github.com/team/github.git')).toBe('github.com/team/github')
@@ -63,7 +68,9 @@ describe('mirror addresses', () => {
     expect(calls[0]?.args[0]).toBe('clone')
     expect(calls[0]?.env).toEqual(credentialEnvironment('https://code.example.com/gitlab', 'oauth2', 'gl', process.env))
     calls.length = 0
-    await expect(service.syncMirror('git@github.com:modestoma/app.git')).rejects.toMatchObject({ code: 'unavailable' })
+    await expect(service.syncMirror('git@github.com:modestoma/app.git')).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('https') })
+    expect(calls).toEqual([])
+    await expect(service.syncMirror('https://elsewhere.example.com/a/b')).rejects.toMatchObject({ code: 'unavailable' })
     expect(calls[0]?.env).toEqual({})
     await expect(service.syncMirror('https://github.com/someone/app')).rejects.toMatchObject({ code: 'not-allowed' })
     await expect(service.syncMirror('https://ghe.example.com/a/b')).rejects.toMatchObject({ code: 'not-allowed' })
@@ -126,7 +133,7 @@ describe('mirror store', () => {
     const make = () => new RepoService(config, {
       credentials: credentials({}),
       hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
-      mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 64, maxTreeEntries: 10 }),
+      ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 64, maxTreeEntries: 10 })),
     })
     const leftover = await make().acquireSnapshot(repo.dir, (await make().syncMirror(repo.dir)).commit)
     const restarted = make()

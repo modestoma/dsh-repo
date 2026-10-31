@@ -11,11 +11,12 @@
  */
 
 import { defaultMirrorDir, hostsFile, resolveConfig } from './config.ts'
-import type { HostApproval, HostContext } from './host.ts'
+import type { HostApproval, HostContext, WorkingDirectoryService } from './host.ts'
 import { HostStore } from './hosts.ts'
 import { runGit } from './mirror/git.ts'
 import type { GitRunner } from './mirror/git.ts'
 import { MirrorStore } from './mirror/store.ts'
+import { WorkspaceStore } from './mirror/workspace.ts'
 import { DSH_REPOS_SERVICE, RepoService } from './service.ts'
 import type { ProviderFactory } from './service.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
@@ -29,6 +30,8 @@ export { HostStore, addedTokenRef, isAcceptedToken } from './hosts.ts'
 export { GitError, credentialEnvironment, runGit } from './mirror/git.ts'
 export type { GitRunOptions, GitRunner } from './mirror/git.ts'
 export { MirrorStore, isAcceptedGitUrl, mirrorPath } from './mirror/store.ts'
+export { WorkspaceStore, forgetAbandonedWorkspaces } from './mirror/workspace.ts'
+export type { PushRequest, WorkspaceStoreDeps } from './mirror/workspace.ts'
 export { DSH_REPOS_SERVICE, RepoService, defaultProviderFactory } from './service.ts'
 export type { ProviderFactory, RepoServiceDeps } from './service.ts'
 export { GithubProvider } from './providers/github.ts'
@@ -82,10 +85,13 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     maxFileBytes: resolved.limits.maxFileBytes,
     maxTreeEntries: resolved.limits.maxTreeEntries,
   })
+  const git = options.git ?? runGit
+  const workspaces = new WorkspaceStore({ git, mirrors, timeoutMs: resolved.mirror.gitTimeoutMs, maxDiffBytes: resolved.limits.maxDiffBytes })
   const service = new RepoService(resolved, {
     credentials: ctx.credentials,
     hosts,
     mirrors,
+    workspaces,
     defaultMirrorDir: defaultMirrorDir(env),
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
     ...options.providerFactory === undefined ? {} : { factory: options.providerFactory },
@@ -94,7 +100,13 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   mountSettingsRoutes(ctx, service)
   if (!resolved.tools.enabled) return
   if (!service.configured) ctx.logger?.info?.('dsh-repo: 还没有主机，代码仓库工具在添加主机后提供')
-  for (const definition of createTools({ service, config: resolved, approval: () => ctx.get?.('approval') as HostApproval | undefined })) {
+  const tools = createTools({
+    service,
+    config: resolved,
+    approval: () => ctx.get?.('approval') as HostApproval | undefined,
+    workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
+  })
+  for (const definition of tools) {
     ctx.effect(() => ctx.tools.register(definition, { when: () => service.configured }), `dsh-repo: ${definition.name}`)
   }
 }

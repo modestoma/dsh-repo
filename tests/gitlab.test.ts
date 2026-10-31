@@ -37,53 +37,6 @@ describe('GitLab provider', () => {
     expect(Object.fromEntries(requests[0]!.url.searchParams)).toMatchObject({ page: '2', per_page: '10' })
   })
 
-  it('commits with create or update per file, starting a new branch from the base', async () => {
-    const { requests } = fakeHttp([
-      { method: 'GET', path: API, reply: { body: project } },
-      { method: 'GET', path: `${API}/repository/branches/feature`, reply: { status: 404, body: { message: '404 Branch Not Found' } } },
-      { method: 'GET', path: `${API}/repository/tree`, reply: request => request.url.searchParams.get('path') === 'docs'
-        ? { body: [{ path: 'docs/old.md', type: 'blob', mode: '100644' }] }
-        : { status: 404, body: { message: '404 Tree Not Found' } } },
-      { method: 'POST', path: `${API}/repository/commits`, reply: { status: 201, body: { id: 'c1', web_url: `${REPO}/-/commit/c1` } } },
-    ])
-    const result = await createService(testConfig(), TOKENS).commitFiles(REPO, {
-      branch: 'feature',
-      base: 'dev',
-      message: 'docs: update',
-      files: [
-        { action: 'write', path: 'docs/old.md', content: 'new' },
-        { action: 'write', path: 'new/dir/file.md', content: 'x' },
-        { action: 'delete', path: 'gone.md' },
-      ],
-    })
-    expect(result).toEqual({ sha: 'c1', branch: 'feature', createdBranch: true, webUrl: `${REPO}/-/commit/c1` })
-    expect(requests.filter(request => path(request).endsWith('/repository/tree')).every(request => request.url.searchParams.get('ref') === 'dev')).toBe(true)
-    expect(requests.at(-1)?.body).toMatchObject({
-      branch: 'feature',
-      commit_message: 'docs: update',
-      start_branch: 'dev',
-      actions: [
-        { action: 'update', file_path: 'docs/old.md', content: 'new' },
-        { action: 'create', file_path: 'new/dir/file.md', content: 'x' },
-        { action: 'delete', file_path: 'gone.md' },
-      ],
-    })
-  })
-
-  it('starts a new branch at baseSha and reports a branch created concurrently as a conflict', async () => {
-    const { requests } = fakeHttp([
-      { method: 'GET', path: API, reply: { body: project } },
-      { method: 'GET', path: `${API}/repository/branches/feature`, reply: { status: 404, body: { message: '404 Branch Not Found' } } },
-      { method: 'GET', path: `${API}/repository/tree`, reply: { body: [{ path: 'a.md', type: 'blob', mode: '100644' }] } },
-      { method: 'POST', path: `${API}/repository/commits`, reply: { status: 400, body: { message: 'A branch called \'feature\' already exists.' } } },
-    ])
-    const files = [{ action: 'write' as const, path: 'a.md', content: 'A' }]
-    await expect(createService(testConfig(), TOKENS).commitFiles(REPO, { branch: 'feature', baseSha: SHA, newBranch: true, author: { name: 'Bot', email: 'bot@example.com' }, message: 'm', files }))
-      .rejects.toMatchObject({ code: 'conflict' })
-    expect(requests.find(request => path(request).endsWith('/repository/tree'))?.url.searchParams.get('ref')).toBe(SHA)
-    expect(requests.at(-1)?.body).toMatchObject({ start_sha: SHA, author_name: 'Bot', author_email: 'bot@example.com', actions: [{ action: 'update', file_path: 'a.md' }] })
-  })
-
   it('reads one branch and reports a missing one as absent', async () => {
     fakeHttp([
       { method: 'GET', path: `${API}/repository/branches/feature`, reply: { body: { name: 'feature', protected: false, default: false, commit: { id: SHA } } } },
@@ -92,16 +45,6 @@ describe('GitLab provider', () => {
     const service = createService(testConfig(), TOKENS)
     expect(await service.getBranch(REPO, 'feature')).toEqual({ name: 'feature', commit: SHA, protected: false, default: false })
     expect(await service.getBranch(REPO, 'gone')).toBeUndefined()
-  })
-
-  it('refuses to commit on top of an existing branch when newBranch is set', async () => {
-    const { requests } = fakeHttp([
-      { method: 'GET', path: API, reply: { body: project } },
-      { method: 'GET', path: `${API}/repository/branches/feature`, reply: { body: { name: 'feature', protected: false, commit: { id: SHA } } } },
-    ])
-    await expect(createService(testConfig(), TOKENS).commitFiles(REPO, { branch: 'feature', newBranch: true, message: 'm', files: [{ action: 'delete', path: 'a' }] }))
-      .rejects.toMatchObject({ code: 'conflict' })
-    expect(requests.some(request => request.method === 'POST')).toBe(false)
   })
 
   it('maps issue states and closes through state events', async () => {

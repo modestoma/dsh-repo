@@ -21,6 +21,20 @@ export interface ContentBlock {
 /** The calling Agent as seen by a tool execution. */
 export interface Agent {
   readonly id: string
+  /** The Agent's Session; its header `cwd` is the original project directory and the sandbox's writable root. */
+  readonly session?: { readonly header: { readonly cwd?: string } }
+}
+
+/**
+ * The `ctx.workingDirectory` slice (`@deepseek-ai/dsh-working-directory`):
+ * one Session's effective directory. Changing it does not move the sandbox's
+ * writable root, which stays at the Session header `cwd`.
+ */
+export interface WorkingDirectoryService {
+  /** @returns the existing effective directory, restoring the original project when it disappeared. */
+  ensure(agent: Agent, signal?: AbortSignal): Promise<string>
+  /** @returns the canonical directory now recorded as the Session's working directory. */
+  set(agent: Agent, path: string, signal?: AbortSignal): Promise<string>
 }
 
 /** Per-call execution context handed to `execute`. */

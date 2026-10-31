@@ -33,15 +33,12 @@ export interface GitRunOptions {
 export type GitRunner = (args: readonly string[], options: GitRunOptions) => Promise<string>
 
 /**
- * Environment for non-interactive git: no terminal prompts, and SSH in batch
- * mode unless the user configured their own SSH command.
+ * Environment for non-interactive git: no terminal prompts.
  * @param env - base environment.
  * @returns environment for git child processes.
  */
 export function gitEnvironment(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const next: NodeJS.ProcessEnv = { ...env, GIT_TERMINAL_PROMPT: '0' }
-  if (env.GIT_SSH_COMMAND === undefined && env.GIT_SSH === undefined) next.GIT_SSH_COMMAND = 'ssh -o BatchMode=yes'
-  return next
+  return { ...env, GIT_TERMINAL_PROMPT: '0' }
 }
 
 /**

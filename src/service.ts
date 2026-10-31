@@ -14,9 +14,9 @@ import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type {
-  CallOptions, ChangeCreate, ChangeListOptions, ChangeUpdate, CommitRequest, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
+  CallOptions, ChangeCreate, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
   HostCreate, HostInfo, HostsChange, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, PageOptions, RepoRef, RepoTarget,
-  SnapshotLease, TokenStatus,
+  SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
 } from './contract.ts'
 import { apiBaseUrl, expandHome } from './config.ts'
 import type { HostSpec, RepoConfig } from './config.ts'
@@ -25,6 +25,7 @@ import type { HostCredentials, HostLogger } from './host.ts'
 import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
 import { credentialEnvironment } from './mirror/git.ts'
 import type { MirrorStore } from './mirror/store.ts'
+import type { WorkspaceStore } from './mirror/workspace.ts'
 import { GithubProvider } from './providers/github.ts'
 import { GitlabProvider } from './providers/gitlab.ts'
 import type { Call, Paging, Provider } from './providers/types.ts'
@@ -76,6 +77,8 @@ export interface RepoServiceDeps {
   readonly hosts: HostStore
   /** Local mirrors. */
   readonly mirrors: MirrorStore
+  /** Writable checkouts of mirror commits. */
+  readonly workspaces: WorkspaceStore
   readonly factory?: ProviderFactory
   /** Mirror directory used while none is chosen; default: the mirrors' starting root. */
   readonly defaultMirrorDir?: string
@@ -85,11 +88,12 @@ export interface RepoServiceDeps {
 
 /** The service implementation. */
 export class RepoService implements DshRepoService {
-  readonly version = 1 as const
+  readonly version = 2 as const
   private readonly providers = new Map<string, Provider>()
   private readonly credentials: HostCredentials
   private readonly hosts: HostStore
   private readonly mirrors: MirrorStore
+  private readonly workspaces: WorkspaceStore
   private readonly factory: ProviderFactory
   private readonly logger: HostLogger | undefined
   private readonly defaultMirrorDir: string
@@ -103,6 +107,7 @@ export class RepoService implements DshRepoService {
     this.credentials = deps.credentials
     this.hosts = deps.hosts
     this.mirrors = deps.mirrors
+    this.workspaces = deps.workspaces
     this.factory = deps.factory ?? defaultProviderFactory
     this.logger = deps.logger
     this.defaultMirrorDir = deps.defaultMirrorDir ?? deps.mirrors.root
@@ -148,41 +153,6 @@ export class RepoService implements DshRepoService {
   async readFile(repo: RepoTarget, path: string, options: CallOptions & { readonly ref?: string } = {}) {
     requireRepoPath(path, '文件路径')
     return await this.run(repo, options, `读取文件 ${path}`, (provider, ref, call) => provider.readFile(ref, path, options.ref, call))
-  }
-
-  async commitFiles(repo: RepoTarget, request: CommitRequest) {
-    requireBranch(request.branch, '分支名')
-    if (request.base !== undefined) requireBranch(request.base, '起点分支名')
-    if (request.baseSha !== undefined) {
-      if (request.base !== undefined) throw new RepoError('invalid', 'base 和 baseSha 只能给一个')
-      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(request.baseSha)) throw new RepoError('invalid', `起点提交必须是完整的十六进制提交 id：${request.baseSha}`)
-    }
-    requireText(request.message, '提交说明')
-    if (request.author !== undefined) {
-      if (!/^[^<>\n]+$/.test(request.author.name.trim())) throw new RepoError('invalid', '提交作者名不能为空，也不能包含 < > 或换行')
-      if (!/^[^<>\s]+$/.test(request.author.email.trim())) throw new RepoError('invalid', '提交作者邮箱不能为空，也不能包含 < > 或空白')
-    }
-    if (request.files.length === 0) throw new RepoError('invalid', '提交至少要包含一个文件')
-    if (request.files.length > this.config.limits.maxCommitFiles) throw new RepoError('too-large', `一次提交最多 ${this.config.limits.maxCommitFiles} 个文件`)
-    const seen = new Set<string>()
-    for (const file of request.files) {
-      requireRepoPath(file.path, '文件路径')
-      if (seen.has(file.path)) throw new RepoError('invalid', `文件重复：${file.path}`)
-      seen.add(file.path)
-      if (file.action === 'write' && Buffer.byteLength(file.content, 'utf8') > this.config.limits.maxFileBytes) {
-        throw new RepoError('too-large', `${file.path} 超过单文件上限 ${this.config.limits.maxFileBytes} 字节`)
-      }
-    }
-    const fields = {
-      branch: request.branch,
-      message: request.message,
-      files: request.files,
-      ...request.base === undefined ? {} : { base: request.base },
-      ...request.baseSha === undefined ? {} : { baseSha: request.baseSha },
-      ...request.newBranch === true ? { newBranch: true } : {},
-      ...request.author === undefined ? {} : { author: { name: request.author.name.trim(), email: request.author.email.trim() } },
-    }
-    return await this.run(repo, request, `提交到分支 ${request.branch}`, (provider, ref, call) => provider.commitFiles(ref, fields, call))
   }
 
   async listIssues(repo: RepoTarget, options: IssueListOptions = {}) {
@@ -379,21 +349,53 @@ export class RepoService implements DshRepoService {
     return await this.mirrors.acquire(url, commit, options.signal)
   }
 
+  async openWorkspace(url: string, options: WorkspaceOpenOptions): Promise<WorkspaceInfo> {
+    if (options.commit !== undefined && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(options.commit)) throw new RepoError('invalid', `起点提交必须是完整的十六进制提交 id：${options.commit}`)
+    if (!isAbsolute(options.dir)) throw new RepoError('invalid', `工作区目录必须是绝对路径：${options.dir}`)
+    const state = await this.syncMirror(url, { ...options.baseBranch === undefined ? {} : { branch: options.baseBranch }, ...options.signal === undefined ? {} : { signal: options.signal } })
+    return await this.workspaces.open(url, options.dir, options.commit ?? state.commit, state.branch, options.signal)
+  }
+
+  async workspaceChanges(dir: string, options: CallOptions = {}): Promise<WorkspaceChanges> {
+    return await this.workspaces.changes(dir, options.signal)
+  }
+
+  async pushWorkspace(dir: string, options: WorkspacePushOptions = {}): Promise<WorkspacePushResult> {
+    if (options.branch !== undefined) requireBranch(options.branch, '分支名')
+    if (options.author !== undefined) {
+      if (!/^[^<>\n]+$/.test(options.author.name.trim())) throw new RepoError('invalid', '提交作者名不能为空，也不能包含 < > 或换行')
+      if (!/^[^<>\s]+$/.test(options.author.email.trim())) throw new RepoError('invalid', '提交作者邮箱不能为空，也不能包含 < > 或空白')
+    }
+    const { url } = await this.workspaces.locate(dir)
+    const env = await this.mirrorAuth(url, true)
+    const author = options.author === undefined ? undefined : { name: options.author.name.trim(), email: options.author.email.trim() }
+    return await this.workspaces.push(dir, {
+      env,
+      ...options.branch === undefined ? {} : { branch: options.branch },
+      ...options.message === undefined ? {} : { message: options.message },
+      ...author === undefined ? {} : { author },
+      ...options.signal === undefined ? {} : { signal: options.signal },
+    }, async (remote, branch) => (await this.mirrors.remoteDefaultBranch(remote, env, options.signal)) === branch)
+  }
+
   /**
-   * Environment of a mirror's network commands: the host's token for an
-   * HTTP(S) address under a known host, nothing otherwise.
-   * @throws {RepoError} `invalid` for an unsupported address, `not-allowed` outside the configured repositories or on another host when those are refused, `unauthenticated` when the host's token is unset.
+   * Environment of a mirror's or workspace's network commands: the host's
+   * token for an address under a configured host, nothing for local paths
+   * and (when allowed) other hosts.
+   * @param url - accepted git address.
+   * @param push - whether the command writes, which needs a configured host's token unless the address is local.
+   * @throws {RepoError} `invalid` for an unsupported address, `not-allowed` outside the configured repositories or on another host when those are refused, `unauthenticated` when the host's token is unset or a push targets a host without one.
    */
-  private async mirrorAuth(url: string): Promise<Record<string, string>> {
+  private async mirrorAuth(url: string, push = false): Promise<Record<string, string>> {
     this.mirrors.dirOf(url)
-    const local = isAbsolute(url) || url.startsWith('file:')
-    const spec = local ? undefined : hostOf(url, this.hosts.all())
+    if (isAbsolute(url) || url.startsWith('file:')) return {}
+    const spec = hostOf(url, this.hosts.all())
     if (spec === undefined) {
+      if (push) throw new RepoError('unauthenticated', `${url} 不属于已配置的主机，没有令牌可用于推送；先在 dsh-repo 中添加该主机并设置令牌`)
       if (!this.config.mirror.otherHosts) throw new RepoError('not-allowed', `${url} 不属于已配置的主机，dsh-repo 不镜像其他主机上的仓库`)
       return {}
     }
     resolveTarget(url, this.hosts.all(), this.config.repos)
-    if (!/^https?:/i.test(url)) return {}
     return credentialEnvironment(spec.url, gitUsername(spec.kind), await this.token(spec))
   }
 

@@ -14,17 +14,21 @@
  *   deletes the snapshots an earlier run left behind.
  * - Clone and fetch of one mirror run one at a time; `git worktree` changes
  *   of one mirror run one at a time.
+ * - The first sync of a mirror in this process also deletes the local
+ *   branches of writable workspaces ({@link ./workspace.ts}) whose checkouts
+ *   were deleted.
  *
  * @module dsh-repo/mirror/store
  */
 
 import { createHash, randomBytes } from 'node:crypto'
-import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
+import { mkdir, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import type { MirrorState, MirrorTreeEntry, SnapshotLease } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { GitError } from './git.ts'
 import type { GitRunner } from './git.ts'
+import { forgetAbandonedWorkspaces } from './workspace.ts'
 
 /** Collaborators and limits of the store. */
 export interface MirrorStoreDeps {
@@ -37,26 +41,25 @@ export interface MirrorStoreDeps {
   readonly maxTreeEntries: number
 }
 
-const SCP_LIKE = /^[A-Za-z0-9._-]+@([A-Za-z0-9.-]+):([^\s]+)$/
-const URL_SCHEMES = new Set(['https:', 'http:', 'ssh:', 'git:', 'file:'])
+const URL_SCHEMES = new Set(['https:', 'file:'])
 const COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
 
 /**
- * Whether an address is one this store hands to `git clone`: an
- * `https`/`http`/`ssh`/`git`/`file` URL, an scp-like `user@host:path`, or an
- * absolute local path. Other transports (notably `ext::`) are refused.
+ * Whether an address is one this store hands to `git clone`: an `https` or
+ * `file` URL, or an absolute local path. SSH, scp-like `user@host:path`,
+ * `git://`, plain `http`, and other transports (notably `ext::`) are refused,
+ * so every remote address authenticates with a host token.
  * @param value - candidate address.
  * @returns whether it is accepted.
  */
 export function isAcceptedGitUrl(value: string): boolean {
   if (value === '' || value.startsWith('-') || /\s/.test(value)) return false
-  if (SCP_LIKE.test(value)) return true
   if (isAbsolute(value)) return true
   try {
     return URL_SCHEMES.has(new URL(value).protocol)
   } catch {
-    // Not a URL and not scp-like: refused.
+    // Not a URL and not a local path: refused.
     return false
   }
 }
@@ -86,8 +89,6 @@ function cleanSegments(path: string): string[] {
  * @returns relative directory, `/`-separated.
  */
 export function mirrorPath(url: string): string {
-  const scp = SCP_LIKE.exec(url)
-  if (scp !== null) return [(scp[1] ?? '').toLowerCase(), ...cleanSegments(scp[2] ?? '')].join('/')
   if (!isAbsolute(url)) {
     const parsed = new URL(url)
     if (parsed.protocol !== 'file:') {
@@ -181,7 +182,7 @@ export class MirrorStore {
    * @throws {RepoError} `invalid` for an unsupported address.
    */
   dirOf(url: string): string {
-    if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${url}（支持 https/ssh/git/file URL、user@host:path 或绝对路径）`)
+    if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${url}（只支持 https 地址、file URL 或绝对路径；SSH 地址请改用仓库的 https 地址）`)
     const root = this.currentRoot
     const dir = join(root, ...mirrorPath(url).split('/'))
     this.roots.set(dir, root)
@@ -305,6 +306,37 @@ export class MirrorStore {
     return { url, commit, dir: snapshot.dir, release }
   }
 
+  /**
+   * Run a task after every `git worktree` change of the same mirror queued earlier.
+   * @param dir - mirror directory.
+   * @param task - work to run.
+   * @returns the task's result.
+   */
+  withWorktreeLock<T>(dir: string, task: () => Promise<T>): Promise<T> {
+    return serialize(this.worktreeLocks, dir, task)
+  }
+
+  /**
+   * Whether a directory lies inside the current mirror root or a root a
+   * mirror was resolved under earlier in this process.
+   * @param dir - canonical absolute directory.
+   * @returns whether the store owns it.
+   */
+  async owns(dir: string): Promise<boolean> {
+    for (const root of new Set([this.currentRoot, ...this.roots.values()])) {
+      let real: string
+      try {
+        real = await realpath(root)
+      } catch {
+        // A root that no longer exists owns nothing.
+        continue
+      }
+      const rel = relative(real, dir)
+      if (rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)) return true
+    }
+    return false
+  }
+
   private mirror(dir: string): Mirror {
     let mirror = this.mirrors.get(dir)
     if (mirror === undefined) {
@@ -323,8 +355,15 @@ export class MirrorStore {
     return this.deps.git(args, { ...cwd === undefined ? {} : { cwd }, timeoutMs: this.deps.timeoutMs, env, ...signal === undefined ? {} : { signal } })
   }
 
-  /** The mirror directory of an address, after checking the mirror and commit exist. */
-  private async existing(url: string, commit: string, signal?: AbortSignal): Promise<string> {
+  /**
+   * The mirror directory of an address, after checking the mirror and commit exist.
+   * @param url - git address.
+   * @param commit - full commit id.
+   * @param signal - cancellation.
+   * @returns the mirror directory.
+   * @throws {RepoError} `invalid` for a bad address or commit id, `not-found` when the mirror or commit is missing.
+   */
+  async existing(url: string, commit: string, signal?: AbortSignal): Promise<string> {
     const dir = this.dirOf(url)
     if (!COMMIT.test(commit)) throw new RepoError('invalid', `提交必须是完整的十六进制提交 id：${commit}`)
     if (await pathKind(join(dir, '.git')) === 'missing') throw new RepoError('not-found', `${url} 还没有镜像，先同步`)
@@ -374,13 +413,33 @@ export class MirrorStore {
     if (cleared === undefined) {
       cleared = serialize(this.worktreeLocks, dir, async () => {
         await rm(this.snapshotRoot(dir), { recursive: true, force: true })
-        if (await pathKind(join(dir, '.git')) !== 'missing') await this.git(['worktree', 'prune'], dir, {})
+        if (await pathKind(join(dir, '.git')) === 'missing') return
+        await this.git(['worktree', 'prune'], dir, {})
+        await forgetAbandonedWorkspaces(args => this.git(args, dir, {}))
       })
       // A failed cleanup is retried by the next caller.
       cleared.catch(() => { this.cleared.delete(dir) })
       this.cleared.set(dir, cleared)
     }
     return cleared
+  }
+
+  /**
+   * The default branch the remote reports right now.
+   * @param url - mirror address.
+   * @param env - credentials of the network command.
+   * @param signal - cancellation.
+   * @returns the branch name, or undefined when the remote reports none.
+   * @throws {RepoError} `unavailable` when git fails.
+   */
+  async remoteDefaultBranch(url: string, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string | undefined> {
+    const dir = this.dirOf(url)
+    try {
+      const listed = await this.git(['ls-remote', '--symref', 'origin', 'HEAD'], dir, env, signal)
+      return /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(listed)?.[1]
+    } catch (error) {
+      throw gitFailure(error, `读取 ${url} 的默认分支`)
+    }
   }
 
   /** The remote's current default branch, asked from the remote on every call so a changed default is followed. */

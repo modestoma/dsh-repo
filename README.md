@@ -1,12 +1,12 @@
 # dsh-repo
 
-面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的代码仓库插件。它用 GitHub 官方 SDK [Octokit](https://github.com/octokit/rest.js) 和 GitLab 文档推荐的 [GitBeaker](https://github.com/jdalrymple/gitbeaker) 抹平 GitHub 与 GitLab 的差异，对其他插件提供 `dshRepos` 服务，对模型提供代码、issue、PR/MR 工具；需要本地代码目录的插件可以用它维护仓库的本地镜像和按提交的只读快照。
+面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的代码仓库插件。它用 GitHub 官方 SDK [Octokit](https://github.com/octokit/rest.js) 和 GitLab 文档推荐的 [GitBeaker](https://github.com/jdalrymple/gitbeaker) 抹平 GitHub 与 GitLab 的差异，对其他插件提供 `dshRepos` 服务，对模型提供代码、issue、PR/MR 工具；需要本地代码目录的插件可以用它维护仓库的本地镜像、按提交的只读快照，以及用来改代码的可写工作区。
 
 支持的主机：github.com、GitHub Enterprise Server、gitlab.com、自建 GitLab（包括部署在子路径下的实例）。
 
 ## 项目状态
 
-测试版：提供统一接口、模型工具、运行时主机管理、本地镜像和 Web 设置页。接口仍可能调整。
+测试版：提供统一接口、模型工具、运行时主机管理、本地镜像、可写工作区和 Web 设置页。接口仍可能调整。
 
 ## 安装
 
@@ -41,14 +41,13 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
     limits:
       perPage: 30                       # 列表默认每页条数
       maxPerPage: 100
-      maxFileBytes: 1048576             # 读文件、提交单文件的上限
-      maxDiffBytes: 524288              # diff 的上限，超出截断
+      maxFileBytes: 1048576             # 读文件的上限
+      maxDiffBytes: 524288              # PR/MR 与工作区 diff 的上限，超出截断
       maxTreeEntries: 1000              # 目录列表的上限，超出截断
-      maxCommitFiles: 100               # 一次提交的文件数上限
       maxComments: 50                   # 读取 issue / PR/MR 时附带的评论条数
     mirror:
-      gitTimeoutMs: 600000              # 单条 git 命令（clone、fetch、worktree）的超时
-      otherHosts: true                  # false = 只镜像 hosts 中主机上的仓库
+      gitTimeoutMs: 600000              # 单条 git 命令（clone、fetch、worktree、push）的超时
+      otherHosts: true                  # false = 只镜像 hosts 中主机上的仓库；其他主机上的仓库只能拉取，不能推送
     hostsFile: ~/.dsh/dsh-repo/hosts.json  # 运行时添加的主机，默认 $DSH_HOME/dsh-repo/hosts.json
     tools:
       enabled: true                     # false = 只提供 dshRepos 服务，不注册模型工具
@@ -67,7 +66,7 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 
 ### 令牌
 
-令牌每次请求时经 `ctx.credentials` 读取（环境变量 > `$DSH_HOME/.credentials.yaml` > `.env`），更换令牌不用重启。GitHub 需要 `repo`（或细粒度令牌的 Contents、Issues、Pull requests 读写）权限；GitLab 需要 `api` 权限，只读使用可以用 `read_api`。令牌只出现在发往该主机的请求头里，不进入模型上下文。
+令牌每次请求时经 `ctx.credentials` 读取（环境变量 > `$DSH_HOME/.credentials.yaml` > `.env`），更换令牌不用重启。GitHub 需要 `repo`（或细粒度令牌的 Contents、Issues、Pull requests 读写）权限；GitLab 需要 `api` 权限，只读使用可以用 `read_api`。令牌只出现在发往该主机的请求头和 git 进程的凭据助手里，不进入模型上下文。推送工作区用的也是这个令牌（GitLab 的 `api` 权限包含推送）。
 
 与 DSH 中的模型 API Key 一样，Agent 的命令以同一系统用户运行，文件权限不能把令牌与 Agent 隔离；建议使用权限最小、设置了过期时间的令牌，并用 `repos` 限定范围。
 
@@ -77,7 +76,7 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 
 ## 模型工具
 
-所有工具的 `repo` 参数接受仓库网址、git 地址或 `主机/路径`；PR/MR 页面的网址也可以直接粘贴。编号是网页上显示的编号（GitLab 的 IID）。
+所有工具的 `repo` 参数接受仓库网址、git 地址或 `主机/路径`；PR/MR 页面的网址也可以直接粘贴。编号是网页上显示的编号（GitLab 的 IID）。工作区按仓库的 HTTPS 地址检出，所以 `repo` 写成 SSH 地址也可以。
 
 | 工具 | 作用 | 审批 |
 |---|---|---|
@@ -86,14 +85,29 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 | `repo_list_tree` / `repo_read_file` | 目录与文件内容 | 否 |
 | `repo_issue_list` / `repo_issue_get` | issue 列表、单个 issue 及评论 | 否 |
 | `repo_mr_list` / `repo_mr_get` / `repo_mr_diff` / `repo_mr_status` | PR/MR 列表、详情与评论、diff、CI 与可合并状态 | 否 |
-| `repo_commit_files` | 一次提交多个文件的写入和删除；分支不存在时从 `base` 创建 | 是 |
+| `repo_workspace_open` | 在当前工作目录下检出可写工作区，并把会话的工作目录切到那里，见[改代码](#改代码) | 否 |
+| `repo_workspace_changes` | 工作区相对起点提交的改动：文件与增删行数、已推送的提交、diff | 否 |
+| `repo_workspace_push` | 提交工作区未提交的改动并推送到新分支，从不强推 | 是 |
 | `repo_issue_create` / `repo_issue_update` / `repo_issue_comment` | 创建、修改、关闭或重开、评论 issue | 是 |
 | `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR | 是 |
 | `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；默认不注册 | 是 |
 
 - 写操作在 `writes: ask` 下每次调用都经 `ctx.approval` 请用户确认一次，被拒绝时工具返回 `{ "status": "declined" }`，不会调用主机。组合里没有审批服务时写工具报错。
-- `repo_commit_files` 不允许提交到默认分支或受保护分支；改代码的流程是提交到新分支，再用 `repo_mr_create` 开 PR/MR。
+- `repo_workspace_push` 的审批提示列出仓库、目标分支、起点、改动文件与增删行数和提交说明。
 - 失败时工具报错，消息以失败类型开头，例如 `[not-found]`、`[forbidden]`、`[conflict]`。
+
+## 改代码
+
+改代码只有一条路：检出工作区 → 修改 → 推送到新分支 → 开 PR/MR。
+
+1. **检出。** `repo_workspace_open` 先拉取镜像，再以 `baseBranch`（默认是默认分支）的最新提交或给定的 `commit` 为起点，在当前工作目录下新建 `<仓库名>/`（重名时加 `-2`、`-3`），并经 DSH 的 `workingDirectory` 服务把会话的工作目录切过去，仓库里的 AGENTS.md、项目 SKILL 随之生效。当前工作目录不在会话的项目目录（沙箱可写根）内时，工作区放在项目目录下；当前目录在另一个工作区里时，放在那个工作区旁边。
+2. **修改。** Agent 用普通的文件和命令工具编辑、构建、测试。工作区的 git 元数据（索引、HEAD、本地分支和提交）留在镜像里，Agent 只能改文件，`git status`、`git diff`、`git log` 这类只读命令可以用，`git add`、`git commit`、`git checkout` 会因为写不了元数据而失败。
+3. **推送。** `repo_workspace_push` 经用户审批后，由插件进程把未提交的改动（`git add --all`，`.gitignore` 生效）提交为一个提交，再把工作区推送到远端分支。第一次推送要给出分支名：不能是起点分支或远端默认分支，远端已有同名分支时以 `conflict` 失败，推送用 `--force-with-lease=<分支>:` 保证只创建、不覆盖；之后的推送只能去同一个分支，普通推送，远端被他人更新时以 `conflict` 失败。推送失败时撤销这次调用新建的提交。推送用该主机的令牌，主机没有配置时报 `unauthenticated`；提交作者和提交者是本机的 git 身份（服务调用可以用 `author` 指定）。
+4. **开 PR/MR。** 用 `repo_mr_create`，`sourceBranch` 是推送的分支，`targetBranch` 是起点分支。
+
+工作区目录归调用方所有，dsh-repo 不删除它；删除目录即放弃这个工作区，进程下次启动后第一次同步该镜像时清理它在镜像里的本地分支。换了镜像目录后，旧目录里镜像的工作区不能再推送。
+
+工作区目录由 Agent 写入，dsh-repo 把它当作不可信内容：每次操作前核对工作区的 `.git` 文件与镜像里的记录互相指向、且元数据属于 dsh-repo 的镜像目录，再显式指定 `--git-dir` 和 `--work-tree` 运行 git，所以伪造的 `.git` 不能让插件进程在 Agent 控制的仓库配置下运行 git。镜像目录不要放在 Agent 可写的目录里。
 
 ## `dshRepos` 服务
 
@@ -108,7 +122,7 @@ if (repos?.version === 1) {
 }
 ```
 
-接口覆盖仓库信息、分支、提交、目录、文件、多文件提交、issue 与 PR/MR 的读写和合并，以及主机管理和本地镜像，完整定义见 [`src/contract.ts`](src/contract.ts)。多文件提交可以用 `baseSha` 从指定提交建新分支，`newBranch: true` 时分支已存在就以 `conflict` 失败，不会在已有分支上追加提交；`author` 指定提交作者（提交者始终是令牌对应的用户）。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并，以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit })` 在调用方给的目录（必须不存在）检出工作区，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
 
 ## 本地镜像
 
@@ -117,8 +131,8 @@ if (repos?.version === 1) {
 - 镜像目录默认是 `$DSH_HOME/dsh-repo/mirrors`，可以在「插件 → dsh-repo」页面手动输入或用系统目录选择框（本机 GUI 会话可用）换到别处，也可以由其他插件调用 `setMirrorDir`。所选目录与运行时添加的主机一起保存在 `hostsFile`（默认 `$DSH_HOME/dsh-repo/hosts.json`）的 `mirrorDir` 字段，不写 cordis.yml；恢复默认时删除该字段。目录不存在时创建，无法创建或写入时拒绝。换目录后旧目录里的镜像不搬也不删，之后的同步在新目录重新克隆；已经持有的快照留在旧目录直到释放。每次换目录都经 `onHostsChange` 通知（`kind: 'mirror'`）。
 - 镜像和主机文件都在 DSH 主目录下，不在插件的安装目录里，升级、卸载或重装插件不会删除它们。
 - 镜像位于 `<镜像目录>/<主机>/<路径>`，本地路径位于 `<镜像目录>/local/`；快照位于 `<镜像目录>/.snapshots/` 下对应位置。新地址先克隆到临时目录再改名；同一镜像的 clone/fetch 依次执行。进程内第一次同步某个镜像时清理上次运行遗留的快照。
-- 地址可以是 HTTPS/SSH/git/file URL、`user@host:path` 或绝对路径。属于已配置主机的地址受 `repos` 范围限制；其中 HTTPS 地址自动使用该主机的令牌（GitLab 用户名 `oauth2`，GitHub 用户名 `x-access-token`），令牌经只对这次 git 进程生效的凭据助手传入，不出现在命令行、`.git/config` 或输出里。SSH 地址、其他主机和本地路径使用本机已有的 git 凭据（SSH key、凭据助手），`mirror.otherHosts: false` 时拒绝其他主机。
-- 需要本机安装 `git`；git 不会弹出交互式提示，SSH 以 batch 模式运行。
+- 地址只接受 HTTPS URL、`file:` URL 或绝对路径；SSH 地址、`user@host:path`、`git://` 和 `http://` 以 `invalid` 拒绝，请改用仓库的 HTTPS 地址。属于已配置主机的地址受 `repos` 范围限制，并自动使用该主机的令牌（GitLab 用户名 `oauth2`，GitHub 用户名 `x-access-token`），令牌经只对这次 git 进程生效的凭据助手传入，不出现在命令行、`.git/config` 或输出里，Agent 也拿不到。其他主机上的仓库不带凭据拉取（适合公开仓库），`mirror.otherHosts: false` 时拒绝；本地路径不需要凭据。
+- 需要本机安装 `git`；git 不会弹出交互式提示。
 
 ## GitHub 与 GitLab 的差异处理
 
@@ -129,7 +143,6 @@ if (repos?.version === 1) {
 | PR/MR 状态 | 统一为 `open` / `closed` / `merged`；GitHub 的 merged 由 `merged_at` 判断 |
 | 草稿 | GitHub 用 `draft` 字段；GitLab 创建时加 `Draft: ` 标题前缀 |
 | 指派人 | 统一用用户名；GitLab 先查用户 id |
-| 多文件提交 | GitHub 用 Git Data API（tree → commit → ref），保留已有文件的可执行位；GitLab 用 Commits API，按文件是否存在选择 create / update |
 | CI 状态 | GitHub 合并 check runs 与 commit statuses；GitLab 读 MR 的 head pipeline |
 | 合并方式 | GitHub 支持 merge / squash / rebase；GitLab 支持 merge / squash |
 

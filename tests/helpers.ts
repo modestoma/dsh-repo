@@ -7,6 +7,8 @@ import type { HostCredentials } from '../src/host.ts'
 import { HostStore } from '../src/hosts.ts'
 import { runGit } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
+import { WorkspaceStore } from '../src/mirror/workspace.ts'
+import type { GitRunner } from '../src/mirror/git.ts'
 import { RepoService } from '../src/service.ts'
 
 /** One recorded request. */
@@ -69,8 +71,13 @@ export function createService(config: RepoConfig, tokens: Record<string, string>
   return new RepoService(config, {
     credentials: credentials(tokens),
     hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
-    mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: config.limits.maxFileBytes, maxTreeEntries: config.limits.maxTreeEntries }),
+    ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: config.limits.maxFileBytes, maxTreeEntries: config.limits.maxTreeEntries })),
   })
+}
+
+/** Service dependencies over a mirror store: the store and workspaces on it. */
+export function withMirrors(mirrors: MirrorStore, git: GitRunner = runGit, maxDiffBytes = 4096): { mirrors: MirrorStore; workspaces: WorkspaceStore } {
+  return { mirrors, workspaces: new WorkspaceStore({ git, mirrors, timeoutMs: 30_000, maxDiffBytes }) }
 }
 
 /** Configuration with a github.com host, a GitHub Enterprise host, and a self-managed GitLab under a path prefix. */

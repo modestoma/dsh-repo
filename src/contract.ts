@@ -13,9 +13,10 @@
  * `code` is a {@link RepoErrorCode}; nothing else is thrown for an expected
  * failure. A repository is addressed by a {@link RepoTarget}; only hosts and
  * repositories the deployment configured are reachable through the host APIs.
- * Local mirrors ({@link DshRepoService.syncMirror}) also accept addresses on
- * other hosts unless the deployment turned that off; those use the machine's
- * own git credentials.
+ * Local mirrors and workspaces take HTTPS addresses (or local paths); an
+ * address on a configured host carries that host's token, and addresses on
+ * other hosts are mirrored without credentials unless the deployment turned
+ * that off.
  *
  * @module dsh-repo/contract
  */
@@ -28,7 +29,7 @@ export type DshReposServiceName = 'dshRepos'
  * consumer misbehave; a consumer refuses a provider whose version it does not
  * know.
  */
-export type DshReposVersion = 1
+export type DshReposVersion = 2
 
 /** Code host family. */
 export type ForgeKind = 'github' | 'gitlab'
@@ -165,40 +166,10 @@ export interface FileContent {
   readonly truncated: boolean
 }
 
-/** One file of a commit request. */
-export type FileChange =
-  | { readonly action: 'write'; readonly path: string; readonly content: string }
-  | { readonly action: 'delete'; readonly path: string }
-
-/** Name and email recorded as a commit's author. */
+/** Name and email recorded on a commit. */
 export interface CommitAuthor {
   readonly name: string
   readonly email: string
-}
-
-/** A multi-file commit. */
-export interface CommitRequest extends CallOptions {
-  /** Target branch; created from {@link base} when it does not exist. Never the default or a protected branch. */
-  readonly branch: string
-  /** Start branch of a new branch; default: the repository's default branch. Ignored when the branch exists. Not with {@link baseSha}. */
-  readonly base?: string
-  /** Start commit of a new branch, as a full hexadecimal object id. Ignored when the branch exists. Not with {@link base}. */
-  readonly baseSha?: string
-  /** When true, the call fails with `conflict` instead of committing on top of a branch that already exists. */
-  readonly newBranch?: boolean
-  /** Commit author; default: the token's user. The committer is always the token's user. */
-  readonly author?: CommitAuthor
-  readonly message: string
-  readonly files: readonly FileChange[]
-}
-
-/** Outcome of a commit. */
-export interface CommitResult {
-  readonly sha: string
-  readonly branch: string
-  /** Whether the branch was created by this commit. */
-  readonly createdBranch: boolean
-  readonly webUrl?: string
 }
 
 /** Lifecycle state of an issue. */
@@ -469,6 +440,85 @@ export interface SnapshotLease {
   release(): void
 }
 
+/** Options of {@link DshRepoService.openWorkspace}. */
+export interface WorkspaceOpenOptions extends CallOptions {
+  /** Absolute directory of the checkout; must not exist yet (its parent is created). */
+  readonly dir: string
+  /** Branch the work starts from and later merges into; default: the remote's default branch. */
+  readonly baseBranch?: string
+  /** Full commit id to start from, fetched by an earlier {@link DshRepoService.syncMirror}; default: the head of {@link baseBranch} after a fetch. */
+  readonly commit?: string
+}
+
+/** A writable checkout opened by {@link DshRepoService.openWorkspace}. */
+export interface WorkspaceInfo {
+  /** HTTPS address (or local path) of the repository. */
+  readonly url: string
+  /** Absolute directory of the checkout. */
+  readonly dir: string
+  /** Branch the work started from; the natural target of its change request. */
+  readonly baseBranch: string
+  /** Commit the work started from. */
+  readonly baseCommit: string
+  /** Remote branch fixed by the first {@link DshRepoService.pushWorkspace}; absent before it. */
+  readonly branch?: string
+}
+
+/** One file that differs from the workspace's base commit. */
+export interface WorkspaceFileChange {
+  /** Path from the repository root, `/`-separated. */
+  readonly path: string
+  readonly status: 'added' | 'modified' | 'deleted' | 'renamed' | 'type-changed'
+  /** Former path of a renamed file. */
+  readonly previousPath?: string
+  /** Whether git treats the file as binary; such files have no line counts. */
+  readonly binary: boolean
+  readonly additions?: number
+  readonly deletions?: number
+}
+
+/** Everything a workspace changed relative to its base commit, committed or not. */
+export interface WorkspaceChanges {
+  readonly workspace: WorkspaceInfo
+  /** Commits made by earlier pushes on top of the base commit, oldest first. */
+  readonly commits: readonly { readonly sha: string; readonly subject: string }[]
+  /** Whether the working tree has changes not yet committed by a push. */
+  readonly uncommitted: boolean
+  /** Files differing between the base commit and the working tree (untracked files included, ignored files excluded). */
+  readonly files: readonly WorkspaceFileChange[]
+  /** Unified diff from the base commit to the working tree. */
+  readonly diff: string
+  /** Whether {@link diff} was cut at the configured diff limit. */
+  readonly truncated: boolean
+}
+
+/** Options of {@link DshRepoService.pushWorkspace}. */
+export interface WorkspacePushOptions extends CallOptions {
+  /**
+   * Remote branch to push to. Required on the first push, which fails with
+   * `conflict` when the remote already has the branch and with `invalid` for
+   * the base or default branch; later pushes must name the same branch or omit it.
+   */
+  readonly branch?: string
+  /** Message of the commit recording uncommitted changes; required when there are any. */
+  readonly message?: string
+  /** Author and committer of that commit; default: the machine's git identity. */
+  readonly author?: CommitAuthor
+}
+
+/** Outcome of {@link DshRepoService.pushWorkspace}. */
+export interface WorkspacePushResult {
+  readonly url: string
+  readonly branch: string
+  readonly baseBranch: string
+  /** Commit the remote branch points to after the push. */
+  readonly commit: string
+  /** Whether this push recorded uncommitted changes as a new commit. */
+  readonly committed: boolean
+  /** Whether this push created the remote branch. */
+  readonly created: boolean
+}
+
 /** The `dshRepos` service. */
 export interface DshRepoService {
   readonly version: DshReposVersion
@@ -492,8 +542,6 @@ export interface DshRepoService {
   listTree(repo: RepoTarget, options?: CallOptions & { readonly ref?: string; readonly path?: string; readonly recursive?: boolean }): Promise<TreeListing>
   /** @returns one file at `ref` (default: the default branch). */
   readFile(repo: RepoTarget, path: string, options?: CallOptions & { readonly ref?: string }): Promise<FileContent>
-  /** @returns the new commit. */
-  commitFiles(repo: RepoTarget, request: CommitRequest): Promise<CommitResult>
 
   /** @returns one page of issues (change requests are excluded). */
   listIssues(repo: RepoTarget, options?: IssueListOptions): Promise<Page<IssueInfo>>
@@ -565,10 +613,10 @@ export interface DshRepoService {
   setMirrorDir(dir: string | undefined): Promise<MirrorSettings>
   /**
    * Clone the address as a fetch-only mirror, or fetch it, and resolve the
-   * branch head. Calls for the same mirror run one at a time. HTTPS addresses
-   * under a configured host carry its token; other addresses use the
-   * machine's git credentials (SSH keys, credential helpers).
-   * @param url - git address: HTTPS/SSH/git URL, `user@host:path`, or an absolute local path.
+   * branch head. Calls for the same mirror run one at a time. Addresses under
+   * a configured host carry its token; other hosts are fetched without
+   * credentials.
+   * @param url - HTTPS address, `file:` URL, or absolute local path; SSH and other transports are refused.
    * @returns the mirror and the branch head.
    * @throws `invalid` for an unsupported address or branch, `not-allowed` outside the configured repositories or on other hosts when they are refused, `not-found` for a missing branch, `unavailable` when git fails.
    */
@@ -593,4 +641,31 @@ export interface DshRepoService {
    * @throws `not-found` when the mirror or commit is missing, `unavailable` when the checkout cannot be created.
    */
   acquireSnapshot(url: string, commit: string, options?: CallOptions): Promise<SnapshotLease>
+  /**
+   * Check out a commit as a writable working tree for editing. Its git
+   * metadata stays in the mirror, outside the checkout: callers and agents
+   * edit files only, and {@link pushWorkspace} records and pushes the
+   * changes. The checkout belongs to the caller and is never deleted by the
+   * service; deleting the directory abandons it.
+   * @param url - HTTPS address, `file:` URL, or absolute local path.
+   * @returns the workspace.
+   * @throws `invalid` for an unsupported address, branch, commit, or a directory that exists; `not-allowed` outside the configured repositories; `not-found` for a missing branch or commit; `unavailable` when git fails.
+   */
+  openWorkspace(url: string, options: WorkspaceOpenOptions): Promise<WorkspaceInfo>
+  /**
+   * Describe what a workspace changed since its base commit.
+   * @param dir - directory returned by {@link openWorkspace}.
+   * @returns the changes.
+   * @throws `not-found` when the directory is not a workspace of this service, `unavailable` when git fails.
+   */
+  workspaceChanges(dir: string, options?: CallOptions): Promise<WorkspaceChanges>
+  /**
+   * Commit uncommitted changes, then push the workspace to its remote branch
+   * with the host's token, never forcing. Pushing needs a configured host
+   * with a token unless the address is a local path.
+   * @param dir - directory returned by {@link openWorkspace}.
+   * @returns the push outcome.
+   * @throws `invalid` for a missing message or branch, the base or default branch, or nothing to push; `conflict` when the remote branch exists before the first push or moved since the last one; `unauthenticated` without a token; `forbidden` when the host refuses the push; `not-found` when the directory is not a workspace of this service; `unavailable` when git fails.
+   */
+  pushWorkspace(dir: string, options?: WorkspacePushOptions): Promise<WorkspacePushResult>
 }
