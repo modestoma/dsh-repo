@@ -126,7 +126,7 @@ if (repos?.version === 1) {
 
 ### 提交尾注事件
 
-`repo_workspace_push` 为某个 Agent 的会话提交改动之前，用 `ctx.parallel('repo/commit-trailers', event)` 通知其他插件。`event` 带 `session`（会话 id）和 `dir`（工作区目录），监听者调用 `event.add(token, value)` 追加尾注，写在 `DSH-Session:` 之后，按添加顺序排列。监听者返回（或返回的 promise 结束）之后再调用 `add` 不生效。规则：
+`repo_workspace_push` 为某个 Agent 的会话提交改动之前，用 `ctx.parallel('repo/commit-trailers', event)` 通知其他插件。`event` 带 `session`（会话 id）和 `dir`（工作区目录），监听者调用 `event.add(token, value)` 追加尾注，写在 `DSH-Session:` 之后，按添加顺序排列。监听者应在返回（或返回的 promise 结束）之前调用 `add`；所有监听者都结束之后再调用 `add` 不生效，但某个监听者结束后、其他监听者还在运行时的调用仍会记下。规则：
 
 - 尾注名以字母开头，只含字母、数字和 `-`，最长 64 个字符，不能是 `DSH-Session`；值是一行，1 到 200 个字符，不含控制字符。每次推送最多 20 条。不合规时推送以 `invalid` 失败。
 - 任何监听者抛错时推送以 `unavailable` 失败，不提交任何内容。

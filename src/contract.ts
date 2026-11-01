@@ -187,7 +187,9 @@ export interface CommitTrailer {
  * Payload of the `repo/commit-trailers` event, dispatched with
  * `ctx.parallel` before `repo_workspace_push` records uncommitted changes
  * for an Agent's Session. Listeners call {@link add} before their returned
- * promise settles; later calls are ignored. A listener that throws fails the
+ * promise settles. Calls made after every listener has settled are ignored;
+ * a call a listener makes after its own promise settled, while another
+ * listener is still running, is still recorded. A listener that throws fails the
  * push with `unavailable` and nothing is committed. Every added trailer is
  * validated like {@link WorkspacePushOptions.trailers}.
  */
