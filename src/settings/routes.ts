@@ -14,8 +14,8 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { RepoService } from '../service.ts'
 import type { DirectoryPicker } from './directory-picker.ts'
 import { hostDirectoryPicker } from './directory-picker.ts'
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE } from './contract.ts'
-import type { SettingsState, WatchInfo } from './contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_RUN_ROUTE, SYNCS_ROUTE, WATCHES_ROUTE } from './contract.ts'
+import type { SettingsState, SyncInfo, SyncInput, WatchInfo } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -44,6 +44,38 @@ export interface WatchList {
 
 /** No watcher: nothing is watched. */
 const NO_WATCHES: WatchList = { active: false, list: () => [], remove: async () => false }
+
+const syncFields = {
+  url: z.string(),
+  branch: z.string().optional(),
+  dir: z.string(),
+  intervalMinutes: z.number().optional(),
+}
+const syncAddSchema = z.object(syncFields).strict()
+const syncUpdateSchema = z.object({ id: z.string(), ...syncFields }).strict()
+const syncIdSchema = z.object({ id: z.string() }).strict()
+
+/** The local syncs as the settings page uses them. */
+export interface SyncList {
+  list(): SyncInfo[]
+  add(input: SyncInput): Promise<SyncInfo>
+  update(id: string, input: SyncInput): Promise<SyncInfo>
+  remove(id: string): Promise<boolean>
+  syncNow(id: string): Promise<SyncInfo>
+}
+
+/** No syncer: nothing is synced, and changes are refused. */
+const NO_SYNCS: SyncList = {
+  list: () => [],
+  add: async () => { throw new HttpError(404, '当前组合没有本地同步') },
+  update: async () => { throw new HttpError(404, '当前组合没有本地同步') },
+  remove: async () => false,
+  syncNow: async () => { throw new HttpError(404, '当前组合没有本地同步') },
+}
+
+function syncInput(body: z.output<typeof syncAddSchema>): SyncInput {
+  return { url: body.url, dir: body.dir, ...body.branch === undefined ? {} : { branch: body.branch }, ...body.intervalMinutes === undefined ? {} : { intervalMinutes: body.intervalMinutes } }
+}
 /** The service validates the settings fields and reports every bad one. */
 const settingsBodySchema = z.record(z.string(), z.unknown())
 
@@ -155,9 +187,10 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
  * @param service - the `dshRepos` implementation.
  * @param picker - the Host's directory dialog.
  * @param watches - the PR/MR watcher.
- * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, whether a directory dialog is available, and the watched PRs/MRs.
+ * @param syncs - the local syncs.
+ * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, whether a directory dialog is available, the watched PRs/MRs, and the local syncs.
  */
-export async function settingsState(service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES): Promise<SettingsState> {
+export async function settingsState(service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): Promise<SettingsState> {
   return {
     hosts: await service.listHosts(),
     mirror: service.mirrorSettings(),
@@ -167,6 +200,7 @@ export async function settingsState(service: RepoService, picker: DirectoryPicke
     pickerAvailable: picker.available,
     watches: watches.list(),
     watchAvailable: watches.active,
+    syncs: syncs.list(),
   }
 }
 
@@ -177,10 +211,11 @@ export async function settingsState(service: RepoService, picker: DirectoryPicke
  * @param service - the `dshRepos` implementation.
  * @param picker - the Host's directory dialog.
  * @param watches - the PR/MR watcher.
+ * @param syncs - the local syncs.
  * @returns disposer removing every route.
  */
-export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES): () => void {
-  const state = (): Promise<SettingsState> => settingsState(service, picker, watches)
+export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): () => void {
+  const state = (): Promise<SettingsState> => settingsState(service, picker, watches, syncs)
   const reply = async (res: ServerResponse): Promise<void> => { sendJson(res, 200, { ok: true, state: await state() }) }
   const disposers = [
     server.register({
@@ -240,6 +275,35 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
     }),
     server.register({
       kind: 'exact',
+      path: SYNCS_ROUTE,
+      handler: guarded(gate, ['POST', 'PUT', 'DELETE'], async (req, res) => {
+        const method = req.method?.toUpperCase()
+        if (method === 'DELETE') {
+          if (!await syncs.remove((await readJsonBody(req, syncIdSchema)).id)) throw new HttpError(404, '没有这条本地同步，可能已经删除')
+        } else if (method === 'PUT') {
+          const { id, ...body } = await readJsonBody(req, syncUpdateSchema)
+          await syncs.update(id, syncInput(body))
+        } else {
+          await syncs.add(syncInput(await readJsonBody(req, syncAddSchema)))
+        }
+        await reply(res)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: SYNC_RUN_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        await syncs.syncNow((await readJsonBody(req, syncIdSchema)).id)
+        await reply(res)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: MIRROR_USAGE_ROUTE,
+      handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await service.mirrorUsage()) }),
+    }),
+    server.register({
+      kind: 'exact',
       path: PICK_DIRECTORY_ROUTE,
       handler: guarded(gate, ['POST'], async (req, res) => {
         const abort = new AbortController()
@@ -263,13 +327,14 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
  * @param ctx - plugin context.
  * @param service - the `dshRepos` implementation.
  * @param watches - the PR/MR watcher.
+ * @param syncs - the local syncs.
  */
-export function mountSettingsRoutes(ctx: HostContext, service: RepoService, watches: WatchList = NO_WATCHES): void {
+export function mountSettingsRoutes(ctx: HostContext, service: RepoService, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): void {
   const attach = (webCtx: HostContext): void => {
     const server = webCtx.get?.('webServer') as HostWebServer | undefined
     const gate = webCtx.get?.('connection') as HostRequestGate | undefined
     if (server === undefined || gate === undefined) return
-    webCtx.effect(() => registerSettingsRoutes(server, gate, service, hostDirectoryPicker(webCtx), watches), 'dsh-repo: settings routes')
+    webCtx.effect(() => registerSettingsRoutes(server, gate, service, hostDirectoryPicker(webCtx), watches, syncs), 'dsh-repo: settings routes')
   }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer', 'connection'], attach)

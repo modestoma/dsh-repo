@@ -311,6 +311,24 @@ export function watchesFile(settingsFile: string): string {
 }
 
 /**
+ * The file local syncs are kept in: `syncs.json` next to the settings file.
+ * @param settingsFile - absolute path of the settings file.
+ * @returns absolute path.
+ */
+export function syncsFile(settingsFile: string): string {
+  return join(dirname(settingsFile), 'syncs.json')
+}
+
+/**
+ * The directory holding each local sync's git index: `syncs/` next to the settings file.
+ * @param settingsFile - absolute path of the settings file.
+ * @returns absolute path.
+ */
+export function syncIndexDir(settingsFile: string): string {
+  return join(dirname(settingsFile), 'syncs')
+}
+
+/**
  * The settings file a configuration implies.
  * @param config - validated configuration.
  * @param env - process environment.

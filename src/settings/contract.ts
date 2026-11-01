@@ -21,6 +21,12 @@ export const SETTINGS_ROUTE = '/dsh-repo/settings'
 export const PICK_DIRECTORY_ROUTE = '/dsh-repo/pick-directory'
 /** DELETE：body `{ id }` 停止跟踪一个 PR/MR。 */
 export const WATCHES_ROUTE = '/dsh-repo/watches'
+/** POST：body {@link SyncInput} 添加本地同步；PUT：body `{ id, ...SyncInput }` 修改；DELETE：body `{ id }` 删除（本地目录里的文件保留）。 */
+export const SYNCS_ROUTE = '/dsh-repo/syncs'
+/** POST：body `{ id }` 立即同步一条本地同步，同步结束后响应。 */
+export const SYNC_RUN_ROUTE = '/dsh-repo/syncs/run'
+/** GET：{@link MirrorUsage}，镜像目录里的仓库和占用空间。 */
+export const MIRROR_USAGE_ROUTE = '/dsh-repo/mirror-usage'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
@@ -43,6 +49,13 @@ export const SETTING_BOUNDS = {
   dailyWakeLimit: { min: 1, max: 100 },
   maxWatches: { min: 1, max: 500 },
 } as const satisfies Record<string, { readonly min: number; readonly max: number }>
+
+/** Inclusive range of a local sync's interval, in minutes. */
+export const SYNC_INTERVAL_BOUNDS = { min: 5, max: 30 * 24 * 60 } as const
+/** Interval of a local sync that names none: 12 hours. */
+export const DEFAULT_SYNC_INTERVAL_MINUTES = 12 * 60
+/** Most local syncs. */
+export const MAX_SYNCS = 50
 
 /** Longest tool signature. */
 export const MAX_SIGNATURE_LENGTH = 500
@@ -120,6 +133,65 @@ export interface WatchInfo {
   pending: number
 }
 
+/** What a local sync keeps up to date: the head of a branch, expanded into a local directory. */
+export interface SyncInput {
+  /** HTTPS address, `file:` URL, or absolute path of the repository. */
+  url: string
+  /** Branch to follow; missing or empty follows the remote's default branch. */
+  branch?: string
+  /** Absolute directory on the Host the files are expanded into; `~` expands to the home directory. */
+  dir: string
+  /** Minutes between two syncs; default {@link DEFAULT_SYNC_INTERVAL_MINUTES}. */
+  intervalMinutes?: number
+}
+
+/** One local sync as the settings page lists it. */
+export interface SyncInfo {
+  id: string
+  url: string
+  /** Branch asked for; missing follows the remote's default branch. */
+  branch?: string
+  dir: string
+  intervalMinutes: number
+  /** `queued`: waiting for another sync to finish; `running`: syncing now. */
+  state: 'idle' | 'queued' | 'running'
+  /** Last successful sync: when, which commit, and the branch it resolved. */
+  syncedAt?: string
+  commit?: string
+  syncedBranch?: string
+  /** Failure of the latest attempt, cleared by the next success. */
+  error?: string
+  failedAt?: string
+  /** When the next sync is due, while one is scheduled. */
+  nextAt?: string
+}
+
+/** One repository in the mirror directory. */
+export interface MirrorUsageEntry {
+  /** Directory relative to the mirror directory, `/`-separated (`<host>/<path>` or `local/<name>`). */
+  path: string
+  /** The mirror's `origin` address, without user name or password. */
+  url?: string
+  /** Disk space the mirror occupies. */
+  bytes: number
+  /** Last fetch, or clone when it was never fetched. */
+  fetchedAt?: string
+}
+
+/** `GET /dsh-repo/mirror-usage` response. */
+export interface MirrorUsage {
+  ok: true
+  /** The mirror directory that was measured. */
+  root: string
+  /** Largest first. */
+  mirrors: MirrorUsageEntry[]
+  /** Read-only snapshots under `.snapshots/`. */
+  snapshotBytes: number
+  /** Everything else: unfinished clones and stray files. */
+  otherBytes: number
+  totalBytes: number
+}
+
 /** Body of a host addition. */
 export interface HostAddRequest {
   /** Default `gitlab`. */
@@ -148,6 +220,8 @@ export interface SettingsState {
   watches: readonly WatchInfo[]
   /** Whether this composition can start a turn of a Session, which PR/MR watching needs. */
   watchAvailable: boolean
+  /** Local syncs in the order they were added. */
+  syncs: readonly SyncInfo[]
 }
 
 /** `POST /dsh-repo/pick-directory` response: the chosen path, or null when cancelled. */

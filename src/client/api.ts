@@ -4,8 +4,8 @@
  * @module dsh-repo/client/api
  */
 
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE } from '../settings/contract.ts'
-import type { HostAddRequest, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState } from '../settings/contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_RUN_ROUTE, SYNCS_ROUTE, WATCHES_ROUTE } from '../settings/contract.ts'
+import type { HostAddRequest, MirrorUsage, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState, SyncInput } from '../settings/contract.ts'
 
 /**
  * Error text of a value thrown by a request.
@@ -129,6 +129,48 @@ export function resetSettings(): Promise<SettingsState> {
  */
 export function stopWatch(id: string): Promise<SettingsState> {
   return mutate(WATCHES_ROUTE, 'DELETE', { id })
+}
+
+/**
+ * Add a local sync; responds after its first sync.
+ * @param input - address, branch, directory, and interval.
+ * @returns the new state.
+ */
+export function addSync(input: SyncInput): Promise<SettingsState> {
+  return mutate(SYNCS_ROUTE, 'POST', input)
+}
+
+/**
+ * Change a local sync; responds after the sync a changed address, branch, or directory causes.
+ * @param id - sync id.
+ * @param input - the complete new fields.
+ * @returns the new state.
+ */
+export function updateSync(id: string, input: SyncInput): Promise<SettingsState> {
+  return mutate(SYNCS_ROUTE, 'PUT', { id, ...input })
+}
+
+/**
+ * Remove a local sync; its files stay.
+ * @param id - sync id.
+ * @returns the new state.
+ */
+export function removeSync(id: string): Promise<SettingsState> {
+  return mutate(SYNCS_ROUTE, 'DELETE', { id })
+}
+
+/**
+ * Sync now; responds when the sync finished.
+ * @param id - sync id.
+ * @returns the new state.
+ */
+export function runSync(id: string): Promise<SettingsState> {
+  return mutate(SYNC_RUN_ROUTE, 'POST', { id })
+}
+
+/** @returns the repositories in the mirror directory with their disk usage. */
+export function fetchMirrorUsage(): Promise<MirrorUsage> {
+  return request<MirrorUsage>(MIRROR_USAGE_ROUTE)
 }
 
 /** @returns the directory chosen in the Host's system dialog, or null when cancelled. */

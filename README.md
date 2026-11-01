@@ -1,12 +1,12 @@
 # dsh-repo
 
-面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的代码仓库插件。它用 GitHub 官方 SDK [Octokit](https://github.com/octokit/rest.js) 和 GitLab 文档推荐的 [GitBeaker](https://github.com/jdalrymple/gitbeaker) 抹平 GitHub 与 GitLab 的差异，对其他插件提供 `dshRepos` 服务，对模型提供代码、issue、PR/MR 工具；需要本地代码目录的插件可以用它维护仓库的本地镜像、按提交的只读快照，以及用来改代码的可写工作区。
+面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的代码仓库插件。它用 GitHub 官方 SDK [Octokit](https://github.com/octokit/rest.js) 和 GitLab 文档推荐的 [GitBeaker](https://github.com/jdalrymple/gitbeaker) 抹平 GitHub 与 GitLab 的差异，对其他插件提供 `dshRepos` 服务，对模型提供代码、issue、PR/MR 工具；需要本地代码目录的插件可以用它维护仓库的本地镜像、按提交的只读快照，以及用来改代码的可写工作区，也可以把仓库分支定时展开到本机任意目录（本地同步）。
 
 支持的主机：github.com、GitHub Enterprise Server、gitlab.com、自建 GitLab（包括部署在子路径下的实例）。
 
 ## 项目状态
 
-测试版：提供统一接口、模型工具、运行时主机管理、本地镜像、可写工作区、PR/MR 跟踪和左侧栏「代码仓库」设置页。接口仍可能调整。
+测试版：提供统一接口、模型工具、运行时主机管理、本地镜像、可写工作区、PR/MR 跟踪、本地同步和左侧栏「代码仓库」设置页。接口仍可能调整。
 
 ## 安装
 
@@ -47,6 +47,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 |---|---|---|---|
 | 主机 | 添加（类型、地址、GitHub 接口地址、别名、令牌）、删除主机，保存或清除令牌 | 无 | 立即 |
 | 高级 | 镜像目录 | `$DSH_HOME/dsh-repo/mirrors` | 立即 |
+| 高级 | 镜像占用：镜像目录里每个仓库占用的空间和最近拉取时间，以及快照和其他文件的合计（只读） | — | — |
 | 访问范围 | `repos`：可访问的仓库，`主机/路径`，末段 `*` 匹配一层、`**` 匹配任意多层；空 = 主机上令牌能访问的全部仓库 | 空 | 保存条 |
 | 访问范围 | `mirror.otherHosts`：是否允许不带凭据镜像不在主机列表中的仓库 | 允许 | 保存条 |
 | 模型工具 | `tools.enabled`：是否提供 `repo_*` 工具 | 提供 | 保存条 |
@@ -60,6 +61,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | MR 跟踪 | `watch.batchMs`：合并通知窗口 | 120 秒 | 保存条 |
 | MR 跟踪 | `watch.idleDays` / `dailyWakeLimit` / `maxWatches`：无动态停止跟踪、每个 PR/MR 每天唤醒上限、同时跟踪上限 | 7 天 / 10 次 / 50 个 | 保存条 |
 | MR 跟踪 | 正在跟踪的 PR/MR，每个可以停止 | 无 | 立即 |
+| 本地同步 | 添加、修改、删除本地同步（仓库地址、分支、本地目录、同步间隔），立即同步，见[本地同步](#本地同步) | 无；间隔默认 12 小时 | 立即 |
 | 高级 | `timeoutMs`：一次接口调用 | 30 秒 | 保存条 |
 | 高级 | `mirror.gitTimeoutMs`：一条 git 命令（clone、fetch、worktree、push） | 600 秒 | 保存条 |
 | 高级 | `limits.perPage` / `maxPerPage` / `maxComments` / `maxTreeEntries` | 30 / 100 / 50 / 1000 | 保存条 |
@@ -212,6 +214,16 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 - 地址只接受 HTTPS URL、`file:` URL 或绝对路径；SSH 地址、`user@host:path`、`git://` 和 `http://` 以 `invalid` 拒绝，请改用仓库的 HTTPS 地址。属于已配置主机的地址受 `repos` 范围限制，并自动使用该主机的令牌（GitLab 用户名 `oauth2`，GitHub 用户名 `x-access-token`），令牌经只对这次 git 进程生效的凭据助手传入，不出现在命令行、`.git/config` 或输出里，Agent 也拿不到。其他主机上的仓库不带凭据拉取（适合公开仓库），设置页关闭「其他主机上的仓库」（`mirror.otherHosts`）时拒绝；本地路径不需要凭据。
 - 需要本机安装 `git`；git 不会弹出交互式提示。
 
+## 本地同步
+
+「本地同步」把一个仓库分支的最新提交定时展开到本机任意目录，适合让 DSH 或其他工具直接读一份始终最新的文件，例如把公用 SKILL 仓库同步到一个目录，再把该目录加进 deepseek-harness `@deepseek-ai/dsh-skill-filesystem` 的 `customSkillDirs`。
+
+- 每条本地同步有仓库地址（与镜像相同，只接受 HTTPS、`file:` URL 或绝对路径，按主机自动带令牌并受访问范围限制）、分支（留空跟随远端默认分支）、本地目录（绝对路径，`~` 展开为主目录）和同步间隔（5 分钟到 30 天，默认 12 小时）。可以添加多条，本地目录不能互相包含，也不能与镜像目录重叠，比较时会解析路径中已存在部分的符号链接。
+- 同步先拉取镜像，再用 `git --git-dir=<镜像>/.git --work-tree=<本地目录> read-tree --reset -u <提交>` 展开，使用每条同步自己的索引文件（在 `$DSH_HOME/dsh-repo/syncs/` 下），不改动镜像的 `HEAD` 和索引。本地目录里只有普通文件，没有 `.git`；git 对象只在镜像目录里存一份。
+- 每次同步只写入有变化的文件，删除分支上已删除的文件，本地改过或删掉的文件恢复成仓库里的版本；分支上从来没有的文件保留。改公用仓库请走[改代码](#改代码)的工作区流程，合入后等下一次同步或点「立即同步」。
+- 第一次同步要求本地目录不存在或为空，避免覆盖已有文件；目录不为空时这次同步失败并在列表里显示原因。检查通过后先在 `syncs.json` 记下这个目录再写文件，所以第一次同步写到一半被打断时，重试会接着写入该目录。每个本地目录有自己的索引文件（`syncs/<id>-<目录哈希>.index`）。把同步改到另一个目录时同样要求新目录为空，旧目录里的文件保留。删除本地同步只删除它的记录和索引，目录里的文件保留。
+- 本地同步依次执行。上次成功后过了同步间隔就再同步一次；失败后在同步间隔和 30 分钟中较短的时间后重试。添加、修改地址/分支/目录和「立即同步」都会马上同步，并在同步结束后返回结果。列表和每条的上次成功结果保存在 `$DSH_HOME/dsh-repo/syncs.json`（与设置文件同目录），重启后按上次成功时间继续计时，过期的同步启动后马上执行。
+
 ## GitHub 与 GitLab 的差异处理
 
 | 差异 | 处理 |
@@ -231,6 +243,7 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 - 修改 PR/MR 时不能切换草稿状态；GitHub 的行内评审评论、评审（approve / request changes）不在第一版范围内。
 - issue 列表不支持全文搜索。
 - 不提供删除分支、删除仓库、修改仓库设置等操作。
+- 本地同步展开整个仓库，不能只同步某个子目录；子模块只建出空目录，不拉取子模块内容。
 
 ## 开发
 

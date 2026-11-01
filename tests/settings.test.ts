@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -8,7 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { HostContext, HostWebServer } from '../src/host.ts'
 import * as plugin from '../src/index.ts'
 import type { RepoService } from '../src/service.ts'
-import type { SettingsState } from '../src/settings/contract.ts'
+import type { MirrorUsage, SettingsState } from '../src/settings/contract.ts'
 import { credentials } from './helpers.ts'
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
@@ -196,9 +197,51 @@ describe('settings routes', () => {
     expect(((await (await serve()).call('/dsh-repo/state')).body as unknown as SettingsState).watchAvailable).toBe(false)
   })
 
+  it('adds, syncs, changes, and removes local syncs, and measures the mirror directory', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'dsh-repo-settings-origin-'))
+    const author = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
+    execFileSync('git', ['init', '--quiet', '--initial-branch=main'], { cwd: repo })
+    mkdirSync(join(repo, 'skill-a'))
+    writeFileSync(join(repo, 'skill-a', 'SKILL.md'), 'a\n')
+    execFileSync('git', ['add', '.'], { cwd: repo })
+    execFileSync('git', ['commit', '--quiet', '-m', 'init'], { cwd: repo, env: author })
+    const { call, json, env } = await serve()
+    const dir = join(env.DSH_HOME, 'shared-skills')
+
+    let response = await call('/dsh-repo/syncs', json('POST', { url: repo, dir }))
+    expect(response.status).toBe(200)
+    const [added] = (response.body.state as SettingsState).syncs
+    expect(added).toMatchObject({ url: repo, dir, intervalMinutes: 720, syncedBranch: 'main', state: 'idle' })
+    expect(readFileSync(join(dir, 'skill-a', 'SKILL.md'), 'utf8')).toBe('a\n')
+    expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'syncs.json'), 'utf8')).syncs).toHaveLength(1)
+
+    writeFileSync(join(repo, 'skill-a', 'SKILL.md'), 'a2\n')
+    execFileSync('git', ['commit', '--quiet', '-am', 'two'], { cwd: repo, env: author })
+    response = await call('/dsh-repo/syncs/run', json('POST', { id: added?.id }))
+    expect(readFileSync(join(dir, 'skill-a', 'SKILL.md'), 'utf8')).toBe('a2\n')
+    response = await call('/dsh-repo/syncs', json('PUT', { id: added?.id, url: repo, dir, intervalMinutes: 60 }))
+    expect((response.body.state as SettingsState).syncs[0]?.intervalMinutes).toBe(60)
+
+    expect((await call('/dsh-repo/syncs', json('POST', { url: repo, dir: join(dir, 'inner') }))).status).toBe(409)
+    expect((await call('/dsh-repo/syncs', json('POST', { url: 'git@x:y.git', dir: join(env.DSH_HOME, 'x') }))).status).toBe(400)
+    expect((await call('/dsh-repo/syncs/run', json('POST', { id: 'missing' }))).status).toBe(404)
+
+    const usage = (await call('/dsh-repo/mirror-usage')).body as unknown as MirrorUsage
+    expect(usage.root).toBe(join(env.DSH_HOME, 'dsh-repo', 'mirrors'))
+    expect(usage.mirrors).toHaveLength(1)
+    expect(usage.mirrors[0]).toMatchObject({ path: expect.stringMatching(/^local\//), url: repo })
+    expect(usage.mirrors[0]?.bytes).toBeGreaterThan(0)
+    expect(usage.totalBytes).toBeGreaterThanOrEqual(usage.mirrors[0]?.bytes ?? 0)
+
+    response = await call('/dsh-repo/syncs', json('DELETE', { id: added?.id }))
+    expect((response.body.state as SettingsState).syncs).toEqual([])
+    expect(existsSync(join(dir, 'skill-a', 'SKILL.md'))).toBe(true)
+    expect((await call('/dsh-repo/syncs', json('DELETE', { id: added?.id }))).status).toBe(404)
+  })
+
   it('removes its routes when the Web server goes away', async () => {
     const { routes, disposers } = await serve()
-    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/pick-directory', '/dsh-repo/settings', '/dsh-repo/state', '/dsh-repo/watches'])
+    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/mirror-usage', '/dsh-repo/pick-directory', '/dsh-repo/settings', '/dsh-repo/state', '/dsh-repo/syncs', '/dsh-repo/syncs/run', '/dsh-repo/watches'])
     for (const dispose of disposers) dispose()
     expect(routes.size).toBe(0)
   })

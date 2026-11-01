@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_SETTINGS } from '../src/config.ts'
-import { displayNumber, fromDraft, sameDraft, toDraft } from '../src/client/form.ts'
+import { displayNumber, formatBytes, formatInterval, fromDraft, intervalHoursText, parseIntervalHours, sameDraft, toDraft } from '../src/client/form.ts'
 
 describe('settings form', () => {
   it('shows times in seconds and sizes in KiB, and saves them back in stored units', () => {
@@ -29,5 +29,15 @@ describe('settings form', () => {
     const draft = toDraft(DEFAULT_SETTINGS)
     expect(sameDraft(draft, toDraft(DEFAULT_SETTINGS))).toBe(true)
     expect(sameDraft(draft, { ...draft, merge: true })).toBe(false)
+  })
+
+  it('takes local sync intervals in hours and shows sizes in binary units', () => {
+    expect(parseIntervalHours('12')).toEqual({ ok: true, minutes: 720 })
+    expect(parseIntervalHours(' 0.5 ')).toEqual({ ok: true, minutes: 30 })
+    expect(parseIntervalHours('0.01')).toEqual({ ok: false, message: '同步间隔须在 5 分钟 到 30 天 之间' })
+    expect(parseIntervalHours('x')).toMatchObject({ ok: false, message: expect.stringContaining('要填小时数') })
+    expect(intervalHoursText(90)).toBe('1.5')
+    expect([formatInterval(720), formatInterval(45), formatInterval(2880)]).toEqual(['12 小时', '45 分钟', '2 天'])
+    expect([formatBytes(512), formatBytes(1536), formatBytes(300 * 1024 * 1024), formatBytes(3.25 * 1024 ** 3)]).toEqual(['512 B', '1.5 KiB', '300 MiB', '3.3 GiB'])
   })
 })
