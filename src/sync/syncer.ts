@@ -30,7 +30,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, readdir, realpath, rm, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join, parse, relative } from 'node:path'
+import { basename, dirname, isAbsolute, join, parse, relative, sep } from 'node:path'
 import { expandHome } from '../config.ts'
 import type { MirrorState, MirrorSyncOptions } from '../contract.ts'
 import { RepoError, toRepoError } from '../errors.ts'
@@ -87,7 +87,7 @@ function errorText(error: unknown): string {
 /** Whether `inner` is `outer` or lies inside it. */
 function within(outer: string, inner: string): boolean {
   const rel = relative(outer, inner)
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
 
 /**
