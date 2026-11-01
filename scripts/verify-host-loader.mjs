@@ -23,9 +23,11 @@ const configured = await plugin.Config['~standard'].validate({
     { kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' },
     { kind: 'gitlab', url: 'https://gitlab.example.com', tokenRef: 'GITLAB_TOKEN' },
   ],
-  repos: ['github.com/modestoma/*', 'gitlab.example.com/team/**'],
+  hostsFile: '~/.dsh/dsh-repo/hosts.json',
 })
 assert.equal(configured.issues, undefined, 'a typical config should validate')
+const runtime = await plugin.Config['~standard'].validate({ repos: ['github.com/modestoma/*'] })
+assert.ok(runtime.issues !== undefined, 'run-time settings belong to the settings file, not cordis.yml')
 const invalid = await plugin.Config['~standard'].validate({ hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'ghp_x-y' }] })
 assert.ok(invalid.issues !== undefined, 'a token value in place of a reference must be rejected')
 

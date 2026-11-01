@@ -387,6 +387,8 @@ export interface HostInfo {
   readonly kind: ForgeKind
   /** Normalized `https://host[:port][/path]`. */
   readonly url: string
+  /** GitHub only: REST API base when it is not derived from `url`. */
+  readonly apiUrl?: string
   readonly alias?: string
   /** Credential reference holding the host's token. */
   readonly tokenRef: string
@@ -401,6 +403,8 @@ export interface HostCreate {
   readonly kind?: ForgeKind
   /** `https://host[:port][/path]`; must differ from every existing host's address. */
   readonly url: string
+  /** GitHub only: REST API base when it is not `https://api.github.com` (github.com) or `<url>/api/v3` (GitHub Enterprise Server). */
+  readonly apiUrl?: string
   /** Display name, at most 64 characters. */
   readonly alias?: string
   /** Token value stored under a generated credential reference; omitted leaves the token unset. */
@@ -648,7 +652,7 @@ export interface DshRepoService {
   mirrorSettings(): MirrorSettings
   /**
    * Choose the mirror directory, or return to the default with undefined. The
-   * choice is kept with the added hosts. Existing mirrors are not moved: later
+   * choice is kept in the settings file. Existing mirrors are not moved: later
    * syncs clone into the new directory, and held snapshots stay valid.
    * @param dir - absolute directory (`~` expands to the home directory); created when missing.
    * @returns the new settings.

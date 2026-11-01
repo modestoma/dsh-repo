@@ -1,11 +1,11 @@
 /**
- * 插件页设置的同源 HTTP 客户端，请求 Host 半侧注册的 `/dsh-repo/*` 路由。
+ * 设置页的同源 HTTP 客户端，请求 Host 半侧注册的 `/dsh-repo/*` 路由。
  *
  * @module dsh-repo/client/api
  */
 
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, STATE_ROUTE } from '../settings/contract.ts'
-import type { HostAddRequest, MutationError, MutationOk, PickedDirectory, SettingsState } from '../settings/contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE } from '../settings/contract.ts'
+import type { HostAddRequest, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState } from '../settings/contract.ts'
 
 /**
  * Error text of a value thrown by a request.
@@ -52,7 +52,7 @@ async function mutate(route: string, method: string, body?: object): Promise<Set
   return (await request<MutationOk>(route, { method, ...body === undefined ? {} : { body: JSON.stringify(body) } })).state
 }
 
-/** @returns hosts and the mirror directory. */
+/** @returns hosts, the mirror directory, and the run-time settings. */
 export function fetchState(): Promise<SettingsState> {
   return request<SettingsState>(STATE_ROUTE)
 }
@@ -106,6 +106,20 @@ export function saveMirrorDir(dir: string): Promise<SettingsState> {
 /** @returns the state after returning to the default mirror directory. */
 export function resetMirrorDir(): Promise<SettingsState> {
   return mutate(MIRROR_ROUTE, 'DELETE')
+}
+
+/**
+ * Save the run-time settings.
+ * @param settings - complete settings.
+ * @returns the new state.
+ */
+export function saveSettings(settings: RepoSettingsWire): Promise<SettingsState> {
+  return mutate(SETTINGS_ROUTE, 'PUT', settings)
+}
+
+/** @returns the state after returning every run-time setting to its default. */
+export function resetSettings(): Promise<SettingsState> {
+  return mutate(SETTINGS_ROUTE, 'DELETE')
 }
 
 /** @returns the directory chosen in the Host's system dialog, or null when cancelled. */

@@ -131,6 +131,37 @@ describe('settings routes', () => {
     expect(changes).toEqual([chosen, join(env.DSH_HOME, 'dsh-repo', 'mirrors')])
   })
 
+  it('saves run-time settings as overrides, applies them at once, and resets them', async () => {
+    const { call, json, service, env } = await serve()
+    const file = join(env.DSH_HOME, 'dsh-repo', 'hosts.json')
+    const initial = (await call('/dsh-repo/state')).body as unknown as SettingsState
+    expect(initial.settings).toEqual(initial.defaults)
+    expect(initial.file).toBe(file)
+    const next = { ...initial.defaults, repos: ['github.com/modestoma/*'], tools: { ...initial.defaults.tools, writes: 'off' }, limits: { ...initial.defaults.limits, perPage: 20 } }
+    let response = await call('/dsh-repo/settings', json('PUT', next))
+    expect(response.status).toBe(200)
+    expect((response.body.state as SettingsState).settings).toEqual(next)
+    expect(service.settings.tools.writes).toBe('off')
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ hosts: [], settings: { repos: ['github.com/modestoma/*'], tools: { writes: 'off' }, limits: { perPage: 20 } } })
+    expect(() => service.resolve('github.com/other/repo')).toThrow(expect.objectContaining({ code: 'not-allowed' }))
+
+    expect((await serve(undefined, {}, env.DSH_HOME)).service.settings).toEqual(next)
+
+    const invalid = await call('/dsh-repo/settings', json('PUT', { ...next, timeoutMs: 5 }))
+    expect(invalid).toMatchObject({ status: 400, body: { ok: false, error: expect.stringContaining('timeoutMs') } })
+    expect(service.settings).toEqual(next)
+    response = await call('/dsh-repo/settings', { method: 'DELETE' })
+    expect((response.body.state as SettingsState).settings).toEqual(initial.defaults)
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ hosts: [] })
+  })
+
+  it('adds a GitHub Enterprise host with its API address', async () => {
+    const { call, json } = await serve()
+    const response = await call('/dsh-repo/hosts', json('POST', { kind: 'github', url: 'https://ghe.example.com', apiUrl: 'https://api.ghe.example.com/', alias: 'GHE' }))
+    expect((response.body.state as SettingsState).hosts[1]).toMatchObject({ url: 'https://ghe.example.com', apiUrl: 'https://api.ghe.example.com' })
+    expect((await call('/dsh-repo/hosts', json('POST', { kind: 'gitlab', url: 'https://g.example.com', apiUrl: 'https://g.example.com/api' }))).status).toBe(400)
+  })
+
   it('opens the Host directory dialog only when it is native', async () => {
     const { call } = await serve()
     expect((await call('/dsh-repo/pick-directory', { method: 'POST' })).status).toBe(409)
@@ -145,7 +176,7 @@ describe('settings routes', () => {
 
   it('removes its routes when the Web server goes away', async () => {
     const { routes, disposers } = await serve()
-    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/pick-directory', '/dsh-repo/state'])
+    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/pick-directory', '/dsh-repo/settings', '/dsh-repo/state'])
     for (const dispose of disposers) dispose()
     expect(routes.size).toBe(0)
   })

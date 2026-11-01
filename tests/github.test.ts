@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GithubProvider } from '../src/providers/github.ts'
-import { createService, fakeHttp, testConfig, TOKENS } from './helpers.ts'
+import { createService, fakeHttp, testConfig, testSettings, TOKENS } from './helpers.ts'
 
 const REPO = 'https://github.com/modestoma/dsh-repo'
 const API = '/repos/modestoma/dsh-repo'
@@ -33,7 +33,7 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/contents/README.md`, reply: { body: '你好世界' } },
       { method: 'GET', path: `${API}/contents/logo.png`, reply: { body: 'PNG\0data' } },
     ])
-    const service = createService(testConfig({ limits: { maxFileBytes: 7 } }), TOKENS)
+    const service = createService(testConfig(), TOKENS, testSettings({ limits: { maxFileBytes: 7 } }))
     expect(await service.readFile(REPO, 'README.md')).toEqual({ path: 'README.md', ref: 'main', text: '你好', binary: false, truncated: true })
     expect(await service.readFile(REPO, 'logo.png', { ref: 'dev' })).toMatchObject({ ref: 'dev', binary: true, text: '' })
   })
@@ -126,7 +126,7 @@ describe('GitHub provider', () => {
 })
 
 describe('GitHub token account', () => {
-  const call = () => ({ signal: AbortSignal.timeout(5_000), limits: testConfig().limits })
+  const call = () => ({ signal: AbortSignal.timeout(5_000), limits: testSettings().limits })
 
   it('commits as the token account, with its noreply address when the email is private', async () => {
     fakeHttp([{ method: 'GET', path: '/api/v3/user', reply: { body: { login: 'bot', id: 7, name: null, email: null } } }])

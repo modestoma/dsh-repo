@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GitlabProvider } from '../src/providers/gitlab.ts'
-import { createService, fakeHttp, testConfig, TOKENS } from './helpers.ts'
+import { createService, fakeHttp, testConfig, testSettings, TOKENS } from './helpers.ts'
 
 const REPO = 'https://code.example.com/gitlab/team/backend/orders'
 const API = '/gitlab/api/v4/projects/team%2Fbackend%2Forders'
@@ -80,7 +80,7 @@ describe('GitLab provider', () => {
       { method: 'GET', path: `${API}/merge_requests/7`, reply: { body: mr({ head_pipeline: { id: 9, status: 'failed', web_url: 'p' }, detailed_merge_status: 'mergeable' }) } },
       { method: 'PUT', path: `${API}/merge_requests/7/merge`, reply: { body: mr({ state: 'merged', merge_commit_sha: 'm1' }) } },
     ])
-    const service = createService(testConfig({ tools: { merge: true } }), TOKENS)
+    const service = createService(testConfig(), TOKENS)
     expect(await service.changeStatus(REPO, 7)).toEqual({ headSha: SHA, checks: [{ name: 'pipeline #9', state: 'failure', webUrl: 'p' }], overall: 'failure', mergeable: true })
     expect(await service.mergeChange(REPO, 7, { headSha: SHA, method: 'squash' })).toEqual({ sha: 'm1' })
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, squash: true })
@@ -113,7 +113,7 @@ describe('GitLab provider', () => {
 })
 
 describe('GitLab token account', () => {
-  const call = () => ({ signal: AbortSignal.timeout(5_000), limits: testConfig().limits })
+  const call = () => ({ signal: AbortSignal.timeout(5_000), limits: testSettings().limits })
   const provider = () => new GitlabProvider('https://code.example.com/gitlab', async () => 't', 5_000)
   const account = { id: 9, username: 'bot', name: 'Shared Bot', public_email: '' }
 

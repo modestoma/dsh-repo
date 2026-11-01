@@ -1,12 +1,14 @@
 import { vi } from 'vitest'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { resolveConfig } from '../src/config.ts'
-import type { RepoConfig } from '../src/config.ts'
+import { DEFAULT_SETTINGS, resolveConfig, resolveSettings, settingsOverrides } from '../src/config.ts'
+import type { RepoConfig, RepoSettings } from '../src/config.ts'
 import type { HostCredentials } from '../src/host.ts'
 import { HostStore } from '../src/hosts.ts'
 import { runGit } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
+import type { MirrorLimits } from '../src/mirror/store.ts'
 import { WorkspaceStore } from '../src/mirror/workspace.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
 import { RepoService } from '../src/service.ts'
@@ -64,31 +66,48 @@ export function credentials(values: Record<string, string>): HostCredentials & {
 }
 
 /**
- * Service over a configuration, fixed tokens, an added-hosts file and mirror
- * root under `root` (default: a path that does not exist).
+ * Host store over a configuration whose settings file under `root` starts
+ * with `settings` (default: no file, so default settings).
  */
-export function createService(config: RepoConfig, tokens: Record<string, string> = {}, root = join(tmpdir(), 'dsh-repo-test-missing')): RepoService {
-  return new RepoService(config, {
+export function hostStore(config: RepoConfig, root: string, settings?: RepoSettings): HostStore {
+  const file = join(root, 'hosts.json')
+  if (settings !== undefined) writeFileSync(file, `${JSON.stringify({ hosts: [], settings: settingsOverrides(settings) })}\n`)
+  return new HostStore(config.hosts, file)
+}
+
+/** Fixed mirror limits. */
+export function mirrorLimits(maxFileBytes: number, maxTreeEntries: number, timeoutMs = 30_000): () => MirrorLimits {
+  return () => ({ timeoutMs, maxFileBytes, maxTreeEntries })
+}
+
+/** Service over a configuration, fixed tokens, and settings, with its settings file and mirrors in a fresh directory. */
+export function createService(config: RepoConfig, tokens: Record<string, string> = {}, settings: RepoSettings = DEFAULT_SETTINGS): RepoService {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-repo-test-'))
+  return new RepoService({
     credentials: credentials(tokens),
-    hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
-    ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: config.limits.maxFileBytes, maxTreeEntries: config.limits.maxTreeEntries })),
+    hosts: hostStore(config, root, settings),
+    ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(settings.limits.maxFileBytes, settings.limits.maxTreeEntries) })),
   })
 }
 
 /** Service dependencies over a mirror store: the store and workspaces on it. */
 export function withMirrors(mirrors: MirrorStore, git: GitRunner = runGit, maxDiffBytes = 4096): { mirrors: MirrorStore; workspaces: WorkspaceStore } {
-  return { mirrors, workspaces: new WorkspaceStore({ git, mirrors, timeoutMs: 30_000, maxDiffBytes }) }
+  return { mirrors, workspaces: new WorkspaceStore({ git, mirrors, limits: () => ({ timeoutMs: 30_000, maxDiffBytes }) }) }
+}
+
+/** Settings with overrides on top of the defaults. */
+export function testSettings(overrides: Record<string, unknown> = {}): RepoSettings {
+  return resolveSettings(overrides)
 }
 
 /** Configuration with a github.com host, a GitHub Enterprise host, and a self-managed GitLab under a path prefix. */
-export function testConfig(overrides: Record<string, unknown> = {}): RepoConfig {
+export function testConfig(): RepoConfig {
   return resolveConfig({
     hosts: [
       { kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' },
       { kind: 'github', url: 'https://ghe.example.com', tokenRef: 'GHE_TOKEN' },
       { kind: 'gitlab', url: 'https://code.example.com/gitlab', tokenRef: 'GITLAB_TOKEN' },
     ],
-    ...overrides,
   })
 }
 

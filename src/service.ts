@@ -4,8 +4,9 @@
  * to the host family's provider, and turns every failure into a
  * {@link RepoError}.
  *
- * Tokens are read through `ctx.credentials` on every request, so a rotated
- * token takes effect without a reload.
+ * Tokens are read through `ctx.credentials` and settings from the settings
+ * file's store on every request, so a rotated token or a saved setting takes
+ * effect without a reload.
  *
  * @module dsh-repo/service
  */
@@ -18,8 +19,8 @@ import type {
   HostCreate, HostInfo, HostsChange, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, PageOptions, RepoRef, RepoTarget,
   SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
 } from './contract.ts'
-import { apiBaseUrl, expandHome } from './config.ts'
-import type { HostSpec, RepoConfig } from './config.ts'
+import { apiBaseUrl, DEFAULT_SETTINGS, expandHome, resolveSettings } from './config.ts'
+import type { HostSpec, RepoSettings } from './config.ts'
 import { RepoError, toRepoError } from './errors.ts'
 import type { HostCredentials, HostLogger } from './host.ts'
 import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
@@ -102,7 +103,7 @@ function gitUsername(kind: HostSpec['kind']): string {
 export interface RepoServiceDeps {
   /** DSH credential store; tokens are resolved per request. */
   readonly credentials: HostCredentials
-  /** Configured and added hosts. */
+  /** Configured and added hosts, the mirror directory, and the run-time settings. */
   readonly hosts: HostStore
   /** Local mirrors. */
   readonly mirrors: MirrorStore
@@ -130,11 +131,8 @@ export class RepoService implements DshRepoService {
   /** Commit identity of each host's token account, keyed by host URL and checked against the token it was read with. */
   private readonly identities = new Map<string, { readonly token: string; readonly author: Promise<CommitAuthor> }>()
 
-  /**
-   * @param config - validated configuration.
-   * @param deps - credential store, hosts, mirrors, and provider factory.
-   */
-  constructor(private readonly config: RepoConfig, deps: RepoServiceDeps) {
+  /** @param deps - credential store, hosts and settings, mirrors, and provider factory. */
+  constructor(deps: RepoServiceDeps) {
     this.credentials = deps.credentials
     this.hosts = deps.hosts
     this.mirrors = deps.mirrors
@@ -145,6 +143,36 @@ export class RepoService implements DshRepoService {
   }
 
   /** Whether any host is configured or added. */
+  /** @returns the run-time settings now in effect. */
+  get settings(): RepoSettings {
+    return this.hosts.settings()
+  }
+
+  /** @returns the value of every setting while nothing is stored. */
+  get defaultSettings(): RepoSettings {
+    return DEFAULT_SETTINGS
+  }
+
+  /** @returns absolute path of the settings file. */
+  get settingsFile(): string {
+    return this.hosts.file
+  }
+
+  /**
+   * Validate and persist the run-time settings, or return to the defaults
+   * with undefined. Calls that start afterwards use them; providers are
+   * rebuilt so the API deadline applies to their HTTP clients too.
+   * @param input - complete settings from the settings page.
+   * @returns the settings now in effect.
+   * @throws {RepoError} `invalid` naming every bad field, `unavailable` when the file cannot be written.
+   */
+  async updateSettings(input: unknown): Promise<RepoSettings> {
+    const next = input === undefined ? DEFAULT_SETTINGS : resolveSettings(input)
+    await this.hosts.setSettings(next)
+    this.providers.clear()
+    return next
+  }
+
   get configured(): boolean {
     return this.hosts.all().length > 0
   }
@@ -430,10 +458,10 @@ export class RepoService implements DshRepoService {
     const spec = hostOf(url, this.hosts.all())
     if (spec === undefined) {
       if (push) throw new RepoError('unauthenticated', `${url} 不属于已配置的主机，没有令牌可用于推送；先在 dsh-repo 中添加该主机并设置令牌`)
-      if (!this.config.mirror.otherHosts) throw new RepoError('not-allowed', `${url} 不属于已配置的主机，dsh-repo 不镜像其他主机上的仓库`)
+      if (!this.settings.mirror.otherHosts) throw new RepoError('not-allowed', `${url} 不属于已配置的主机，dsh-repo 不镜像其他主机上的仓库`)
       return {}
     }
-    resolveTarget(url, this.hosts.all(), this.config.repos)
+    resolveTarget(url, this.hosts.all(), this.settings.repos)
     return credentialEnvironment(spec.url, gitUsername(spec.kind), await this.token(spec))
   }
 
@@ -452,7 +480,7 @@ export class RepoService implements DshRepoService {
     let entry = this.identities.get(spec.url)
     if (entry?.token !== token) {
       // Concurrent pushes share this read, so only the deadline cancels it.
-      const author = this.provider(spec).currentUser({ signal: AbortSignal.timeout(this.config.timeoutMs), limits: this.config.limits })
+      const author = this.provider(spec).currentUser({ signal: AbortSignal.timeout(this.settings.timeoutMs), limits: this.settings.limits })
       entry = { token, author }
       this.identities.set(spec.url, entry)
       // A failed read is not kept, so the next push asks again.
@@ -484,6 +512,7 @@ export class RepoService implements DshRepoService {
     return {
       kind: spec.kind,
       url: spec.url,
+      ...spec.apiUrl === undefined ? {} : { apiUrl: spec.apiUrl },
       ...spec.alias === undefined ? {} : { alias: spec.alias },
       tokenRef: spec.tokenRef,
       origin: this.hosts.isAdded(spec.url) ? 'added' : 'config',
@@ -499,15 +528,15 @@ export class RepoService implements DshRepoService {
   }
 
   private target(repo: RepoTarget): ResolvedTarget {
-    return resolveTarget(repo, this.hosts.all(), this.config.repos)
+    return resolveTarget(repo, this.hosts.all(), this.settings.repos)
   }
 
   private paging(options: PageOptions): Paging {
     const page = options.page ?? 1
-    const perPage = options.perPage ?? this.config.limits.perPage
+    const perPage = options.perPage ?? this.settings.limits.perPage
     if (!Number.isSafeInteger(page) || page < 1) throw new RepoError('invalid', `page 必须是正整数：${page}`)
-    if (!Number.isSafeInteger(perPage) || perPage < 1 || perPage > this.config.limits.maxPerPage) {
-      throw new RepoError('invalid', `perPage 必须在 1 到 ${this.config.limits.maxPerPage} 之间：${perPage}`)
+    if (!Number.isSafeInteger(perPage) || perPage < 1 || perPage > this.settings.limits.maxPerPage) {
+      throw new RepoError('invalid', `perPage 必须在 1 到 ${this.settings.limits.maxPerPage} 之间：${perPage}`)
     }
     return { page, perPage }
   }
@@ -515,17 +544,18 @@ export class RepoService implements DshRepoService {
   private provider(spec: HostSpec): Provider {
     const existing = this.providers.get(spec.url)
     if (existing !== undefined) return existing
-    const created = this.factory(spec, () => this.token(spec), this.config.timeoutMs)
+    const created = this.factory(spec, () => this.token(spec), this.settings.timeoutMs)
     this.providers.set(spec.url, created)
     return created
   }
 
   private async run<T>(repo: RepoTarget, options: CallOptions, what: string, body: (provider: Provider, ref: RepoRef, call: Call) => Promise<T>): Promise<T> {
     const { spec, ...ref } = this.target(repo)
-    const deadline = AbortSignal.timeout(this.config.timeoutMs)
+    const settings = this.settings
+    const deadline = AbortSignal.timeout(settings.timeoutMs)
     const signal = options.signal === undefined ? deadline : AbortSignal.any([options.signal, deadline])
     try {
-      return await body(this.provider(spec), ref, { signal, limits: this.config.limits })
+      return await body(this.provider(spec), ref, { signal, limits: settings.limits })
     } catch (error) {
       throw toRepoError(error, `${what}（${ref.host}/${ref.path}）`)
     }

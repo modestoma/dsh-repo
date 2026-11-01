@@ -1,5 +1,6 @@
 /**
- * 插件配置：cordis.yml 中的 `config`，经 Standard Schema 在加载时校验。
+ * 插件配置：cordis.yml 中的 `config`（预置主机与设置文件位置），以及保存在
+ * 设置文件、由设置页编辑的运行时设置，均经 Standard Schema 校验。
  *
  * @module dsh-repo/config
  */
@@ -8,9 +9,16 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { ForgeKind } from './contract.ts'
+import { RepoError } from './errors.ts'
+import { MAX_REPO_PATTERNS, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS } from './settings/contract.ts'
+import type { RepoSettingsWire } from './settings/contract.ts'
 
-/** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
-export const MAX_TIMER_DELAY_MS = 2_147_483_647
+
+/** An integer setting within its {@link SETTING_BOUNDS}. */
+function bounded(name: keyof typeof SETTING_BOUNDS) {
+  const { min, max } = SETTING_BOUNDS[name]
+  return z.number().int().min(min).max(max)
+}
 
 /** Credential reference names: environment-variable style. */
 export const TOKEN_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -52,34 +60,113 @@ const hostSchema = z.object({
 })
 
 const limitsSchema = z.object({
-  perPage: z.number().int().min(1).max(100).default(30),
-  maxPerPage: z.number().int().min(1).max(100).default(100),
-  maxFileBytes: z.number().int().min(1).max(64 * 1024 * 1024).default(1024 * 1024),
-  maxDiffBytes: z.number().int().min(1).max(64 * 1024 * 1024).default(512 * 1024),
-  maxTreeEntries: z.number().int().min(1).max(100_000).default(1000),
-  maxComments: z.number().int().min(1).max(100).default(50),
+  /** Items per page when a list call names none. */
+  perPage: bounded('perPage').default(30),
+  /** Largest page a list call may ask for. */
+  maxPerPage: bounded('maxPerPage').default(100),
+  /** Cut of one file read through the API or the mirror. */
+  maxFileBytes: bounded('maxFileBytes').default(1024 * 1024),
+  /** Cut of a PR/MR or workspace diff. */
+  maxDiffBytes: bounded('maxDiffBytes').default(512 * 1024),
+  /** Most entries of one directory listing. */
+  maxTreeEntries: bounded('maxTreeEntries').default(1000),
+  /** Comments returned with one issue or PR/MR. */
+  maxComments: bounded('maxComments').default(50),
 }).strict().superRefine((limits, issues) => {
-  if (limits.perPage > limits.maxPerPage) issues.addIssue({ code: 'custom', path: ['perPage'], message: 'perPage 不能大于 maxPerPage' })
+  if (limits.perPage > limits.maxPerPage) issues.addIssue({ code: 'custom', path: ['perPage'], message: '默认每页条数不能大于每页上限' })
 })
 
 const mirrorSchema = z.object({
-  /** Timeout of one git command (clone, fetch, worktree). */
-  gitTimeoutMs: z.number().int().min(1000).max(MAX_TIMER_DELAY_MS).default(10 * 60 * 1000),
-  /** Whether addresses on hosts outside `hosts` may be mirrored with the machine's own git credentials. */
+  /** Timeout of one git command (clone, fetch, worktree, push). */
+  gitTimeoutMs: bounded('gitTimeoutMs').default(10 * 60 * 1000),
+  /** Whether addresses on hosts outside the host list may be mirrored with the machine's own git credentials. */
   otherHosts: z.boolean().default(true),
 }).strict()
 
 const toolsSchema = z.object({
+  /** Whether model tools are offered at all; false leaves only the `dshRepos` service. */
   enabled: z.boolean().default(true),
-  /** `ask`: every write asks the user once; `allow`: writes run without asking; `off`: write tools are not registered. */
+  /** `ask`: every write asks the user once; `allow`: writes run without asking; `off`: write tools are not offered. */
   writes: z.enum(['ask', 'allow', 'off']).default('ask'),
-  /** Whether the merge tool is registered at all; it always follows `writes` for approval. */
+  /** Whether the merge tool is offered; it always follows `writes` for approval. */
   merge: z.boolean().default(false),
   /** Appended (after a blank line) to issue, change request, and comment bodies written through tools; empty = none. */
-  signature: z.string().max(500).default(''),
+  signature: z.string().max(MAX_SIGNATURE_LENGTH).default(''),
 }).strict()
 
-/** Standard Schema of the `config` block. */
+/**
+ * Standard Schema of the run-time settings kept in the settings file and
+ * edited on the settings page. Every field has a default, so a partial
+ * object (the stored overrides) parses to complete settings.
+ */
+export const repoSettingsSchema = z.object({
+  /** Reachable repositories; empty = every repository on the hosts. */
+  repos: z.array(z.string().trim().toLowerCase().regex(REPO_PATTERN, '仓库格式：主机/路径，末段可以是 *（一层）或 **（任意层），例如 github.com/modestoma/*')).max(MAX_REPO_PATTERNS).default([]),
+  /** Deadline of one API call. */
+  timeoutMs: bounded('timeoutMs').default(30_000),
+  limits: limitsSchema.prefault({}),
+  tools: toolsSchema.prefault({}),
+  mirror: mirrorSchema.prefault({}),
+}).strict()
+
+/** Complete run-time settings. */
+export type RepoSettings = z.output<typeof repoSettingsSchema>
+
+/** Compile-time check that the page's wire type and the schema stay identical. */
+type Same<A, B> = [A] extends [B] ? [B] extends [A] ? true : false : false
+const settingsWireMatches: Same<RepoSettings, RepoSettingsWire> = true
+void settingsWireMatches
+
+/** Stored form of {@link RepoSettings}: only the fields that differ from the defaults. */
+export type SettingsOverrides = z.input<typeof repoSettingsSchema>
+
+/** Settings used while nothing is stored. */
+export const DEFAULT_SETTINGS: RepoSettings = repoSettingsSchema.parse({})
+
+/**
+ * Validate settings, filling every missing field with its default.
+ * @param input - complete settings or stored overrides.
+ * @returns the validated settings.
+ * @throws {RepoError} `invalid` with every issue in the message.
+ */
+export function resolveSettings(input: unknown): RepoSettings {
+  const parsed = repoSettingsSchema.safeParse(input)
+  if (parsed.success) return parsed.data
+  throw new RepoError('invalid', `设置不合法：${parsed.error.issues.map(issue => `${issue.path.join('.') || '(根)'}：${issue.message}`).join('；')}`)
+}
+
+function changedFields<T extends object>(value: T, base: T): Partial<T> | undefined {
+  const changed: Partial<T> = {}
+  for (const key of Object.keys(value) as (keyof T)[]) {
+    if (JSON.stringify(value[key]) !== JSON.stringify(base[key])) changed[key] = value[key]
+  }
+  return Object.keys(changed).length === 0 ? undefined : changed
+}
+
+/**
+ * The fields of complete settings that differ from the defaults, so later
+ * default changes reach every field the user never set.
+ * @param settings - validated settings.
+ * @returns the overrides to store; empty when everything is default.
+ */
+export function settingsOverrides(settings: RepoSettings): SettingsOverrides {
+  const limits = changedFields(settings.limits, DEFAULT_SETTINGS.limits)
+  const tools = changedFields(settings.tools, DEFAULT_SETTINGS.tools)
+  const mirror = changedFields(settings.mirror, DEFAULT_SETTINGS.mirror)
+  return {
+    ...settings.repos.length === 0 ? {} : { repos: settings.repos },
+    ...settings.timeoutMs === DEFAULT_SETTINGS.timeoutMs ? {} : { timeoutMs: settings.timeoutMs },
+    ...limits === undefined ? {} : { limits },
+    ...tools === undefined ? {} : { tools },
+    ...mirror === undefined ? {} : { mirror },
+  }
+}
+
+/**
+ * Standard Schema of the cordis.yml `config` block. Only hosts provisioned
+ * with the profile and the settings file location live here; everything else
+ * is a run-time setting ({@link repoSettingsSchema}).
+ */
 export const pluginConfigSchema = z.object({
   hosts: z.array(hostSchema).default([]).superRefine((hosts, issues) => {
     const seen = new Set<string>()
@@ -88,22 +175,9 @@ export const pluginConfigSchema = z.object({
       seen.add(host.url)
     }
   }),
-  /** Reachable repositories; omitted or empty = every repository on the configured hosts. */
-  repos: z.array(z.string().trim().toLowerCase().regex(REPO_PATTERN, '仓库格式：主机/路径，末段可以是 *（一层）或 **（任意层），例如 github.com/modestoma/*')).default([]),
-  timeoutMs: z.number().int().min(1000).max(MAX_TIMER_DELAY_MS).default(30_000),
-  limits: limitsSchema.default({ perPage: 30, maxPerPage: 100, maxFileBytes: 1024 * 1024, maxDiffBytes: 512 * 1024, maxTreeEntries: 1000, maxComments: 50 }),
-  tools: toolsSchema.default({ enabled: true, writes: 'ask', merge: false, signature: '' }),
-  mirror: mirrorSchema.default({ gitTimeoutMs: 10 * 60 * 1000, otherHosts: true }),
-  /** File holding hosts added at run time; default `$DSH_HOME/dsh-repo/hosts.json`. */
-  hostsFile: z.string().trim().min(1, '主机文件路径不能为空').optional(),
-}).strict().default({
-  hosts: [],
-  repos: [],
-  timeoutMs: 30_000,
-  limits: { perPage: 30, maxPerPage: 100, maxFileBytes: 1024 * 1024, maxDiffBytes: 512 * 1024, maxTreeEntries: 1000, maxComments: 50 },
-  tools: { enabled: true, writes: 'ask', merge: false, signature: '' },
-  mirror: { gitTimeoutMs: 10 * 60 * 1000, otherHosts: true },
-})
+  /** Settings file holding added hosts, the mirror directory, and the run-time settings; default `$DSH_HOME/dsh-repo/hosts.json`. */
+  hostsFile: z.string().trim().min(1, '设置文件路径不能为空').optional(),
+}).strict().prefault({})
 
 /** Validated configuration. */
 export type RepoConfig = z.output<typeof pluginConfigSchema>
@@ -111,11 +185,11 @@ export type RepoConfig = z.output<typeof pluginConfigSchema>
 /** One host: configured in cordis.yml or added at run time. */
 export type HostSpec = RepoConfig['hosts'][number]
 
-/** Schema of one host, shared by the configuration and the added-hosts file. */
+/** Schema of one host, shared by the configuration and the settings file. */
 export const hostSpecSchema = hostSchema
 
 /** Size and paging limits. */
-export type RepoLimits = RepoConfig['limits']
+export type RepoLimits = RepoSettings['limits']
 
 /**
  * Validate a raw `config` block.
@@ -171,7 +245,7 @@ export function defaultMirrorDir(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
- * The added-hosts file a configuration implies.
+ * The settings file a configuration implies.
  * @param config - validated configuration.
  * @param env - process environment.
  * @returns absolute path.

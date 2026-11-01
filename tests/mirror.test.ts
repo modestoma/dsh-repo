@@ -8,7 +8,7 @@ import { credentialEnvironment, runGit } from '../src/mirror/git.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
 import { isAcceptedGitUrl, mirrorPath, MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import { credentials, testConfig, withMirrors } from './helpers.ts'
+import { credentials, hostStore, mirrorLimits, testConfig, testSettings, withMirrors } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 
@@ -31,11 +31,12 @@ function origin(): { dir: string; commit: string } {
 
 function setup(options: { git?: GitRunner; otherHosts?: boolean; tokens?: Record<string, string> } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-mirrors-'))
-  const config = testConfig({ mirror: { otherHosts: options.otherHosts ?? true }, repos: ['github.com/modestoma/*', 'code.example.com/team/**'] })
-  const service = new RepoService(config, {
+  const config = testConfig()
+  const settings = testSettings({ mirror: { otherHosts: options.otherHosts ?? true }, repos: ['github.com/modestoma/*', 'code.example.com/team/**'] })
+  const service = new RepoService({
     credentials: credentials(options.tokens ?? {}),
-    hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
-    ...withMirrors(new MirrorStore({ git: options.git ?? runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 64, maxTreeEntries: 10 }), options.git ?? runGit),
+    hosts: hostStore(config, root, settings),
+    ...withMirrors(new MirrorStore({ git: options.git ?? runGit, root: join(root, 'mirrors'), limits: mirrorLimits(64, 10) }), options.git ?? runGit),
   })
   return { root, service }
 }
@@ -141,10 +142,10 @@ describe('mirror store', () => {
     const repo = origin()
     const config = testConfig()
     const root = mkdtempSync(join(tmpdir(), 'dsh-repo-restart-'))
-    const make = () => new RepoService(config, {
+    const make = () => new RepoService({
       credentials: credentials({}),
       hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
-      ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 64, maxTreeEntries: 10 })),
+      ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(64, 10) })),
     })
     const leftover = await make().acquireSnapshot(repo.dir, (await make().syncMirror(repo.dir)).commit)
     const restarted = make()

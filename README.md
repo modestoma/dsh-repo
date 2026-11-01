@@ -6,7 +6,7 @@
 
 ## 项目状态
 
-测试版：提供统一接口、模型工具、运行时主机管理、本地镜像、可写工作区和 Web 设置页。接口仍可能调整。
+测试版：提供统一接口、模型工具、运行时主机管理、本地镜像、可写工作区和左侧栏「代码仓库」设置页。接口仍可能调整。
 
 ## 安装
 
@@ -20,10 +20,12 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 
 ## 配置
 
+所有参数都在 Web 组合左侧栏的「代码仓库」页面配置，保存在设置文件（默认 `$DSH_HOME/dsh-repo/hosts.json`）中，不在插件安装目录里，升级、卸载或重装插件都不会清空。cordis.yml 只保留两项：
+
 ```yaml
 - id: dsh-repo
   config:
-    hosts:
+    hosts:                              # 可选：随 profile 预置的主机，在设置页只读显示、只能改令牌
       - kind: github
         url: https://github.com
         tokenRef: GITHUB_TOKEN          # DSH 凭据库中的令牌名称，也可以是同名环境变量；不是令牌本身
@@ -34,35 +36,37 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
       - kind: gitlab                    # 自建 GitLab，可带子路径
         url: https://code.example.com/gitlab
         tokenRef: GITLAB_TOKEN
-    repos:                              # 可访问的仓库；省略或为空 = 上面主机上令牌能访问的全部仓库
-      - github.com/modestoma/*          # * 匹配一层
-      - code.example.com/team/**        # ** 匹配任意多层（GitLab 子组）
-    timeoutMs: 30000                    # 单次调用的超时
-    limits:
-      perPage: 30                       # 列表默认每页条数
-      maxPerPage: 100
-      maxFileBytes: 1048576             # 读文件的上限
-      maxDiffBytes: 524288              # PR/MR 与工作区 diff 的上限，超出截断
-      maxTreeEntries: 1000              # 目录列表的上限，超出截断
-      maxComments: 50                   # 读取 issue / PR/MR 时附带的评论条数
-    mirror:
-      gitTimeoutMs: 600000              # 单条 git 命令（clone、fetch、worktree、push）的超时
-      otherHosts: true                  # false = 只镜像 hosts 中主机上的仓库；其他主机上的仓库只能拉取，不能推送
-    hostsFile: ~/.dsh/dsh-repo/hosts.json  # 运行时添加的主机，默认 $DSH_HOME/dsh-repo/hosts.json
-    tools:
-      enabled: true                     # false = 只提供 dshRepos 服务，不注册模型工具
-      writes: ask                       # ask：每次写操作请用户审批；allow：不审批；off：不注册写工具
-      merge: false                      # true 才注册合并工具（仍按 writes 审批）
-      signature: ''                     # 非空时追加到模型写的 issue、PR/MR 正文和评论末尾
+    hostsFile: ~/.dsh/dsh-repo/hosts.json  # 设置文件位置，默认 $DSH_HOME/dsh-repo/hosts.json
 ```
 
-配置在加载时校验，不合法时插件加载失败；`hostsFile` 存在但无法读取或内容不合法时同样加载失败。没有任何主机时模型看不到代码仓库工具，添加主机后立即提供。
+cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`limits`、`tools`、`mirror`、`timeoutMs`）时插件加载失败；设置文件存在但无法读取或内容不合法时同样加载失败。
+
+### 设置页
+
+| 标签页 | 设置 | 默认 | 保存方式 |
+|---|---|---|---|
+| 主机 | 添加（类型、地址、GitHub 接口地址、别名、令牌）、删除主机，保存或清除令牌 | 无 | 立即 |
+| 高级 | 镜像目录 | `$DSH_HOME/dsh-repo/mirrors` | 立即 |
+| 访问范围 | `repos`：可访问的仓库，`主机/路径`，末段 `*` 匹配一层、`**` 匹配任意多层；空 = 主机上令牌能访问的全部仓库 | 空 | 保存条 |
+| 访问范围 | `mirror.otherHosts`：是否允许不带凭据镜像不在主机列表中的仓库 | 允许 | 保存条 |
+| 模型工具 | `tools.enabled`：是否提供 `repo_*` 工具 | 提供 | 保存条 |
+| 模型工具 | `tools.writes`：`ask` 每次审批、`allow` 不审批、`off` 不提供写工具 | `ask` | 保存条 |
+| 模型工具 | `tools.merge`：是否提供合并工具（审批跟随 `writes`） | 不提供 | 保存条 |
+| 模型工具 | `tools.signature`：追加到模型写的正文和评论末尾 | 空 | 保存条 |
+| 高级 | `timeoutMs`：一次接口调用 | 30 秒 | 保存条 |
+| 高级 | `mirror.gitTimeoutMs`：一条 git 命令（clone、fetch、worktree、push） | 600 秒 | 保存条 |
+| 高级 | `limits.perPage` / `maxPerPage` / `maxComments` / `maxTreeEntries` | 30 / 100 / 50 / 1000 | 保存条 |
+| 高级 | `limits.maxFileBytes` / `maxDiffBytes`：读文件上限、diff 截断 | 1 MiB / 512 KiB | 保存条 |
+
+「立即」的改动点击即保存；其余设置改动后页面底部出现保存条，每项改过时旁边有「恢复默认」。保存后的设置从下一次调用开始生效，不用重启：工具在模型的下一步按新设置提供或隐藏，已经提供的写工具在写操作被关闭后拒绝执行。设置文件的 `settings` 字段只记录与默认不同的项，「全部恢复默认」删除该字段；以后版本调整默认值时，没改过的项随之变化。「插件 → dsh-repo」页面只保留一个指向该入口的「打开设置」按钮。
+
+没有任何主机时模型看不到代码仓库工具，添加主机后立即提供。
 
 ### 运行时添加主机
 
-除了 cordis.yml 里的 `hosts`，还可以在运行时添加主机：Web 组合中打开左侧栏「插件」，进入 dsh-repo 的详情页即可添加、删除主机和保存、清除令牌，改动立即生效；其他插件也可以调用 `addHost` 添加主机、`removeHost` 删除、`setHostToken` 保存或清除令牌。添加的主机保存在 `hostsFile`，令牌存入 DSH 凭据库，引用名由地址生成（`DSH_REPO_HOST_<哈希>`）。cordis.yml 中的主机只能改令牌，不能在运行时删除；`listHosts` 列出所有主机及令牌是否已设置，不返回令牌值。`onHostsChange` 在每次主机、令牌或镜像目录变更成功后通知监听者，例如需要在令牌更新后重新拉取镜像的插件。
+除了 cordis.yml 里的 `hosts`，还可以在设置页添加、删除主机和保存、清除令牌，改动立即生效；其他插件也可以调用 `addHost` 添加主机、`removeHost` 删除、`setHostToken` 保存或清除令牌。添加的主机保存在设置文件，令牌存入 DSH 凭据库，引用名由地址生成（`DSH_REPO_HOST_<哈希>`）。cordis.yml 中的主机只能改令牌，不能在运行时删除；`listHosts` 列出所有主机及令牌是否已设置，不返回令牌值。`onHostsChange` 在每次主机、令牌或镜像目录变更成功后通知监听者，例如需要在令牌更新后重新拉取镜像的插件。
 
-设置页的数据来自宿主 `webServer` 上的 `/dsh-repo/state`、`/dsh-repo/hosts`、`/dsh-repo/host-token` 路由，请求经宿主 `connection` 做与 DSH `/api` 相同的来源校验和登录鉴权，写操作另外要求同源。没有 Web 的组合不挂载这些路由。
+设置页的数据来自宿主 `webServer` 上的 `/dsh-repo/state`、`/dsh-repo/hosts`、`/dsh-repo/host-token`、`/dsh-repo/mirror`、`/dsh-repo/settings` 路由，请求经宿主 `connection` 做与 DSH `/api` 相同的来源校验和登录鉴权，写操作另外要求同源。没有 Web 的组合不挂载这些路由。
 
 ### 令牌
 
@@ -90,9 +94,9 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 | `repo_workspace_push` | 提交工作区未提交的改动并推送到新分支，从不强推 | 是 |
 | `repo_issue_create` / `repo_issue_update` / `repo_issue_comment` | 创建、修改、关闭或重开、评论 issue | 是 |
 | `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR | 是 |
-| `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；默认不注册 | 是 |
+| `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；默认不提供 | 是 |
 
-- 写操作在 `writes: ask` 下每次调用都经 `ctx.approval` 请用户确认一次，被拒绝时工具返回 `{ "status": "declined" }`，不会调用主机。组合里没有审批服务时写工具报错。
+- 写操作在设置页选「每次审批」（`writes: ask`）时每次调用都经 `ctx.approval` 请用户确认一次，被拒绝时工具返回 `{ "status": "declined" }`，不会调用主机。组合里没有审批服务时写工具报错。
 - 审批提示首行写要做的事，之后每行一项「标签：值」，文件列表缩进两格；审批端按行展示即可。`repo_workspace_push` 列出目标分支、仓库、起点、提交说明首行、改动总数与增删行数，以及按改动量排序的前 12 项文件改动，整个目录的移动合并成一行。
 - 失败时工具报错，消息以失败类型开头，例如 `[not-found]`、`[forbidden]`、`[conflict]`。
 
@@ -150,10 +154,10 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 
 `syncMirror(url, { branch })` 把仓库拉取为只拉取、不检出的镜像，返回分支最新提交；`readMirrorFile`、`listMirrorTree` 直接从提交的 git 对象读文件和目录；`acquireSnapshot(url, commit)` 返回该提交的只读检出（`git worktree`），同一提交的持有者共用一份，全部 `release()` 且不再是最近一次同步的提交时删除。
 
-- 镜像目录默认是 `$DSH_HOME/dsh-repo/mirrors`，可以在「插件 → dsh-repo」页面手动输入或用系统目录选择框（本机 GUI 会话可用）换到别处，也可以由其他插件调用 `setMirrorDir`。所选目录与运行时添加的主机一起保存在 `hostsFile`（默认 `$DSH_HOME/dsh-repo/hosts.json`）的 `mirrorDir` 字段，不写 cordis.yml；恢复默认时删除该字段。目录不存在时创建，无法创建或写入时拒绝。换目录后旧目录里的镜像不搬也不删，之后的同步在新目录重新克隆；已经持有的快照留在旧目录直到释放。每次换目录都经 `onHostsChange` 通知（`kind: 'mirror'`）。
+- 镜像目录默认是 `$DSH_HOME/dsh-repo/mirrors`，可以在「代码仓库」设置页手动输入或用系统目录选择框（本机 GUI 会话可用）换到别处，也可以由其他插件调用 `setMirrorDir`。所选目录保存在设置文件（默认 `$DSH_HOME/dsh-repo/hosts.json`）的 `mirrorDir` 字段，不写 cordis.yml；恢复默认时删除该字段。目录不存在时创建，无法创建或写入时拒绝。换目录后旧目录里的镜像不搬也不删，之后的同步在新目录重新克隆；已经持有的快照留在旧目录直到释放。每次换目录都经 `onHostsChange` 通知（`kind: 'mirror'`）。
 - 镜像和主机文件都在 DSH 主目录下，不在插件的安装目录里，升级、卸载或重装插件不会删除它们。
 - 镜像位于 `<镜像目录>/<主机>/<路径>`，本地路径位于 `<镜像目录>/local/`；快照位于 `<镜像目录>/.snapshots/` 下对应位置。新地址先克隆到临时目录再改名；同一镜像的 clone/fetch 依次执行。进程内第一次同步某个镜像时清理上次运行遗留的快照。
-- 地址只接受 HTTPS URL、`file:` URL 或绝对路径；SSH 地址、`user@host:path`、`git://` 和 `http://` 以 `invalid` 拒绝，请改用仓库的 HTTPS 地址。属于已配置主机的地址受 `repos` 范围限制，并自动使用该主机的令牌（GitLab 用户名 `oauth2`，GitHub 用户名 `x-access-token`），令牌经只对这次 git 进程生效的凭据助手传入，不出现在命令行、`.git/config` 或输出里，Agent 也拿不到。其他主机上的仓库不带凭据拉取（适合公开仓库），`mirror.otherHosts: false` 时拒绝；本地路径不需要凭据。
+- 地址只接受 HTTPS URL、`file:` URL 或绝对路径；SSH 地址、`user@host:path`、`git://` 和 `http://` 以 `invalid` 拒绝，请改用仓库的 HTTPS 地址。属于已配置主机的地址受 `repos` 范围限制，并自动使用该主机的令牌（GitLab 用户名 `oauth2`，GitHub 用户名 `x-access-token`），令牌经只对这次 git 进程生效的凭据助手传入，不出现在命令行、`.git/config` 或输出里，Agent 也拿不到。其他主机上的仓库不带凭据拉取（适合公开仓库），设置页关闭「其他主机上的仓库」（`mirror.otherHosts`）时拒绝；本地路径不需要凭据。
 - 需要本机安装 `git`；git 不会弹出交互式提示。
 
 ## GitHub 与 GitLab 的差异处理

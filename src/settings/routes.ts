@@ -1,5 +1,5 @@
 /**
- * 插件页设置的 HTTP 路由，挂在宿主可选的 `webServer` 上（没有 Web 的组合不挂载）。
+ * 设置页的 HTTP 路由，挂在宿主可选的 `webServer` 上（没有 Web 的组合不挂载）。
  * 每个请求先经宿主 `connection.requestRejection`（与 DSH `/api` 相同的
  * Host/Origin 校验和登录 cookie 鉴权）；写操作另做同源校验。
  *
@@ -14,7 +14,7 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { RepoService } from '../service.ts'
 import type { DirectoryPicker } from './directory-picker.ts'
 import { hostDirectoryPicker } from './directory-picker.ts'
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, STATE_ROUTE } from './contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE } from './contract.ts'
 import type { SettingsState } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
@@ -25,12 +25,15 @@ const MAX_BODY_BYTES = 64 * 1024
 const hostAddSchema = z.object({
   kind: z.enum(['github', 'gitlab']).optional(),
   url: z.string(),
+  apiUrl: z.string().optional(),
   alias: z.string().optional(),
   token: z.string().optional(),
 }).strict()
 const hostUrlSchema = z.object({ url: z.string() }).strict()
 const hostTokenSchema = z.object({ url: z.string(), value: z.string() }).strict()
 const mirrorSchema = z.object({ dir: z.string() }).strict()
+/** The service validates the settings fields and reports every bad one. */
+const settingsBodySchema = z.record(z.string(), z.unknown())
 
 /** HTTP status of each service failure the routes can surface. */
 const STATUS: Readonly<Record<RepoErrorCode, number>> = {
@@ -139,10 +142,17 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
  * The settings page's view of the service.
  * @param service - the `dshRepos` implementation.
  * @param picker - the Host's directory dialog.
- * @returns hosts with token status, the mirror directory, and whether a directory dialog is available.
+ * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, and whether a directory dialog is available.
  */
 export async function settingsState(service: RepoService, picker: DirectoryPicker): Promise<SettingsState> {
-  return { hosts: await service.listHosts(), mirror: service.mirrorSettings(), pickerAvailable: picker.available }
+  return {
+    hosts: await service.listHosts(),
+    mirror: service.mirrorSettings(),
+    settings: service.settings,
+    defaults: service.defaultSettings,
+    file: service.settingsFile,
+    pickerAvailable: picker.available,
+  }
 }
 
 /**
@@ -168,8 +178,8 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
         if (req.method?.toUpperCase() === 'DELETE') {
           await service.removeHost((await readJsonBody(req, hostUrlSchema)).url)
         } else {
-          const { kind, url, alias, token } = await readJsonBody(req, hostAddSchema)
-          await service.addHost({ url, ...kind === undefined ? {} : { kind }, ...alias === undefined ? {} : { alias }, ...token === undefined ? {} : { token } })
+          const { kind, url, apiUrl, alias, token } = await readJsonBody(req, hostAddSchema)
+          await service.addHost({ url, ...kind === undefined ? {} : { kind }, ...apiUrl === undefined ? {} : { apiUrl }, ...alias === undefined ? {} : { alias }, ...token === undefined ? {} : { token } })
         }
         await reply(res)
       }),
@@ -192,6 +202,14 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       path: MIRROR_ROUTE,
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
         await service.setMirrorDir(req.method?.toUpperCase() === 'DELETE' ? undefined : (await readJsonBody(req, mirrorSchema)).dir)
+        await reply(res)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: SETTINGS_ROUTE,
+      handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
+        await service.updateSettings(req.method?.toUpperCase() === 'DELETE' ? undefined : await readJsonBody(req, settingsBodySchema))
         await reply(res)
       }),
     }),
