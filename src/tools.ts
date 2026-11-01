@@ -16,6 +16,7 @@
  */
 
 import { z } from 'zod'
+import { pushPrompt } from './push-prompt.ts'
 import type { DshRepoService } from './contract.ts'
 import type { RepoSettings } from './config.ts'
 import { RepoError } from './errors.ts'
@@ -257,8 +258,8 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       description: 'Open a pull request (GitHub) or merge request (GitLab) from a pushed branch. Requires user approval.',
       schema: z.object({ repo, title: z.string().min(1), body: z.string().optional(), sourceBranch: z.string().min(1), targetBranch: z.string().optional(), draft: z.boolean().optional(), labels, assignees }).strict(),
       describe: args => ({
-        zh: `在 ${args.repo} 创建${args.draft === true ? '草稿 ' : ''}PR/MR：${args.sourceBranch} → ${args.targetBranch ?? '默认分支'}，标题「${args.title}」`,
-        en: `Open a ${args.draft === true ? 'draft ' : ''}PR/MR in ${args.repo}: ${args.sourceBranch} → ${args.targetBranch ?? 'default branch'}, "${args.title}"`,
+        zh: `创建${args.draft === true ? '草稿 ' : ''}PR/MR\n仓库：${args.repo}\n分支：${args.sourceBranch} → ${args.targetBranch ?? '默认分支'}\n标题：${args.title}`,
+        en: `Open a ${args.draft === true ? 'draft ' : ''}PR/MR\nRepository: ${args.repo}\nBranches: ${args.sourceBranch} → ${args.targetBranch ?? 'default branch'}\nTitle: ${args.title}`,
       }),
       run: (args, signal) => service.createChange(args.repo, { ...args, ...args.body === undefined ? {} : { body: sign(args.body) }, signal }),
     }),
@@ -376,19 +377,6 @@ async function workspaceRoot(deps: ToolDeps, dir: string | undefined, exec: Tool
     if (await present(join(candidate, '.git'))) return candidate
   }
   throw new RepoError('not-found', `${start} 不在 repo_workspace_open 打开的工作区内`)
-}
-
-/** Approval text of a push: target, files with line counts, and the commit message. */
-function pushPrompt(changes: WorkspaceChanges, branch: string, message: string | undefined): Prompt {
-  const ws = changes.workspace
-  const shown = changes.files.slice(0, 20).map(file => `${file.status === 'renamed' ? `${file.previousPath ?? ''} → ` : ''}${file.path}${file.binary ? '（二进制）' : ` +${file.additions ?? 0} −${file.deletions ?? 0}`}`)
-  const more = changes.files.length > shown.length ? `\n…另有 ${changes.files.length - shown.length} 个文件` : ''
-  const counts = changes.files.reduce((sum, file) => ({ add: sum.add + (file.additions ?? 0), del: sum.del + (file.deletions ?? 0) }), { add: 0, del: 0 })
-  const commit = changes.uncommitted && message !== undefined ? `\n提交说明：${message.split('\n', 1)[0] ?? ''}` : ''
-  return {
-    zh: `把 ${ws.url} 的工作区推送到分支 ${branch}（起点 ${ws.baseBranch} @ ${ws.baseCommit.slice(0, 12)}）：${changes.files.length} 个文件，+${counts.add} −${counts.del}${commit}\n${shown.join('\n')}${more}`,
-    en: `Push the workspace of ${ws.url} to branch ${branch} (from ${ws.baseBranch} @ ${ws.baseCommit.slice(0, 12)}): ${changes.files.length} file(s), +${counts.add} -${counts.del}`,
-  }
 }
 
 function define<S extends z.ZodType, V>(deps: ToolDeps, spec: Spec<S, V>): ToolDefinition<V | Declined> {
