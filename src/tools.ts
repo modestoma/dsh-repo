@@ -22,7 +22,7 @@ import type { RepoSettings } from './config.ts'
 import { RepoError } from './errors.ts'
 import { lstat, readFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import type { ChangeInfo, CommitTrailer, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
+import type { ChangeInfo, CommitDetails, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
 import type { Agent, ContentBlock, HostApproval, ToolDefinition, ToolRunContext, WorkingDirectoryService } from './host.ts'
 
 /** Outcome of a write the user did not approve. */
@@ -42,10 +42,10 @@ export interface ToolDeps {
   /** DSH's working-directory service, looked up per call; absent in compositions without it. */
   readonly workingDirectory: () => WorkingDirectoryService | undefined
   /**
-   * Trailers other plugins add to a push made for a Session (the
+   * Trailers and author other plugins add to a push made for a Session (the
    * `repo/commit-trailers` event); absent means none.
    */
-  readonly commitTrailers?: (request: { readonly session: string; readonly dir: string }) => Promise<readonly CommitTrailer[]>
+  readonly commitDetails?: (request: { readonly session: string; readonly dir: string }) => Promise<CommitDetails>
 }
 
 const repo = z.string().min(1).describe('Repository: web or clone URL (https://github.com/owner/name, git@gitlab.example.com:group/project.git) or host/path')
@@ -228,7 +228,7 @@ export function createTools(deps: ToolDeps): RepoTool[] {
   const writes: ToolDefinition[] = [
     define(deps, {
       name: 'repo_workspace_push',
-      description: 'Commit the uncommitted changes of a workspace opened by repo_workspace_open and push it to its remote branch, never forcing. The commit is made as the account that owns the host token and records the id of this session, plus any trailers other plugins add. The first push of a new piece of work names a new branch, which must not exist yet and cannot be the default or starting branch; later pushes, and pushes of a workspace opened with `branch`, add commits to the same branch: omit `branch` then. A PR/MR from the branch updates by itself; the result lists the open ones. Open a PR/MR only when none is listed, with repo_mr_create (sourceBranch = the branch, targetBranch = baseBranch). Requires user approval.',
+      description: 'Commit the uncommitted changes of a workspace opened by repo_workspace_open and push it to its remote branch, never forcing. The commit is committed by the account that owns the host token, authored by that account or by the person another plugin names (e.g. who asked for the change; the result shows the author), and records the id of this session, plus any trailers other plugins add. The first push of a new piece of work names a new branch, which must not exist yet and cannot be the default or starting branch; later pushes, and pushes of a workspace opened with `branch`, add commits to the same branch: omit `branch` then. A PR/MR from the branch updates by itself; the result lists the open ones. Open a PR/MR only when none is listed, with repo_mr_create (sourceBranch = the branch, targetBranch = baseBranch). Requires user approval.',
       schema: z.object({
         dir: z.string().min(1).optional().describe('Workspace directory or a directory inside it; default: the current working directory'),
         branch: z.string().min(1).optional().describe('New remote branch, e.g. fix/order-timeout; required on the first push'),
@@ -241,12 +241,13 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       run: async (args, signal, exec) => {
         const root = await workspaceRoot(deps, args.dir, exec, signal)
         const session = exec.agent?.session?.header.id
-        const trailers = session === undefined || deps.commitTrailers === undefined ? [] : await deps.commitTrailers({ session, dir: root })
+        const details = session === undefined || deps.commitDetails === undefined ? undefined : await deps.commitDetails({ session, dir: root })
         const pushed = await service.pushWorkspace(root, {
           ...args.branch === undefined ? {} : { branch: args.branch },
           ...args.message === undefined ? {} : { message: args.message },
           ...session === undefined ? {} : { session },
-          ...trailers.length === 0 ? {} : { trailers },
+          ...details === undefined || details.trailers.length === 0 ? {} : { trailers: details.trailers },
+          ...details?.author === undefined ? {} : { author: details.author },
           signal,
         })
         return { ...pushed, ...await openChangesOf(service, pushed, signal) }

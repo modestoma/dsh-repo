@@ -186,12 +186,13 @@ export interface CommitTrailer {
 /**
  * Payload of the `repo/commit-trailers` event, dispatched with
  * `ctx.parallel` before `repo_workspace_push` records uncommitted changes
- * for an Agent's Session. Listeners call {@link add} before their returned
- * promise settles. Calls made after every listener has settled are ignored;
- * a call a listener makes after its own promise settled, while another
- * listener is still running, is still recorded. A listener that throws fails the
- * push with `unavailable` and nothing is committed. Every added trailer is
- * validated like {@link WorkspacePushOptions.trailers}.
+ * for an Agent's Session. Listeners call {@link add} and {@link setAuthor}
+ * before their returned promise settles. Calls made after every listener has
+ * settled are ignored; a call a listener makes after its own promise settled,
+ * while another listener is still running, is still recorded. A listener that
+ * throws fails the push with `unavailable` and nothing is committed. Every
+ * added trailer is validated like {@link WorkspacePushOptions.trailers}, the
+ * author like {@link WorkspacePushOptions.author}.
  */
 export interface CommitTrailersEvent {
   /** Session id of the Agent that called the tool. */
@@ -204,6 +205,23 @@ export interface CommitTrailersEvent {
    * @param value - one-line trailer value.
    */
   add(token: string, value: string): void
+  /**
+   * Make someone other than the committer the commit's author, e.g. the person
+   * who asked for the change; the committer stays the host token's account.
+   * More than one call during one push, from any listeners, fails the push
+   * with `invalid` and nothing is committed.
+   * @param name - author name: one line without `<` or `>`.
+   * @param email - author email: no `<`, `>`, or whitespace.
+   */
+  setAuthor(name: string, email: string): void
+}
+
+/** What the `repo/commit-trailers` listeners contributed to one push. */
+export interface CommitDetails {
+  /** Trailers in the order they were added. */
+  readonly trailers: readonly CommitTrailer[]
+  /** Author set by a listener; absent means the committer. */
+  readonly author?: CommitAuthor
 }
 
 /** Lifecycle state of an issue. */
@@ -585,11 +603,13 @@ export interface WorkspacePushOptions extends CallOptions {
   /** Message of the commit recording uncommitted changes; required when there are any. */
   readonly message?: string
   /**
-   * Author and committer of that commit. Default: the account that owns the
-   * host's token, read from the host's current-user API (on GitHub a missing
-   * public email becomes the account's noreply address); the machine's git
-   * identity for local addresses. A token that cannot read its own account
-   * fails the push with `forbidden` or `unauthenticated`.
+   * Author of that commit; default: its committer. The committer is always
+   * the account that owns the host's token, read from the host's
+   * current-user API (on GitHub a missing public email becomes the account's
+   * noreply address), so pushes still pass push rules that check the
+   * committer; for local addresses it is this author, or the machine's git
+   * identity without one. A token that cannot read its own account fails the
+   * push with `forbidden` or `unauthenticated`.
    */
   readonly author?: CommitAuthor
   /** Session that made the change, added to that commit's message as a `DSH-Session:` trailer. One line of at most 200 characters. */
@@ -607,6 +627,8 @@ export interface WorkspacePushResult {
   readonly commit: string
   /** Whether this push recorded uncommitted changes as a new commit. */
   readonly committed: boolean
+  /** Author of that new commit; absent when nothing was committed or a local address used the machine's git identity. */
+  readonly author?: CommitAuthor
   /** Whether this push created the remote branch. */
   readonly created: boolean
 }

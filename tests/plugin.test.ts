@@ -55,15 +55,31 @@ describe('plugin', () => {
   it('collects repo/commit-trailers from every listener, in order, and ignores late additions', async () => {
     let late: CommitTrailersEvent | undefined
     const { outcome, push, events, dir } = await pushWithListeners([
-      event => { expect(event).toMatchObject({ session: 's1', dir }); event.add('Feishu-User', '张三 <u_1>') },
+      event => { expect(event).toMatchObject({ session: 's1', dir }); event.add('Feishu-User', '张三 <u_1>'); event.setAuthor('张三', 'zhang@example.com') },
       async event => { late = event; event.add('Reviewed-By', 'bot') },
     ])
     await outcome
     late?.add('Late', 'x')
+    late?.setAuthor('Late', 'late@example.com')
     expect(events).toEqual([plugin.COMMIT_TRAILERS_EVENT])
     expect(push.mock.calls[0]?.[1]).toMatchObject({
-      session: 's1', trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }, { token: 'Reviewed-By', value: 'bot' }],
+      session: 's1', trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }, { token: 'Reviewed-By', value: 'bot' }], author: { name: '张三', email: 'zhang@example.com' },
     })
+  })
+
+  it('pushes with the committer as author when no listener sets one', async () => {
+    const { outcome, push } = await pushWithListeners([event => { event.add('A', 'b') }])
+    await outcome
+    expect(push.mock.calls[0]?.[1]).not.toHaveProperty('author')
+  })
+
+  it('fails the push without committing when listeners set more than one author', async () => {
+    const { outcome, push } = await pushWithListeners([
+      event => { event.setAuthor('张三', 'zhang@example.com') },
+      event => { event.setAuthor('李四', 'li@example.com') },
+    ])
+    await expect(outcome).rejects.toThrow(/\[invalid\] repo\/commit-trailers 监听者设置了 2 个提交作者.*张三 <zhang@example.com>、李四 <li@example.com>/)
+    expect(push).not.toHaveBeenCalled()
   })
 
   it('fails the push without committing when a trailer listener throws', async () => {

@@ -21,7 +21,7 @@ import { DSH_REPOS_SERVICE, RepoService } from './service.ts'
 import type { ProviderFactory } from './service.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
 import { createTools, toolOffered } from './tools.ts'
-import type { CommitTrailer, CommitTrailersEvent } from './contract.ts'
+import type { CommitAuthor, CommitDetails, CommitTrailer, CommitTrailersEvent } from './contract.ts'
 import { RepoError } from './errors.ts'
 
 export type * from './contract.ts'
@@ -49,20 +49,25 @@ export type { DirectoryPicker } from './settings/directory-picker.ts'
 export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes, settingsState } from './settings/routes.ts'
 export type { Declined, RepoTool, ToolAccess, ToolDeps } from './tools.ts'
 
-/** Cordis event other plugins listen to for extra trailers of a pushed commit; payload {@link CommitTrailersEvent}. */
+/** Cordis event other plugins listen to for extra trailers and the author of a pushed commit; payload {@link CommitTrailersEvent}. */
 export const COMMIT_TRAILERS_EVENT = 'repo/commit-trailers'
 
 /**
- * Collect the trailers the `repo/commit-trailers` listeners add.
+ * Collect the trailers and the author the `repo/commit-trailers` listeners add.
  * @param ctx - plugin context; without `parallel` there are no listeners.
  * @param request - Session and workspace of the push.
- * @returns the trailers in the order they were added.
- * @throws {RepoError} `unavailable` naming the listener failures.
+ * @returns the trailers in the order they were added, and the author when a listener set one.
+ * @throws {RepoError} `unavailable` naming the listener failures; `invalid` when more than one author was set.
  */
-async function collectTrailers(ctx: HostContext, request: { readonly session: string; readonly dir: string }): Promise<CommitTrailer[]> {
+async function collectDetails(ctx: HostContext, request: { readonly session: string; readonly dir: string }): Promise<CommitDetails> {
   const trailers: CommitTrailer[] = []
+  const authors: CommitAuthor[] = []
   let open = true
-  const event: CommitTrailersEvent = { ...request, add: (token, value) => { if (open) trailers.push({ token, value }) } }
+  const event: CommitTrailersEvent = {
+    ...request,
+    add: (token, value) => { if (open) trailers.push({ token, value }) },
+    setAuthor: (name, email) => { if (open) authors.push({ name, email }) },
+  }
   try {
     await ctx.parallel?.(COMMIT_TRAILERS_EVENT, event)
   } catch (error) {
@@ -71,7 +76,8 @@ async function collectTrailers(ctx: HostContext, request: { readonly session: st
   } finally {
     open = false
   }
-  return trailers
+  if (authors.length > 1) throw new RepoError('invalid', `${COMMIT_TRAILERS_EVENT} 监听者设置了 ${authors.length} 个提交作者，只能有一个，没有提交：${authors.map(author => `${author.name} <${author.email}>`).join('、')}`)
+  return { trailers, ...authors[0] === undefined ? {} : { author: authors[0] } }
 }
 
 /** Cordis plugin name. */
@@ -141,7 +147,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     settings: () => service.settings.tools,
     approval: () => ctx.get?.('approval') as HostApproval | undefined,
     workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
-    commitTrailers: request => collectTrailers(ctx, request),
+    commitDetails: request => collectDetails(ctx, request),
   })
   for (const { definition, access } of tools) {
     ctx.effect(() => ctx.tools.register(definition, { when: () => service.configured && toolOffered(access, service.settings.tools) }), `dsh-repo: ${definition.name}`)
