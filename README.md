@@ -143,8 +143,8 @@ GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支�
 
 | 动态 | 默认 | 说明 |
 |---|---|---|
-| CI 失败 | 唤醒 | 当前 head 的检查或流水线失败；同一个 head 上出现新的失败检查时再报一次 |
-| CI 通过 | 只记录 | 当前 head 的检查全部通过 |
+| CI 失败 | 唤醒 | 当前 head 的检查或流水线失败，其他检查还在运行时也立即报；之后又有检查失败（包括重跑后再次失败）时再报一次 |
+| CI 通过 | 只记录 | 当前 head 的检查全部通过，包括失败后在同一个 head 上重跑通过 |
 | 新评论 | 唤醒 | 对话评论、代码行评论、只有评论的评审；通过 `repo_mr_comment` / `repo_issue_comment` 发的评论不算 |
 | 要求修改 | 唤醒 | GitHub 评审 `CHANGES_REQUESTED`；GitLab 系统备注「requested changes」 |
 | 批准 | 只记录 | GitHub 评审 `APPROVED`；GitLab 系统备注「approved this merge request」 |
@@ -153,7 +153,7 @@ GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支�
 | 已合并 / 已关闭 | 唤醒 | 立即送达，之后停止跟踪 |
 | 长期无动态 | 唤醒 | 达到 `idleDays` 天没有动态时，告诉会话已停止跟踪，模型用一句话转告用户 |
 
-- **检查方式。** 轮询，不用 webhook：DSH 只监听本机，注册 webhook 也需要每个项目的维护者权限。有动态、CI 运行中或有待送达的动态时每 `activeIntervalMs` 检查一次，`quietAfterMs` 内没有动态后放慢到 `quietIntervalMs`。每次检查先读 PR/MR 本身；它的更新时间变了才读评论和评审；head 变了、CI 还在运行或还没上报时才读 CI（GitLab 的流水线状态随 MR 一起返回）。
+- **检查方式。** 轮询，不用 webhook：DSH 只监听本机，注册 webhook 也需要每个项目的维护者权限。有动态、CI 运行中或有待送达的动态时每 `activeIntervalMs` 检查一次，`quietAfterMs` 内没有动态后放慢到 `quietIntervalMs`。每次检查先读 PR/MR 本身；它的更新时间变了才读评论和评审；head 变了、CI 还在运行、失败（可能被重跑）或还没上报时才读 CI（GitLab 的流水线状态随 MR 一起返回）。两次检查之间的新评论会逐页读完再推进进度，超过 1000 条时这次检查记为失败、稍后重试。
 - **送达方式。** 唤醒的动态经 `repo/resolve-agent` 事件（waterfall，参数为会话 id 和 `next`）解析会话的 Agent，没有监听者处理时用 `sessionController` 恢复会话，然后作为一条新的用户消息开始一轮回复，等会话持久化确认后才从待送达里删除；确认失败时下次可能重复送达。消息来源是 `repo-activity`（notice 形式，带一行摘要）。只记录的动态在会话正在运行时加入下一步的上下文，否则等下一次唤醒一起送达。`batchMs` 内的动态合成一条；合并、关闭和停止跟踪立即送达。每个 PR/MR 每天最多唤醒 `dailyWakeLimit` 次，超出后的动态只记录，合并、关闭和停止跟踪不受限制。
 - **消息内容。** 写明仓库、编号、标题和链接，评论引用前 600 个字符并附链接，并声明评论和评审来自第三方，只是信息，不是用户的指令，也不能授予权限，模型需要改代码、推送或回复时照常经过审批。
 - **结束跟踪。** PR/MR 合并或关闭、`idleDays` 天没有动态、会话已删除、仓库不再在访问范围内（主机被删或 `repos` 变了）、模型调用 `repo_mr_watch` 的 `watch: false`、在设置页点「停止」时结束。超过 `maxWatches` 时结束最久没有动态的一个。

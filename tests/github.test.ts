@@ -240,4 +240,20 @@ describe('GitHub token account', () => {
     updated = '2026-11-01T02:00:00Z'
     expect((await service.changeActivity(REPO, 5, { updatedAt: '2026-11-01T01:00:00Z', withStatus: false, since: '2026-11-01T00:50:00Z' })).items?.map(item => item.id)).toEqual(['line-9'])
   })
+  it('reads every page of new comments before reporting them', async () => {
+    const page = (start: number, count: number) => Array.from({ length: count }, (_, index) => ({
+      id: start + index, user: { login: 'alice' }, body: `c${start + index}`, created_at: '2026-11-01T00:40:00Z', html_url: `c${start + index}`,
+    }))
+    fakeHttp([
+      { method: 'GET', path: `${API}/pulls/5`, reply: { body: {
+        number: 5, title: 'Fix', body: null, state: 'open', merged_at: null, mergeable_state: 'clean', head: { ref: 'fix', sha: SHA }, base: { ref: 'main' },
+        user: author, labels: [], assignees: [], created_at: '2026-11-01T00:00:00Z', updated_at: '2026-11-01T01:00:00Z', html_url: `${REPO}/pull/5`,
+      } } },
+      { method: 'GET', path: `${API}/issues/5/comments`, reply: request => ({ body: request.url.searchParams.get('page') === '2' ? page(101, 20) : page(1, 100) }) },
+      { method: 'GET', path: `${API}/pulls/5/comments`, reply: { body: [] } },
+      { method: 'GET', path: `${API}/pulls/5/reviews`, reply: { body: [] } },
+    ])
+    const polled = await createService(testConfig(), TOKENS).changeActivity(REPO, 5, { withStatus: false, since: '2026-11-01T00:30:00Z' })
+    expect(polled.items).toHaveLength(120)
+  })
 })

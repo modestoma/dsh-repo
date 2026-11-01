@@ -355,8 +355,8 @@ export class GithubProvider implements Provider {
 
   private async activitySince(repo: { owner: string; repo: string }, number: number, since: string, signal: AbortSignal): Promise<ActivityItem[]> {
     const [comments, lineComments, reviews] = await Promise.all([
-      this.octokit.rest.issues.listComments({ ...repo, issue_number: number, since, per_page: PAGE, request: { signal } }).then(response => response.data),
-      this.octokit.rest.pulls.listReviewComments({ ...repo, pull_number: number, since, sort: 'created', direction: 'asc', per_page: PAGE, request: { signal } }).then(response => response.data),
+      this.allPages(page => this.octokit.rest.issues.listComments({ ...repo, issue_number: number, since, per_page: PAGE, page, request: { signal } }).then(response => response.data), '新评论'),
+      this.allPages(page => this.octokit.rest.pulls.listReviewComments({ ...repo, pull_number: number, since, sort: 'created', direction: 'asc', per_page: PAGE, page, request: { signal } }).then(response => response.data), '新行内评论'),
       this.allPages(page => this.octokit.rest.pulls.listReviews({ ...repo, pull_number: number, per_page: PAGE, page, request: { signal } }).then(response => response.data), '评审'),
     ])
     const items: ActivityItem[] = [

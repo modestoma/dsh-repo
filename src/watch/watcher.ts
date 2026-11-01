@@ -25,7 +25,7 @@ import type { WatchSettings } from '../config.ts'
 import type { HostLogger } from '../host.ts'
 import type { ActivityRequest, ChangeActivity } from '../providers/types.ts'
 import type { WatchAction, WatchEventKind, WatchInfo } from '../settings/contract.ts'
-import { detect, FINAL_EVENTS, freshCursor, MAX_OWN_COMMENTS, MAX_OWN_HEADS, MAX_PENDING, renderMessage, watchId } from './activity.ts'
+import { detect, freshCursor, MAX_OWN_COMMENTS, MAX_OWN_HEADS, MAX_PENDING, renderMessage, watchId } from './activity.ts'
 import type { WatchEvent, WatchRecord, WatchSource } from './activity.ts'
 import type { WatchDelivery } from './delivery.ts'
 import type { WatchStore } from './store.ts'
@@ -333,7 +333,9 @@ export class ChangeWatcher {
       return
     }
     const { cursor, events, touched } = detect(record, activity, iso)
-    const ending = events.some(event => FINAL_EVENTS.has(event.kind))
+    // From the stored state, not only this poll: a final notice whose delivery
+    // failed, or was interrupted by a restart, still ends the watch on retry.
+    const ending = cursor.state !== 'open'
     const kept = events.filter(event => this.action(event.kind) !== 'off')
     const updated = await this.merge(id, current => ({
       ...current,
@@ -349,10 +351,10 @@ export class ChangeWatcher {
     await this.flush(updated, ending)
   }
 
-  /** CI is read while it may change: the head moved recently, CI runs, or it was never read. */
+  /** CI is read while it may change: the head moved recently, CI runs or failed (and may be rerun), or it was never read. */
   private needsStatus(record: WatchRecord, now: number): boolean {
     const cursor = record.cursor
-    if (cursor === undefined || cursor.checks === 'pending' || cursor.checks === 'unknown') return true
+    if (cursor === undefined || cursor.checks === 'pending' || cursor.checks === 'failure' || cursor.checks === 'unknown') return true
     return cursor.checks === 'none' && now - Date.parse(cursor.headMovedAt) < CHECKS_GRACE_MS
   }
 

@@ -191,4 +191,19 @@ describe('GitLab token account', () => {
     expect((await service.changeActivity(REPO, 7, { updatedAt: '2026-11-01T01:00:00.000Z', withStatus: false, since: '2026-11-01T00:55:00.000Z' })).items).toBeUndefined()
     expect(requests).toHaveLength(1)
   })
+  it('reads older pages of notes until one predates the cursor', async () => {
+    const notes = (start: number, count: number, createdAt: string) => Array.from({ length: count }, (_, index) => ({
+      id: start - index, body: `n${start - index}`, author: { username: 'alice' }, created_at: createdAt,
+    }))
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/merge_requests/7`, reply: { body: mr({ updated_at: '2026-11-01T01:00:00.000Z' }) } },
+      { method: 'GET', path: `${API}/merge_requests/7/notes`, reply: request => ({ body: request.url.searchParams.get('page') === '2'
+        ? [...notes(400, 10, '2026-11-01T00:40:00.000Z'), ...notes(300, 5, '2026-11-01T00:10:00.000Z')]
+        : notes(500, 100, '2026-11-01T00:50:00.000Z') }) },
+    ])
+    const polled = await createService(testConfig(), TOKENS).changeActivity(REPO, 7, { withStatus: false, since: '2026-11-01T00:30:00.000Z' })
+    expect(polled.items).toHaveLength(110)
+    expect(polled.items?.[0]?.id).toBe('391')
+    expect(requests.filter(request => request.url.pathname.endsWith('/notes'))).toHaveLength(2)
+  })
 })

@@ -65,6 +65,28 @@ describe('detect', () => {
     expect(detect(record(), activity({ status: status('success') }), now).events.map(event => event.kind)).toEqual(['ciPassed'])
   })
 
+  it('keeps reading CI while checks still run after one failed, and reports a same-head rerun', () => {
+    const running = (failed: string[], pending: string[], passed: string[] = []): ChangeStatus => ({
+      headSha: SHA,
+      overall: failed.length > 0 ? 'failure' : pending.length > 0 ? 'pending' : 'success',
+      checks: [
+        ...failed.map(name => ({ name, state: 'failure' as const })),
+        ...pending.map(name => ({ name, state: 'pending' as const })),
+        ...passed.map(name => ({ name, state: 'success' as const })),
+      ],
+    })
+    const first = detect(record(), activity({ status: running(['build'], ['lint']) }), now)
+    expect(first.events).toEqual([{ kind: 'ciFailed', at: now, sha: SHA, checks: ['build'] }])
+    expect(first.cursor).toMatchObject({ checks: 'pending', failing: ['build'] })
+    const second = detect(record({ cursor: first.cursor }), activity({ status: running(['build', 'lint'], []) }), now)
+    expect(second.events.map(event => event.checks)).toEqual([['build', 'lint']])
+    expect(second.cursor.checks).toBe('failure')
+    const rerun = detect(record({ cursor: second.cursor }), activity({ status: running(['lint'], ['build']) }), now)
+    expect(rerun.events).toEqual([])
+    const fixed = detect(record({ cursor: rerun.cursor }), activity({ status: running([], [], ['build', 'lint']) }), now)
+    expect(fixed.events.map(event => event.kind)).toEqual(['ciPassed'])
+  })
+
   it('tells pushes by others from pushes through the tools, and waits for CI of the new head', () => {
     const theirs = detect(record(), activity({ change: { headSha: OTHER } }), now)
     expect(theirs.events).toEqual([{ kind: 'pushed', at: now, sha: OTHER }])
@@ -206,6 +228,37 @@ describe('ChangeWatcher', () => {
     expect(h.deliveries[0]!.text).toContain('已合并，已停止跟踪')
     expect(h.watcher.list()).toEqual([])
     expect(JSON.parse(readFileSync(h.file, 'utf8'))).toEqual({ watches: [] })
+    await h.watcher.stop()
+  })
+
+  it('still ends the watch when the merge notice is delivered on a retry', async () => {
+    const h = harness()
+    h.watcher.start()
+    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    vi.mocked(h.delivery.deliver).mockRejectedValueOnce(new Error('session store busy'))
+    h.setPoll(activity({ change: { state: 'merged' } }))
+    await h.advance(60_000)
+    expect(h.deliveries).toEqual([])
+    expect(h.watcher.list()[0]?.pending).toBe(1)
+    await h.advance(600_000)
+    expect(h.deliveries).toHaveLength(1)
+    expect(h.deliveries[0]!.text).toContain('已合并，已停止跟踪')
+    expect(h.watcher.list()).toEqual([])
+    await h.watcher.stop()
+  })
+
+  it('reads CI again on later polls after a failure, so a rerun on the same head is seen', async () => {
+    const h = harness({ batchMs: 0 })
+    h.watcher.start()
+    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    h.setPoll(activity({ status: status('failure', ['build']) }))
+    await h.advance(60_000)
+    const failedAt = h.changeActivity.mock.calls.length
+    h.setPoll(activity({ status: status('success') }))
+    await h.advance(600_000)
+    const requests = h.changeActivity.mock.calls.slice(failedAt) as unknown as Array<[string, number, { withStatus: boolean }]>
+    expect(requests[0]?.[2].withStatus).toBe(true)
+    expect(h.deliveries.map(delivery => delivery.text.includes('CI 通过'))).toEqual([false, true])
     await h.watcher.stop()
   })
 

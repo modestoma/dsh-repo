@@ -17,6 +17,8 @@ import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Paging, Provi
 
 /** GitLab's maximum page size. */
 const MAX_PAGE = 100
+/** Pages of notes read for one watch poll. */
+const MAX_NOTE_PAGES = 10
 
 /** Prefix GitLab uses to mark a draft merge request in its title. */
 const DRAFT_PREFIX = 'Draft: '
@@ -357,7 +359,7 @@ export class GitlabProvider implements Provider {
     let items: ActivityItem[] | undefined
     if (request.updatedAt !== change.updatedAt) {
       call.signal.throwIfAborted()
-      const notes: readonly GitlabNote[] = await this.api.MergeRequestNotes.all(ref.path, number, { sort: 'desc', orderBy: 'created_at', perPage: MAX_PAGE, maxPages: 1 })
+      const notes = await this.notesSince(ref.path, number, request.since, call.signal)
       items = notes.filter(entry => entry.created_at >= request.since).reverse().flatMap((entry): ActivityItem[] => {
         const kind = noteKind(entry)
         if (kind === undefined) return []
@@ -366,6 +368,21 @@ export class GitlabProvider implements Provider {
       })
     }
     return { change, conflict: data.has_conflicts === true, status: statusOf(data), ...items === undefined ? {} : { items } }
+  }
+
+  /**
+   * Notes newest first, page by page until one predates `since`.
+   * @throws RepoError `too-large` beyond {@link MAX_NOTE_PAGES} pages, so a cursor never skips unread notes.
+   */
+  private async notesSince(project: string, number: number, since: string, signal: AbortSignal): Promise<GitlabNote[]> {
+    const notes: GitlabNote[] = []
+    for (let page = 1; page <= MAX_NOTE_PAGES; page += 1) {
+      signal.throwIfAborted()
+      const batch: readonly GitlabNote[] = await this.api.MergeRequestNotes.all(project, number, { sort: 'desc', orderBy: 'created_at', perPage: MAX_PAGE, page })
+      notes.push(...batch)
+      if (batch.length < MAX_PAGE || (batch.at(-1)?.created_at ?? '') < since) return notes
+    }
+    throw new RepoError('too-large', `新评论超过 ${MAX_NOTE_PAGES * MAX_PAGE} 条，无法完整读取`)
   }
 
   async createChange(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; deleteSourceBranch: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {

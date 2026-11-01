@@ -6,7 +6,7 @@
  * @module dsh-repo/watch/activity
  */
 
-import type { ChangeInfo, ChangeState, CheckState, ForgeKind } from '../contract.ts'
+import type { ChangeInfo, ChangeState, ChangeStatus, CheckState, ForgeKind } from '../contract.ts'
 import type { ChangeActivity } from '../providers/types.ts'
 import type { WatchEventKind } from '../settings/contract.ts'
 
@@ -147,7 +147,7 @@ export function detect(record: WatchRecord, activity: ChangeActivity, now: strin
         headSha: change.headSha,
         headMovedAt: now,
         updatedAt: change.updatedAt,
-        checks: activity.status?.headSha === change.headSha ? activity.status.overall : 'unknown',
+        checks: activity.status?.headSha === change.headSha ? settledChecks(activity.status) : 'unknown',
         failing: activity.status?.headSha === change.headSha ? activity.status.checks.filter(check => check.state === 'failure').map(check => check.name) : [],
         conflict: activity.conflict,
         since: latest,
@@ -165,11 +165,11 @@ export function detect(record: WatchRecord, activity: ChangeActivity, now: strin
   const status = activity.status
   if (status !== undefined && status.headSha === change.headSha) {
     const failed = status.checks.filter(check => check.state === 'failure').map(check => check.name)
-    if (status.overall === 'failure' && (checks !== 'failure' || failed.some(name => !failing.includes(name)))) {
-      events.push({ kind: 'ciFailed', at: now, sha: change.headSha, checks: failed })
-    }
-    if (status.overall === 'success' && checks !== 'success' && checks !== 'unknown') events.push({ kind: 'ciPassed', at: now, sha: change.headSha })
-    checks = status.overall
+    // A check is reported once per failure; a rerun that fails again is new.
+    if (failed.some(name => !failing.includes(name))) events.push({ kind: 'ciFailed', at: now, sha: change.headSha, checks: failed })
+    const next = settledChecks(status)
+    if (next === 'success' && checks !== 'success' && checks !== 'unknown') events.push({ kind: 'ciPassed', at: now, sha: change.headSha })
+    checks = next
     failing = failed
   }
   if (activity.conflict && !previous.conflict) events.push({ kind: 'conflict', at: now })
@@ -210,6 +210,14 @@ export function detect(record: WatchRecord, activity: ChangeActivity, now: strin
     seen,
   }
   return { cursor, events, touched: moved || events.length > 0 || (activity.items !== undefined && change.updatedAt !== previous.updatedAt) }
+}
+
+/**
+ * CI of a head as the cursor keeps it: `pending` while any check still runs,
+ * even when another already failed, so later results are still read.
+ */
+function settledChecks(status: ChangeStatus): CheckState {
+  return status.checks.some(check => check.state === 'pending') ? 'pending' : status.overall
 }
 
 /** The label of a PR/MR: `PR #12` on GitHub, `MR !12` on GitLab. */
