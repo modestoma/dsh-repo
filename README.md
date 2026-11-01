@@ -120,13 +120,15 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 设置页「合并后删除源分支」（`tools.deleteSourceBranch`，默认开）打开时：
 
 - `repo_mr_create` 在 GitLab 上创建的 MR 勾选「合并后删除源分支」，之后不论在网页上还是用工具合并，GitLab 都会删除源分支。GitHub 的 PR 没有对应选项，网页合并后的分支由仓库设置「Automatically delete head branches」或下面的 `repo_branch_delete` 清理。
-- `repo_mr_merge` 合并后删除源分支：GitHub 在合并成功后删除，GitLab 在合并请求里带上 `should_remove_source_branch`。来自 fork 的分支和默认分支不删，GitLab 也不会删受保护分支。删除失败不影响合并结果，结果的 `sourceBranch` 写明分支名、是否删除和没删的原因；GitHub 仓库已经自动删除了这个分支时按已删除报告。
+- `repo_mr_merge` 合并后删除源分支：GitHub 在合并成功后删除，GitLab 在合并请求里带上 `should_remove_source_branch`。来自 fork 的分支、默认分支和受保护分支不删（GitHub 的保护规则即使允许删除也不删）；GitHub 上分支在合并后又有了新提交时也不删。删除失败不影响合并结果，结果的 `sourceBranch` 写明分支名、是否删除和没删的原因；GitHub 仓库已经自动删除了这个分支时按已删除报告。
 
 `repo_branch_delete` 不受这个开关控制，跟随写操作审批，用来清理已经留下来的分支。它只删除同时满足以下条件的分支，其余情况拒绝，所以不会丢掉没合入的工作：
 
 - 分支的最新提交是本仓库某个已合并 PR/MR 的 head 提交，即合并之后没有再推送新提交；否则以 `conflict` 拒绝。
 - 没有从它发起、仍打开中的 PR/MR；否则以 `conflict` 拒绝。
 - 不是默认分支，也不是受保护分支；否则以 `forbidden` 拒绝。
+
+GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支的最新提交在列出 PR/MR 之后、紧挨着删除时读取；这一次读取和删除之间如果恰好有人推送，新提交仍可能随分支一起删除。
 
 ## `dshRepos` 服务
 

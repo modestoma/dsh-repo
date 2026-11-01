@@ -321,11 +321,12 @@ export class RepoService implements DshRepoService {
   async deleteMergedBranch(repo: RepoTarget, branch: string, options: CallOptions = {}): Promise<MergedBranchDeletion> {
     requireBranch(branch, '分支名')
     return await this.run(repo, options, `删除分支 ${branch}`, async (provider, ref, call) => {
+      // The hosts' branch deletion takes no expected commit, so the head is read last, right before the deletion, to keep the window for a concurrent push small.
+      const changes = await allChangesFrom(provider, ref, branch, call)
       const head = await provider.getBranch(ref, branch, call)
       if (head === undefined) throw new RepoError('not-found', `没有分支 ${branch}`)
       if (head.default) throw new RepoError('forbidden', `${branch} 是默认分支，不能删除`)
       if (head.protected) throw new RepoError('forbidden', `${branch} 是受保护分支，不能删除`)
-      const changes = await allChangesFrom(provider, ref, branch, call)
       const open = changes.find(change => change.state === 'open')
       if (open !== undefined) throw new RepoError('conflict', `${branch} 还是打开中的 PR/MR #${open.number} 的源分支，不能删除`)
       const merged = changes.find(change => change.state === 'merged' && change.headSha === head.commit)

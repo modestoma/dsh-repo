@@ -427,6 +427,11 @@ export class GithubProvider implements Provider {
       name = data.head.ref
       if (data.head.repo?.id !== data.base.repo.id) return { name, deleted: false, reason: '源分支在 fork 仓库里，不删除' }
       if (name === data.base.repo.default_branch) return { name, deleted: false, reason: '源分支是默认分支，不删除' }
+      // A protection rule may allow deletion, so protection is checked here rather than left to the host.
+      const branch = await this.getBranch(ref, name, call)
+      if (branch === undefined) return { name, deleted: true }
+      if (branch.protected) return { name, deleted: false, reason: '源分支是受保护分支，不删除' }
+      if (branch.commit !== data.head.sha) return { name, deleted: false, reason: '源分支在合并后有了新提交，不删除' }
       await this.deleteBranch(ref, name, call)
       return { name, deleted: true }
     } catch (error) {

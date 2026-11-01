@@ -80,29 +80,40 @@ describe('GitHub provider', () => {
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, merge_method: 'squash' })
   })
 
-  it('deletes the head branch after a merge, keeping a fork\'s branch and treating an auto-deleted branch as deleted', async () => {
+  it('deletes the head branch after a merge, keeping fork, default, protected, and moved branches', async () => {
     const merged = (headRepo: number | null, ref = 'f') => ({ number: 5, head: { ref, sha: SHA, repo: headRepo === null ? null : { id: headRepo } }, base: { ref: 'main', repo: { id: 1, default_branch: 'main' } } })
     let pull = merged(1)
+    let branch: { status: number; body: unknown } = { status: 200, body: { name: 'f', protected: false, commit: { sha: SHA } } }
     let deleteReply: { status: number; body: unknown } = { status: 204, body: undefined }
     const { requests } = fakeHttp([
+      { method: 'GET', path: API, reply: { body: repoBody } },
       { method: 'PUT', path: `${API}/pulls/5/merge`, reply: { body: { sha: 'm1', merged: true } } },
       { method: 'GET', path: `${API}/pulls/5`, reply: () => ({ body: pull }) },
+      { method: 'GET', path: `${API}/branches/f`, reply: () => branch },
       { method: 'DELETE', path: new RegExp(`${API}/git/refs/heads(/|%2F)f$`), reply: () => deleteReply },
     ])
     const service = createService(testConfig(), TOKENS)
+    const deletes = () => requests.filter(request => request.method === 'DELETE').length
     expect(await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: true } })
-    expect(requests.filter(request => request.method === 'DELETE')).toHaveLength(1)
+    expect(deletes()).toBe(1)
     deleteReply = { status: 422, body: { message: 'Reference does not exist' } }
     expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
-    deleteReply = { status: 422, body: { message: 'Cannot delete protected branch' } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'f', deleted: false, reason: expect.stringContaining('protected') })
+    deleteReply = { status: 403, body: { message: 'Resource not accessible by integration' } }
+    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'f', deleted: false, reason: expect.stringContaining('not accessible') })
+    const attempted = deletes()
+
+    branch = { status: 200, body: { name: 'f', protected: true, commit: { sha: SHA } } }
+    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('受保护') })
+    branch = { status: 200, body: { name: 'f', protected: false, commit: { sha: 'c'.repeat(40) } } }
+    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('新提交') })
+    branch = { status: 404, body: { message: 'Branch not found' } }
+    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
     pull = merged(2)
     expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('fork') })
     pull = merged(1, 'main')
     expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'main', deleted: false })
-    const deletes = requests.filter(request => request.method === 'DELETE').length
     expect(await service.mergeChange(REPO, 5, { headSha: SHA })).toEqual({ sha: 'm1' })
-    expect(requests.filter(request => request.method === 'DELETE')).toHaveLength(deletes)
+    expect(deletes()).toBe(attempted)
   })
 
   it('deletes a branch only when its head was merged through a PR and no PR from it is open', async () => {
