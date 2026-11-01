@@ -21,6 +21,8 @@ import { DSH_REPOS_SERVICE, RepoService } from './service.ts'
 import type { ProviderFactory } from './service.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
 import { createTools } from './tools.ts'
+import type { CommitTrailer, CommitTrailersEvent } from './contract.ts'
+import { RepoError } from './errors.ts'
 
 export type * from './contract.ts'
 export type { HostSpec, RepoConfig, RepoLimits } from './config.ts'
@@ -45,6 +47,31 @@ export { hostDirectoryPicker } from './settings/directory-picker.ts'
 export type { DirectoryPicker } from './settings/directory-picker.ts'
 export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes, settingsState } from './settings/routes.ts'
 export type { Declined, ToolDeps } from './tools.ts'
+
+/** Cordis event other plugins listen to for extra trailers of a pushed commit; payload {@link CommitTrailersEvent}. */
+export const COMMIT_TRAILERS_EVENT = 'repo/commit-trailers'
+
+/**
+ * Collect the trailers the `repo/commit-trailers` listeners add.
+ * @param ctx - plugin context; without `parallel` there are no listeners.
+ * @param request - Session and workspace of the push.
+ * @returns the trailers in the order they were added.
+ * @throws {RepoError} `unavailable` naming the listener failures.
+ */
+async function collectTrailers(ctx: HostContext, request: { readonly session: string; readonly dir: string }): Promise<CommitTrailer[]> {
+  const trailers: CommitTrailer[] = []
+  let open = true
+  const event: CommitTrailersEvent = { ...request, add: (token, value) => { if (open) trailers.push({ token, value }) } }
+  try {
+    await ctx.parallel?.(COMMIT_TRAILERS_EVENT, event)
+  } catch (error) {
+    const reasons = error instanceof AggregateError ? error.errors : [error]
+    throw new RepoError('unavailable', `${COMMIT_TRAILERS_EVENT} 监听者出错，没有提交：${reasons.map(reason => reason instanceof Error ? reason.message : String(reason)).join('；')}`)
+  } finally {
+    open = false
+  }
+  return trailers
+}
 
 /** Cordis plugin name. */
 export const name = 'dsh-repo'
@@ -105,6 +132,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     config: resolved,
     approval: () => ctx.get?.('approval') as HostApproval | undefined,
     workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
+    commitTrailers: request => collectTrailers(ctx, request),
   })
   for (const definition of tools) {
     ctx.effect(() => ctx.tools.register(definition, { when: () => service.configured }), `dsh-repo: ${definition.name}`)

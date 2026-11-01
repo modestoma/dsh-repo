@@ -210,10 +210,23 @@ describe('workspaces', () => {
     await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('令牌账号') })
     expect(await service.workspaceChanges(dir)).toMatchObject({ uncommitted: true, commits: [] })
 
-    const pushed = await service.pushWorkspace(dir, { branch: 'fix/a', message: 'fix: a\n\nWhy.', session: 'sess-1' })
+    for (const [trailer, reason] of [
+      [{ token: 'Feishu User', value: 'x' }, '尾注名'],
+      [{ token: 'dsh-session', value: 'x' }, 'DSH-Session'],
+      [{ token: 'Feishu-User', value: 'a\nb' }, '控制字符'],
+      [{ token: 'Feishu-User', value: '  ' }, '不能为空'],
+    ] as const) {
+      await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', trailers: [trailer] })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining(reason) })
+    }
+    const many = Array.from({ length: 21 }, (_, index) => ({ token: `T${index}`, value: 'x' }))
+    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', trailers: many })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('最多 20 条') })
+
+    const pushed = await service.pushWorkspace(dir, {
+      branch: 'fix/a', message: 'fix: a\n\nWhy.', session: 'sess-1', trailers: [{ token: 'Feishu-User', value: ' 张三 <u_1> ' }],
+    })
     expect(requests[1]?.headers.get('authorization')).toBe('token gh-token')
     expect(git(bare, 'log', '-1', '--format=%an <%ae>|%cn <%ce>', 'fix/a')).toBe('shared-bot <42+shared-bot@users.noreply.github.com>|shared-bot <42+shared-bot@users.noreply.github.com>')
-    expect(git(bare, 'log', '-1', '--format=%B', 'fix/a')).toBe('fix: a\n\nWhy.\n\nDSH-Session: sess-1')
+    expect(git(bare, 'log', '-1', '--format=%B', 'fix/a')).toBe('fix: a\n\nWhy.\n\nDSH-Session: sess-1\nFeishu-User: 张三 <u_1>')
     expect(git(bare, 'rev-parse', 'fix/a^')).toBe(commit)
 
     writeFileSync(join(dir, 'more.ts'), 'export {}\n')

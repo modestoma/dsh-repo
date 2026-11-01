@@ -6,6 +6,7 @@ import type { DshRepoService } from '../src/contract.ts'
 import type { HostApproval, ToolDefinition, WorkingDirectoryService } from '../src/host.ts'
 import { RepoError } from '../src/errors.ts'
 import { createTools } from '../src/tools.ts'
+import type { ToolDeps } from '../src/tools.ts'
 import { testConfig } from './helpers.ts'
 
 const agent = { id: 'agent-1' }
@@ -17,8 +18,13 @@ function fakeService(overrides: Record<string, unknown> = {}): DshRepoService {
   return new Proxy({} as DshRepoService, { get: (_target, key) => overrides[String(key)] ?? notUsed })
 }
 
-function tools(config = testConfig(), service = fakeService(), approval?: HostApproval, workingDirectory?: WorkingDirectoryService): Map<string, ToolDefinition> {
-  return new Map(createTools({ service, config, approval: () => approval, workingDirectory: () => workingDirectory }).map(tool => [tool.name, tool]))
+function tools(
+  config = testConfig(), service = fakeService(), approval?: HostApproval, workingDirectory?: WorkingDirectoryService,
+  commitTrailers?: ToolDeps['commitTrailers'],
+): Map<string, ToolDefinition> {
+  return new Map(createTools({
+    service, config, approval: () => approval, workingDirectory: () => workingDirectory, ...commitTrailers === undefined ? {} : { commitTrailers },
+  }).map(tool => [tool.name, tool]))
 }
 
 /** A Session rooted at a fresh directory whose effective directory starts at `sub`. */
@@ -149,5 +155,32 @@ describe('createTools', () => {
     expect(reason).toContain('logo.png（二进制）')
     expect(pushWorkspace).toHaveBeenCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: a\n\nbody', session: 'session-1', signal: run.signal })
     await expect(all.get('repo_workspace_changes')!.execute({ dir: tmpdir() }, run)).rejects.toThrow(/^\[not-found\]/)
+  })
+
+  it('adds the trailers other plugins contribute for the calling Session to the push', async () => {
+    const { root, workingDirectory, exec: run } = session('ws')
+    checkout(join(root, 'ws'))
+    const changes = {
+      workspace: { url: 'https://github.com/a/b.git', dir: join(root, 'ws'), baseBranch: 'main', baseCommit: 'c'.repeat(40) },
+      commits: [], uncommitted: true, diff: '', truncated: false, files: [],
+    }
+    const pushWorkspace = vi.fn(async () => ({ branch: 'fix/a' }))
+    const service = fakeService({ workspaceChanges: async () => changes, pushWorkspace })
+    const request = async () => 'allowed-once' as const
+    const commitTrailers = vi.fn(async () => [{ token: 'Feishu-User', value: '张三 <u_1>' }])
+    const push = tools(testConfig(), service, { request }, workingDirectory, commitTrailers).get('repo_workspace_push')!
+    await push.execute({ branch: 'fix/a', message: 'fix: a' }, run)
+    expect(commitTrailers).toHaveBeenCalledWith({ session: 'session-1', dir: join(root, 'ws') })
+    expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), {
+      branch: 'fix/a', message: 'fix: a', session: 'session-1', trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }], signal: run.signal,
+    })
+
+    // No Session, no event; no trailers, no option.
+    await push.execute({ dir: join(root, 'ws'), branch: 'fix/a', message: 'fix: b' }, { ...run, agent: { id: 'agent-1' } })
+    expect(commitTrailers).toHaveBeenCalledTimes(1)
+    expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: b', signal: run.signal })
+    commitTrailers.mockResolvedValueOnce([])
+    await push.execute({ branch: 'fix/a', message: 'fix: c' }, run)
+    expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: c', session: 'session-1', signal: run.signal })
   })
 })

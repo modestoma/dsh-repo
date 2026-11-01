@@ -147,6 +147,11 @@ export interface HostContext {
   get?(name: string): unknown
   provide?(name: string, value: unknown): void
   effect(callback: () => (() => void) | void, label?: string): () => unknown
+  /**
+   * Run every listener of a Cordis event concurrently and wait for all of
+   * them; rejects with an `AggregateError` of the listeners that threw.
+   */
+  parallel?(name: string, ...args: unknown[]): Promise<void>
   /** Run `callback` with a context that has every named service, again whenever they are replaced. */
   inject?(dependencies: string[], callback: (child: HostContext) => void): unknown
 }

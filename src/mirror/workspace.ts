@@ -23,7 +23,7 @@
 import { randomBytes } from 'node:crypto'
 import { lstat, mkdir, readFile, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
-import type { CommitAuthor, WorkspaceChanges, WorkspaceFileChange, WorkspaceInfo, WorkspacePushResult } from '../contract.ts'
+import type { CommitAuthor, CommitTrailer, WorkspaceChanges, WorkspaceFileChange, WorkspaceInfo, WorkspacePushResult } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { GitError } from './git.ts'
 import type { GitRunner } from './git.ts'
@@ -65,6 +65,8 @@ export interface PushRequest {
   readonly author?: CommitAuthor
   /** Session recorded as the commit's `DSH-Session:` trailer. */
   readonly session?: string
+  /** Validated trailers recorded after `DSH-Session:`. */
+  readonly trailers?: readonly CommitTrailer[]
   /** Credentials of the network commands. */
   readonly env: Readonly<Record<string, string>>
   readonly signal?: AbortSignal
@@ -272,7 +274,10 @@ export class WorkspaceStore {
       if (pending !== '') {
         if (request.message === undefined || request.message.trim() === '') throw new RepoError('invalid', '工作区有未提交的改动，推送时要给出提交说明')
         const identity = request.author === undefined ? [] : ['-c', `user.name=${request.author.name}`, '-c', `user.email=${request.author.email}`]
-        const trailers = request.session === undefined ? [] : ['--trailer', `DSH-Session: ${request.session}`]
+        const trailers = [
+          ...request.session === undefined ? [] : [`DSH-Session: ${request.session}`],
+          ...(request.trailers ?? []).map(trailer => `${trailer.token}: ${trailer.value}`),
+        ].flatMap(line => ['--trailer', line])
         await this.workspaceGit(ws, [...identity, 'commit', '--quiet', '--no-verify', '-m', request.message, ...trailers], {}, request.signal)
         committed = true
       }

@@ -172,6 +172,40 @@ export interface CommitAuthor {
   readonly email: string
 }
 
+/**
+ * One extra `Token: value` line at the end of a commit message. The token is
+ * an ASCII letter followed by up to 63 letters, digits, or `-`, and is not
+ * `DSH-Session` (any case); the value is one line of 1 to 200 characters
+ * without control characters.
+ */
+export interface CommitTrailer {
+  readonly token: string
+  readonly value: string
+}
+
+/**
+ * Payload of the `repo/commit-trailers` event, dispatched with
+ * `ctx.parallel` before `repo_workspace_push` records uncommitted changes
+ * for an Agent's Session. Listeners call {@link add} before their returned
+ * promise settles. Calls made after every listener has settled are ignored;
+ * a call a listener makes after its own promise settled, while another
+ * listener is still running, is still recorded. A listener that throws fails the
+ * push with `unavailable` and nothing is committed. Every added trailer is
+ * validated like {@link WorkspacePushOptions.trailers}.
+ */
+export interface CommitTrailersEvent {
+  /** Session id of the Agent that called the tool. */
+  readonly session: string
+  /** Workspace directory being pushed. */
+  readonly dir: string
+  /**
+   * Append one trailer to the commit.
+   * @param token - trailer token, e.g. `Feishu-User`.
+   * @param value - one-line trailer value.
+   */
+  add(token: string, value: string): void
+}
+
 /** Lifecycle state of an issue. */
 export type IssueState = 'open' | 'closed'
 
@@ -512,6 +546,8 @@ export interface WorkspacePushOptions extends CallOptions {
   readonly author?: CommitAuthor
   /** Session that made the change, added to that commit's message as a `DSH-Session:` trailer. One line of at most 200 characters. */
   readonly session?: string
+  /** Further trailers of that commit, after `DSH-Session:`, in order; at most 20. An invalid one fails the push with `invalid`. */
+  readonly trailers?: readonly CommitTrailer[]
 }
 
 /** Outcome of {@link DshRepoService.pushWorkspace}. */
