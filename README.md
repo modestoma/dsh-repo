@@ -93,7 +93,7 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 | `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；默认不注册 | 是 |
 
 - 写操作在 `writes: ask` 下每次调用都经 `ctx.approval` 请用户确认一次，被拒绝时工具返回 `{ "status": "declined" }`，不会调用主机。组合里没有审批服务时写工具报错。
-- `repo_workspace_push` 的审批提示列出仓库、目标分支、起点、改动文件与增删行数和提交说明。
+- 审批提示首行写要做的事，之后每行一项「标签：值」，文件列表缩进两格；审批端按行展示即可。`repo_workspace_push` 列出目标分支、仓库、起点、提交说明首行、改动总数与增删行数，以及按改动量排序的前 12 项文件改动，整个目录的移动合并成一行。
 - 失败时工具报错，消息以失败类型开头，例如 `[not-found]`、`[forbidden]`、`[conflict]`。
 
 ## 改代码
