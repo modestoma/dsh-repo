@@ -242,11 +242,31 @@ describe('createTools', () => {
     expect(openWorkspace).not.toHaveBeenCalled()
     expect(set).not.toHaveBeenCalled()
 
+    await expect(open.execute({ repo: 'github.com/a/b', branch: 'fix/a', commit: 'c'.repeat(40) }, run)).rejects.toThrow(/^\[invalid\].*commit/)
+    expect(openWorkspace).not.toHaveBeenCalled()
+
+    expect(await open.execute({ repo: 'github.com/a/b', branch: 'fix/a', baseBranch: 'main' }, run)).toMatchObject({ reused: true })
+    expect(openWorkspace).not.toHaveBeenCalled()
+
     const fresh = await open.execute({ repo: 'github.com/a/b', branch: 'fix/b' }, run)
     const dir = join(root, 'b-2')
-    expect(openWorkspace).toHaveBeenCalledWith('https://github.com/a/b.git', { dir, branch: 'fix/b', signal: run.signal })
+    expect(openWorkspace).toHaveBeenLastCalledWith('https://github.com/a/b.git', { dir, branch: 'fix/b', signal: run.signal })
     expect(fresh).toMatchObject({ dir, branch: 'fix/b', workingDirectory: dir, next: expect.stringContaining('added to fix/b') })
     expect(listChanges).not.toHaveBeenCalled()
+  })
+
+  it('opens a new workspace on a branch the current workspace pushes to when the merge target differs', async () => {
+    const { root, workingDirectory, exec: run } = session('b')
+    const ws = checkout(join(root, 'b'))
+    const gitDir = mkdtempSync(join(tmpdir(), 'dsh-repo-tools-gitdir-'))
+    writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/dsh-repo/ws-0123456789abcdef\n')
+    writeFileSync(join(ws, '.git'), `gitdir: ${gitDir}\n`)
+    const workspace = { url: 'https://github.com/a/b.git', dir: ws, baseBranch: 'main', baseCommit: 'c'.repeat(40), branch: 'fix/a' }
+    const openWorkspace = vi.fn(async (url: string, options: { dir: string; branch?: string }) => ({ url, dir: options.dir, baseBranch: 'dev', baseCommit: 'e'.repeat(40), branch: options.branch }))
+    const service = fakeService({ resolve: () => ({ kind: 'github', host: 'github.com', path: 'a/b', webUrl: 'https://github.com/a/b' }), workspaceChanges: async () => ({ workspace }), openWorkspace })
+    const open = tools(testSettings(), service, undefined, workingDirectory).get('repo_workspace_open')!
+    expect(await open.execute({ repo: 'github.com/a/b', branch: 'fix/a', baseBranch: 'dev' }, run)).toMatchObject({ baseBranch: 'dev', branch: 'fix/a' })
+    expect(openWorkspace).toHaveBeenCalledWith('https://github.com/a/b.git', { dir: join(root, 'b-2'), baseBranch: 'dev', branch: 'fix/a', signal: run.signal })
   })
 
   it('adds the trailers other plugins contribute for the calling Session to the push', async () => {

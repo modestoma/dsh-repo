@@ -189,7 +189,8 @@ export function createTools(deps: ToolDeps): RepoTool[] {
         const ref = service.resolve(args.repo)
         const url = `${ref.webUrl}.git`
         if (args.branch !== undefined) {
-          const reused = await currentWorkspace(deps, agent, url, args.branch, signal)
+          if (args.commit !== undefined) throw new RepoError('invalid', `接着分支 ${args.branch} 修改时从它的最新提交开始，不能再指定 commit`)
+          const reused = await currentWorkspace(deps, agent, url, args.branch, args.baseBranch, signal)
           if (reused !== undefined) return { ...reused, reused: true, next: continueHint(reused.branch) }
         } else if (args.baseBranch !== undefined) {
           const open = await service.listChanges(args.repo, { state: 'open', sourceBranch: args.baseBranch, perPage: 1, signal })
@@ -325,15 +326,16 @@ function continueHint(branch: string): string {
 
 /**
  * The workspace containing the Agent's effective directory, when it is a
- * workspace of `url` that already pushes to `branch`.
+ * workspace of `url` that already pushes to `branch` and, when `baseBranch`
+ * is given, merges into it.
  */
-async function currentWorkspace(deps: ToolDeps, agent: Agent, url: string, branch: string, signal: AbortSignal): Promise<WorkspaceChanges['workspace'] & { readonly branch: string } | undefined> {
+async function currentWorkspace(deps: ToolDeps, agent: Agent, url: string, branch: string, baseBranch: string | undefined, signal: AbortSignal): Promise<WorkspaceChanges['workspace'] & { readonly branch: string } | undefined> {
   const current = await currentDirectory(deps, agent, signal)
   const root = agent.session?.header.cwd
   for (let dir = current; dir !== dirname(dir) && (root === undefined || inside(dir, root)); dir = dirname(dir)) {
     if (!await isWorkspaceCheckout(dir)) continue
     const { workspace } = await deps.service.workspaceChanges(dir, { signal })
-    if (workspace.url !== url || workspace.branch !== branch) return undefined
+    if (workspace.url !== url || workspace.branch !== branch || (baseBranch !== undefined && workspace.baseBranch !== baseBranch)) return undefined
     return { ...workspace, branch: workspace.branch }
   }
   return undefined
