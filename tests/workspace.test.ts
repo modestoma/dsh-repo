@@ -145,6 +145,41 @@ describe('workspaces', () => {
     await expect(service.pushWorkspace(dir, { message: 'mine', author: BOT })).rejects.toMatchObject({ code: 'conflict' })
   })
 
+  it('continues an existing remote branch: starts from its head and pushes fast-forward commits to it', async () => {
+    const { bare, commit } = origin()
+    const { sandbox, service } = setup()
+    const first = join(sandbox, 'first')
+    await service.openWorkspace(bare, { dir: first })
+    writeFileSync(join(first, 'app.ts'), 'export const a = 2\n')
+    const pushed = await service.pushWorkspace(first, { branch: 'fix/a', message: 'fix: a', author: BOT })
+
+    const dir = join(sandbox, 'again')
+    const info = await service.openWorkspace(bare, { dir, branch: 'fix/a' })
+    expect(info).toEqual({ url: bare, dir: realpathSync(dir), baseBranch: 'main', baseCommit: pushed.commit, branch: 'fix/a' })
+    expect(readFileSync(join(dir, 'app.ts'), 'utf8')).toBe('export const a = 2\n')
+    expect(await service.workspaceChanges(dir)).toMatchObject({ workspace: { branch: 'fix/a' }, commits: [], files: [] })
+    await expect(service.pushWorkspace(dir, { message: 'm', author: BOT })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('没有改动') })
+
+    writeFileSync(join(dir, 'more.ts'), 'export {}\n')
+    await expect(service.pushWorkspace(dir, { branch: 'fix/b', message: 'm', author: BOT })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('fix/a') })
+    const more = await service.pushWorkspace(dir, { message: 'fix: more', author: BOT })
+    expect(more).toMatchObject({ branch: 'fix/a', baseBranch: 'main', committed: true, created: false })
+    expect(git(bare, 'rev-parse', 'fix/a')).toBe(more.commit)
+    expect(git(bare, 'rev-parse', 'fix/a^')).toBe(pushed.commit)
+    expect(git(bare, 'rev-parse', 'main')).toBe(commit)
+  })
+
+  it('refuses to continue the base or default branch, a missing branch, or a branch with a start commit', async () => {
+    const { bare, commit } = origin()
+    const { sandbox, service } = setup()
+    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'a'), branch: 'main' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('合入目标') })
+    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'b'), branch: 'main', baseBranch: 'dev' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('默认分支') })
+    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'c'), branch: 'dev', commit })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('起点提交') })
+    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'd'), branch: 'nope' })).rejects.toMatchObject({ code: 'not-found' })
+    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'e'), branch: '-x' })).rejects.toMatchObject({ code: 'invalid' })
+    expect(await service.openWorkspace(bare, { dir: join(sandbox, 'f'), branch: 'dev' })).toMatchObject({ baseBranch: 'main', branch: 'dev', baseCommit: commit })
+  })
+
   it('refuses a first push to an existing branch that already holds the same commit', async () => {
     const { bare } = origin()
     const { sandbox, service } = setup()

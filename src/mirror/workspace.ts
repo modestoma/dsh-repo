@@ -15,7 +15,9 @@
  *   configuration under `dsh-repo-workspace.<id>`.
  * - Pushes never overwrite: the first push may only create the remote branch
  *   (`--force-with-lease=<ref>:` with an empty expectation), later pushes are
- *   plain fast-forward pushes.
+ *   plain fast-forward pushes. A workspace opened to continue an existing
+ *   remote branch has that branch recorded from the start, so every push is a
+ *   fast-forward push to it.
  *
  * @module dsh-repo/mirror/workspace
  */
@@ -61,6 +63,16 @@ interface Located {
   readonly url: string
   readonly baseBranch: string
   readonly baseCommit: string
+  readonly branch?: string
+}
+
+/** Where a new workspace starts, after the service resolved and checked it. */
+export interface WorkspaceStart {
+  /** Full commit id present in the mirror. */
+  readonly commit: string
+  /** Branch the work merges into. */
+  readonly baseBranch: string
+  /** Existing remote branch the workspace continues; every push goes there. */
   readonly branch?: string
 }
 
@@ -205,14 +217,14 @@ export class WorkspaceStore {
    * Check out a commit of a synced mirror at a new directory on a fresh local branch.
    * @param url - mirror address.
    * @param dir - absolute directory that must not exist.
-   * @param commit - full commit id present in the mirror.
-   * @param baseBranch - branch the work starts from.
+   * @param start - full commit id present in the mirror, the branch the work merges into, and the existing remote branch it continues, if any.
    * @param env - credentials of the checkout, whose Git LFS smudge filter may download files.
    * @param signal - cancellation.
    * @returns the workspace.
    * @throws {RepoError} `invalid` for a relative or existing directory, `not-found` for a missing mirror or commit, `unavailable` when git fails.
    */
-  async open(url: string, dir: string, commit: string, baseBranch: string, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<WorkspaceInfo> {
+  async open(url: string, dir: string, start: WorkspaceStart, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<WorkspaceInfo> {
+    const { commit, baseBranch, branch } = start
     if (!isAbsolute(dir)) throw new RepoError('invalid', `工作区目录必须是绝对路径：${dir}`)
     const target = resolve(dir)
     if (await exists(target)) throw new RepoError('invalid', `工作区目录已存在：${target}`)
@@ -225,11 +237,12 @@ export class WorkspaceStore {
         await this.deps.git(['worktree', 'add', '--quiet', '-b', `${BRANCH_PREFIX}${id}`, target, commit], { cwd: mirror, timeoutMs: this.deps.limits().timeoutMs, env, ...signal === undefined ? {} : { signal } })
         await this.git(['config', `${SECTION}.${id}.baseBranch`, baseBranch], mirror)
         await this.git(['config', `${SECTION}.${id}.baseCommit`, commit], mirror)
+        if (branch !== undefined) await this.git(['config', `${SECTION}.${id}.branch`, branch], mirror)
       })
     } catch (error) {
       throw failure(error, `在 ${target} 打开 ${url} 的工作区`)
     }
-    return { url, dir: await realpath(target), baseBranch, baseCommit: commit }
+    return { url, dir: await realpath(target), baseBranch, baseCommit: commit, ...branch === undefined ? {} : { branch } }
   }
 
   /**

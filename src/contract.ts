@@ -301,6 +301,7 @@ export interface ChangeDetail extends ChangeInfo {
 export interface ChangeListOptions extends PageOptions {
   /** Default `open`. */
   readonly state?: ChangeState | 'all'
+  /** Branch of this repository the change requests come from; requests from forks are left out. */
   readonly sourceBranch?: string
   readonly targetBranch?: string
 }
@@ -482,10 +483,18 @@ export interface SnapshotLease {
 export interface WorkspaceOpenOptions extends CallOptions {
   /** Absolute directory of the checkout; must not exist yet (its parent is created). */
   readonly dir: string
-  /** Branch the work starts from and later merges into; default: the remote's default branch. */
+  /** Branch the work merges into, and starts from unless {@link branch} is given; default: the remote's default branch. */
   readonly baseBranch?: string
-  /** Full commit id to start from, fetched by an earlier {@link DshRepoService.syncMirror}; default: the head of {@link baseBranch} after a fetch. */
+  /** Full commit id to start from, fetched by an earlier {@link DshRepoService.syncMirror}; default: the head of {@link baseBranch} after a fetch. Not allowed with {@link branch}. */
   readonly commit?: string
+  /**
+   * Existing remote branch to continue, for example the source branch of an
+   * open change request. The workspace starts from its head after a fetch
+   * and every {@link DshRepoService.pushWorkspace} adds fast-forward commits
+   * to it, so a change request from it updates. Cannot be {@link baseBranch}
+   * or the remote's default branch.
+   */
+  readonly branch?: string
 }
 
 /** A writable checkout opened by {@link DshRepoService.openWorkspace}. */
@@ -498,7 +507,7 @@ export interface WorkspaceInfo {
   readonly baseBranch: string
   /** Commit the work started from. */
   readonly baseCommit: string
-  /** Remote branch fixed by the first {@link DshRepoService.pushWorkspace}; absent before it. */
+  /** Remote branch the pushes go to: fixed by the first {@link DshRepoService.pushWorkspace}, or at open when continuing an existing branch; absent before either. */
   readonly branch?: string
 }
 
@@ -533,9 +542,11 @@ export interface WorkspaceChanges {
 /** Options of {@link DshRepoService.pushWorkspace}. */
 export interface WorkspacePushOptions extends CallOptions {
   /**
-   * Remote branch to push to. Required on the first push, which fails with
+   * Remote branch to push to. Required on the first push of a workspace
+   * opened without {@link WorkspaceOpenOptions.branch}, which fails with
    * `conflict` when the remote already has the branch and with `invalid` for
-   * the base or default branch; later pushes must name the same branch or omit it.
+   * the base or default branch; later pushes, and every push of a workspace
+   * continuing an existing branch, must name the workspace's branch or omit it.
    */
   readonly branch?: string
   /** Message of the commit recording uncommitted changes; required when there are any. */
@@ -697,7 +708,7 @@ export interface DshRepoService {
    * service; deleting the directory abandons it.
    * @param url - HTTPS address, `file:` URL, or absolute local path.
    * @returns the workspace.
-   * @throws `invalid` for an unsupported address, branch, commit, or a directory that exists; `not-allowed` outside the configured repositories; `not-found` for a missing branch or commit; `unavailable` when git fails.
+   * @throws `invalid` for an unsupported address, branch, commit, or a directory that exists, for `commit` with `branch`, and for a `branch` that is the base or default branch; `not-allowed` outside the configured repositories; `not-found` for a missing branch or commit; `unavailable` when git fails.
    */
   openWorkspace(url: string, options: WorkspaceOpenOptions): Promise<WorkspaceInfo>
   /**

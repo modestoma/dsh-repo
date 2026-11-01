@@ -91,7 +91,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | `repo_mr_list` / `repo_mr_get` / `repo_mr_diff` / `repo_mr_status` | PR/MR 列表、详情与评论、diff、CI 与可合并状态 | 否 |
 | `repo_workspace_open` | 在当前工作目录下检出可写工作区，并把会话的工作目录切到那里，见[改代码](#改代码) | 否 |
 | `repo_workspace_changes` | 工作区相对起点提交的改动：文件与增删行数、已推送的提交、diff | 否 |
-| `repo_workspace_push` | 提交工作区未提交的改动并推送到新分支，从不强推 | 是 |
+| `repo_workspace_push` | 提交工作区未提交的改动并推送到工作区的远端分支，从不强推；结果列出这个分支上打开中的 PR/MR | 是 |
 | `repo_issue_create` / `repo_issue_update` / `repo_issue_comment` | 创建、修改、关闭或重开、评论 issue | 是 |
 | `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR | 是 |
 | `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；默认不提供 | 是 |
@@ -102,12 +102,12 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 
 ## 改代码
 
-改代码只有一条路：检出工作区 → 修改 → 推送到新分支 → 开 PR/MR。
+改代码只有一条路：检出工作区 → 修改 → 推送到新分支 → 开 PR/MR。之后的修改（例如评审后的追加修复）推送到同一个分支，原 PR/MR 随之更新，不再开新分支和新 PR/MR。
 
-1. **检出。** `repo_workspace_open` 先拉取镜像，再以 `baseBranch`（默认是默认分支）的最新提交或给定的 `commit` 为起点，在当前工作目录下新建 `<仓库名>/`（重名时加 `-2`、`-3`），并经 DSH 的 `workingDirectory` 服务把会话的工作目录切过去，仓库里的 AGENTS.md、项目 SKILL 随之生效。当前工作目录不在会话的项目目录（沙箱可写根）内时，工作区放在项目目录下；当前目录在另一个工作区里时，放在那个工作区旁边。
+1. **检出。** `repo_workspace_open` 先拉取镜像，再以 `baseBranch`（默认是默认分支）的最新提交或给定的 `commit` 为起点，在当前工作目录下新建 `<仓库名>/`（重名时加 `-2`、`-3`），并经 DSH 的 `workingDirectory` 服务把会话的工作目录切过去，仓库里的 AGENTS.md、项目 SKILL 随之生效。当前工作目录不在会话的项目目录（沙箱可写根）内时，工作区放在项目目录下；当前目录在另一个工作区里时，放在那个工作区旁边。给出 `branch` 时接着这个已有的远端分支修改：以它的最新提交为起点，工作区从一开始就记下这个分支，之后每次推送都是追加到它的普通推送；`baseBranch` 这时只是合入目标。`branch` 不能是 `baseBranch` 或远端默认分支，也不能和 `commit` 同时给出。当前工作区就是这个仓库、已经推送到这个分支、并且（给出 `baseBranch` 时）合入目标相同时，工具直接复用它，不新开目录。工具给出 `baseBranch` 而它是某个打开中的 PR/MR 的源分支时，以 `invalid` 拒绝，并提示在原工作区继续修改或改用 `branch`，避免出现「在修复分支上再开分支、再提一个合入修复分支的 PR/MR」。
 2. **修改。** Agent 用普通的文件和命令工具编辑、构建、测试。工作区的 git 元数据（索引、HEAD、本地分支和提交）留在镜像里，Agent 只能改文件，`git status`、`git diff`、`git log` 这类只读命令可以用，`git add`、`git commit`、`git checkout` 会因为写不了元数据而失败。
-3. **推送。** `repo_workspace_push` 经用户审批后，由插件进程把未提交的改动（`git add --all`，`.gitignore` 生效）提交为一个提交，再把工作区推送到远端分支。第一次推送要给出分支名：不能是起点分支或远端默认分支，远端已有同名分支时以 `conflict` 失败，推送用 `--force-with-lease=<分支>:` 保证只创建、不覆盖；之后的推送只能去同一个分支，普通推送，远端被他人更新时以 `conflict` 失败。推送失败时撤销这次调用新建的提交。推送跳过 git 钩子；本机装了 Git LFS 且新提交改动了 LFS 文件时，先用 `git lfs push` 上传 LFS 对象，再推送分支。检出工作区时同样带上主机令牌，供 Git LFS 下载文件。推送用该主机的令牌，主机没有配置时报 `unauthenticated`。提交作者和提交者默认是令牌所属的账号（通常是公共账号）：推送前用令牌读一次主机的当前用户接口（GitHub `GET /user`，GitLab `GET /api/v4/user`），按令牌缓存；GitHub 账号没有公开邮箱时用 `<id>+<login>@users.noreply.<主机>`，GitLab 依次取提交邮箱、邮箱、公开邮箱，都没有时用 `<id>-<用户名>@users.noreply.<主机>`。令牌读不到自己的账号时推送以 `forbidden` 或 `unauthenticated` 失败（GitLab 令牌需要 `read_user` 或 `api` 权限）。服务调用可以用 `author` 指定身份；本地路径的仓库用本机的 git 身份。提交说明末尾自动加一行 `DSH-Session: <会话 id>`，记录是哪个 DSH 会话做的改动，可在 DSH 中按 id 找回对话。其他插件可以通过 `repo/commit-trailers` 事件在这一行后面追加尾注（例如飞书渠道追加 `Feishu-User: 名字 <user_id>`），见下文「提交尾注事件」。
-4. **开 PR/MR。** 用 `repo_mr_create`，`sourceBranch` 是推送的分支，`targetBranch` 是起点分支。
+3. **推送。** `repo_workspace_push` 经用户审批后，由插件进程把未提交的改动（`git add --all`，`.gitignore` 生效）提交为一个提交，再把工作区推送到远端分支。新工作的第一次推送要给出分支名：不能是起点分支或远端默认分支，远端已有同名分支时以 `conflict` 失败，推送用 `--force-with-lease=<分支>:` 保证只创建、不覆盖；之后的推送，以及接着已有分支打开的工作区的每次推送，只能去同一个分支（不必再给分支名），普通推送，远端被他人更新时以 `conflict` 失败。推送失败时撤销这次调用新建的提交。推送跳过 git 钩子；本机装了 Git LFS 且新提交改动了 LFS 文件时，先用 `git lfs push` 上传 LFS 对象，再推送分支。检出工作区时同样带上主机令牌，供 Git LFS 下载文件。推送用该主机的令牌，主机没有配置时报 `unauthenticated`。提交作者和提交者默认是令牌所属的账号（通常是公共账号）：推送前用令牌读一次主机的当前用户接口（GitHub `GET /user`，GitLab `GET /api/v4/user`），按令牌缓存；GitHub 账号没有公开邮箱时用 `<id>+<login>@users.noreply.<主机>`，GitLab 依次取提交邮箱、邮箱、公开邮箱，都没有时用 `<id>-<用户名>@users.noreply.<主机>`。令牌读不到自己的账号时推送以 `forbidden` 或 `unauthenticated` 失败（GitLab 令牌需要 `read_user` 或 `api` 权限）。服务调用可以用 `author` 指定身份；本地路径的仓库用本机的 git 身份。提交说明末尾自动加一行 `DSH-Session: <会话 id>`，记录是哪个 DSH 会话做的改动，可在 DSH 中按 id 找回对话。其他插件可以通过 `repo/commit-trailers` 事件在这一行后面追加尾注（例如飞书渠道追加 `Feishu-User: 名字 <user_id>`），见下文「提交尾注事件」。
+4. **开 PR/MR。** `repo_workspace_push` 推送成功后查一次这个分支上打开中的 PR/MR，在结果的 `openChanges` 里列出，并在 `next` 里提示模型：已有时它已包含这次推送，不要再创建；没有时用 `repo_mr_create` 创建，`sourceBranch` 是推送的分支，`targetBranch` 是起点分支。查询失败不影响推送结果，`next` 里写明原因并提示先用 `repo_mr_list` 确认。
 
 工作区目录归调用方所有，dsh-repo 不删除它；删除目录即放弃这个工作区，进程下次启动后第一次同步该镜像时清理它在镜像里的本地分支。换了镜像目录后，旧目录里镜像的工作区不能再推送。
 
@@ -126,7 +126,7 @@ if (repos?.version === 1) {
 }
 ```
 
-接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并，以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit })` 在调用方给的目录（必须不存在）检出工作区，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session, trailers })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并，以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit, branch })` 在调用方给的目录（必须不存在）检出工作区，给出 `branch` 时接着这个已有分支修改，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session, trailers })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
 
 ### 提交尾注事件
 
