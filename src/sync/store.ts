@@ -20,6 +20,12 @@ export interface SyncRecord {
   readonly dir: string
   readonly intervalMinutes: number
   readonly createdAt: string
+  /**
+   * Directory a first sync was allowed into after it was found missing or
+   * empty, kept until that sync succeeds, so an attempt interrupted after
+   * writing files can be retried there.
+   */
+  readonly claimedDir?: string
   /** Last successful sync; `dir` is the directory the sync's git index describes. */
   readonly last?: {
     readonly dir: string
@@ -36,6 +42,7 @@ const recordSchema = z.object({
   dir: z.string().min(1),
   intervalMinutes: z.number().int().positive(),
   createdAt: z.string(),
+  claimedDir: z.string().min(1).optional(),
   last: z.object({
     dir: z.string().min(1),
     commit: z.string(),

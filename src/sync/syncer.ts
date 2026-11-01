@@ -12,8 +12,13 @@
  *   longer has, and restores files edited or deleted locally. Files the
  *   branch never had are left alone.
  * - The first sync into a directory requires it to be missing or empty, so
- *   existing files are never overwritten. Removing a sync, or moving it to
- *   another directory, leaves the files in the old directory.
+ *   existing files are never overwritten. The directory is then recorded as
+ *   claimed before any file is written, so a first sync interrupted after
+ *   writing files is retried there. Each directory of a sync has its own
+ *   index file. Removing a sync, or moving it to another directory, leaves
+ *   the files in the old directory.
+ * - Directory overlap is checked on real paths: existing ancestors are
+ *   resolved through symbolic links.
  * - Syncs run one at a time. A sync is due `intervalMinutes` after its last
  *   success; a failed attempt is retried after the interval or
  *   {@link RETRY_MS}, whichever is shorter. Due times survive restarts
@@ -22,10 +27,10 @@
  * @module dsh-repo/sync/syncer
  */
 
-import { randomBytes } from 'node:crypto'
-import { mkdir, readdir, rm, stat } from 'node:fs/promises'
+import { createHash, randomBytes } from 'node:crypto'
+import { mkdir, readdir, realpath, rm, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { isAbsolute, join, parse, relative } from 'node:path'
+import { basename, dirname, isAbsolute, join, parse, relative } from 'node:path'
 import { expandHome } from '../config.ts'
 import type { MirrorState, MirrorSyncOptions } from '../contract.ts'
 import { RepoError, toRepoError } from '../errors.ts'
@@ -108,6 +113,28 @@ function resolveInput(input: SyncInput): Pick<SyncRecord, 'url' | 'branch' | 'di
   return { url, ...branch === undefined || branch === '' ? {} : { branch }, dir, intervalMinutes }
 }
 
+/**
+ * The path with its longest existing ancestor resolved through symbolic links.
+ * @param path - absolute path, existing or not.
+ * @returns the real path of the existing part joined with the rest.
+ */
+export async function realPathOf(path: string): Promise<string> {
+  const missing: string[] = []
+  let current = path
+  for (;;) {
+    try {
+      return join(await realpath(current), ...missing.reverse())
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error
+      const parent = dirname(current)
+      if (parent === current) return path
+      missing.push(basename(current))
+      current = parent
+    }
+  }
+}
+
 async function requireEmpty(dir: string): Promise<void> {
   let names: string[]
   try {
@@ -167,9 +194,10 @@ export class LocalSyncer {
   async add(input: SyncInput): Promise<SyncInfo> {
     const fields = resolveInput(input)
     const id = randomBytes(6).toString('hex')
+    const real = await this.realPaths(fields.dir)
     await this.deps.store.update((current) => {
       if (current.length >= MAX_SYNCS) throw new RepoError('too-large', `本地同步最多 ${MAX_SYNCS} 条`)
-      this.checkDir(fields.dir, current, undefined)
+      this.checkDir(fields.dir, current, undefined, real)
       return [...current, { id, ...fields, createdAt: new Date(this.now()).toISOString() }]
     })
     await this.run(id)
@@ -186,11 +214,12 @@ export class LocalSyncer {
    */
   async update(id: string, input: SyncInput): Promise<SyncInfo> {
     const fields = resolveInput(input)
+    const real = await this.realPaths(fields.dir)
     let resync = false
     await this.deps.store.update((current) => {
       const record = current.find(item => item.id === id)
       if (record === undefined) throw new RepoError('not-found', '没有这条本地同步，可能已经删除')
-      this.checkDir(fields.dir, current, id)
+      this.checkDir(fields.dir, current, id, real)
       resync = record.url !== fields.url || record.branch !== fields.branch || record.dir !== fields.dir
       const { branch: _branch, ...rest } = record
       return current.map(item => item.id === id ? { ...rest, ...fields } : item)
@@ -223,7 +252,7 @@ export class LocalSyncer {
       await status.pending
       this.statuses.delete(id)
     }
-    await rm(this.indexFile(id), { force: true })
+    await this.removeIndexes(id, undefined)
     return true
   }
 
@@ -275,18 +304,47 @@ export class LocalSyncer {
     return status
   }
 
-  private indexFile(id: string): string {
-    return join(this.deps.indexDir, `${id}.index`)
+  /** Index file of one directory of a sync: `<id>-<hash of the directory>.index`. */
+  private indexFile(id: string, dir: string): string {
+    return join(this.deps.indexDir, `${id}-${createHash('sha1').update(dir).digest('hex').slice(0, 12)}.index`)
+  }
+
+  /** Delete a sync's index files, except the one of `keep`. */
+  private async removeIndexes(id: string, keep: string | undefined): Promise<void> {
+    let names: string[]
+    try {
+      names = await readdir(this.deps.indexDir)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw error
+    }
+    const kept = keep === undefined ? undefined : basename(this.indexFile(id, keep))
+    await Promise.all(names.filter(name => name.startsWith(`${id}-`) && name !== kept).map(name => rm(join(this.deps.indexDir, name), { force: true })))
   }
 
   /**
-   * Refuse a directory that overlaps the mirror directory or another sync's.
+   * Real paths of a candidate directory, the mirror directory, and every
+   * sync's directory, read before the list changes so the check itself stays synchronous.
+   */
+  private async realPaths(dir: string): Promise<Map<string, string>> {
+    const paths = [dir, this.deps.service.mirrorSettings().dir, ...this.deps.store.all().map(record => record.dir)]
+    return new Map(await Promise.all(paths.map(async path => [path, await realPathOf(path)] as const)))
+  }
+
+  /**
+   * Refuse a directory that overlaps the mirror directory or another sync's,
+   * comparing real paths where they were read and the paths themselves otherwise.
    * @throws {RepoError} `conflict`.
    */
-  private checkDir(dir: string, current: readonly SyncRecord[], self: string | undefined): void {
+  private checkDir(dir: string, current: readonly SyncRecord[], self: string | undefined, real: ReadonlyMap<string, string>): void {
+    const overlap = (a: string, b: string): boolean => {
+      const ra = real.get(a) ?? a
+      const rb = real.get(b) ?? b
+      return within(a, b) || within(b, a) || within(ra, rb) || within(rb, ra)
+    }
     const mirrors = this.deps.service.mirrorSettings().dir
-    if (within(mirrors, dir) || within(dir, mirrors)) throw new RepoError('conflict', `本地目录 ${dir} 与镜像目录 ${mirrors} 重叠，请换一个目录`)
-    const other = current.find(item => item.id !== self && (within(item.dir, dir) || within(dir, item.dir)))
+    if (overlap(mirrors, dir)) throw new RepoError('conflict', `本地目录 ${dir} 与镜像目录 ${mirrors} 重叠，请换一个目录`)
+    const other = current.find(item => item.id !== self && overlap(item.dir, dir))
     if (other !== undefined) throw new RepoError('conflict', `本地目录 ${dir} 与 ${other.url} 的本地目录 ${other.dir} 重叠，请换一个目录`)
   }
 
@@ -351,7 +409,7 @@ export class LocalSyncer {
     const interval = record.intervalMinutes * 60_000
     let next: number
     if (status.failedAt !== undefined) next = status.failedAt + Math.min(interval, RETRY_MS)
-    else if (record.last === undefined || record.last.dir !== record.dir) next = now
+    else if (record.last?.dir !== record.dir) next = now
     else next = Date.parse(record.last.syncedAt) + interval
     status.nextAt = next
     const timer = setTimeout(() => {
@@ -365,14 +423,15 @@ export class LocalSyncer {
 
   /**
    * Fetch the mirror and expand the branch head into the sync's directory.
-   * @throws {RepoError} the mirror's failures; `conflict` when a first sync finds a non-empty directory.
+   * @throws {RepoError} the mirror's failures; `conflict` when a first sync finds a non-empty directory; `unavailable` when the claim or the result cannot be saved.
    */
   private async expand(record: SyncRecord, signal: AbortSignal): Promise<void> {
     const mirror = await this.deps.service.syncMirror(record.url, { ...record.branch === undefined ? {} : { branch: record.branch }, signal })
-    const index = this.indexFile(record.id)
-    if (record.last === undefined || record.last.dir !== record.dir) {
-      await rm(index, { force: true })
+    const index = this.indexFile(record.id, record.dir)
+    if (record.last?.dir !== record.dir && record.claimedDir !== record.dir) {
       await requireEmpty(record.dir)
+      await rm(index, { force: true })
+      await this.deps.store.update(current => current.map(item => item.id === record.id && item.dir === record.dir ? { ...item, claimedDir: record.dir } : item))
     }
     await mkdir(record.dir, { recursive: true })
     await mkdir(this.deps.indexDir, { recursive: true })
@@ -390,6 +449,11 @@ export class LocalSyncer {
     }
     if ((await git(['diff-files', '--name-only', '-z'])) !== '') await git(['checkout-index', '--all', '--force'])
     const last = { dir: record.dir, commit: mirror.commit, branch: mirror.branch, syncedAt: new Date(this.now()).toISOString() }
-    await this.deps.store.update(current => current.map(item => item.id === record.id && item.dir === record.dir ? { ...item, last } : item))
+    await this.deps.store.update(current => current.map((item) => {
+      if (item.id !== record.id || item.dir !== record.dir) return item
+      const { claimedDir: _claimed, ...rest } = item
+      return { ...rest, last }
+    }))
+    await this.removeIndexes(record.id, record.dir)
   }
 }

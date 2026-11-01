@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -155,16 +155,62 @@ describe('local syncs', () => {
     await expect(syncer.syncNow('000000000000')).rejects.toMatchObject({ code: 'not-found' })
   })
 
+  it('keeps tracking the old directory after a refused move, so upstream deletions still apply there', async () => {
+    const repo = origin()
+    const { root, syncer } = setup()
+    const first = join(root, 'first')
+    const { id } = await syncer.add({ url: repo.dir, dir: first })
+    const busy = join(root, 'busy')
+    mkdirSync(busy)
+    writeFileSync(join(busy, 'note.txt'), 'x')
+    expect((await syncer.update(id, { url: repo.dir, dir: busy })).error).toContain('不是空目录')
+    rmSync(join(repo.dir, 'gamma'), { recursive: true })
+    commitAll(repo.dir, 'drop gamma')
+    const back = await syncer.update(id, { url: repo.dir, dir: first })
+    expect(back.error).toBeUndefined()
+    expect(existsSync(join(first, 'gamma'))).toBe(false)
+    expect(readFileSync(join(busy, 'note.txt'), 'utf8')).toBe('x')
+  })
+
+  it('retries a first sync that wrote files but did not record its result', async () => {
+    const repo = origin()
+    const { root, make } = setup()
+    const dir = join(root, 'out')
+    const syncer = make()
+    const { id } = await syncer.add({ url: repo.dir, dir })
+    // Simulate an interruption between writing files and recording the result.
+    const file = join(root, 'syncs.json')
+    const stored = JSON.parse(readFileSync(file, 'utf8')) as { syncs: Record<string, unknown>[] }
+    const { last: _last, ...record } = stored.syncs[0] as Record<string, unknown>
+    writeFileSync(file, JSON.stringify({ syncs: [{ ...record, claimedDir: dir }] }))
+    const restarted = make()
+    const retried = await restarted.syncNow(id)
+    expect(retried.error).toBeUndefined()
+    expect(retried.commit).toBe(repo.commit)
+    expect(JSON.parse(readFileSync(file, 'utf8')).syncs[0].claimedDir).toBeUndefined()
+  })
+
+  it('refuses directories that overlap through a symbolic link', async () => {
+    const repo = origin()
+    const { root, syncer } = setup()
+    const out = join(root, 'data', 'out')
+    await syncer.add({ url: repo.dir, dir: out })
+    symlinkSync(out, join(root, 'data', 'alias'))
+    await expect(syncer.add({ url: repo.dir, dir: join(root, 'data', 'alias', 'nested') })).rejects.toMatchObject({ code: 'conflict' })
+    symlinkSync(join(root, 'mirrors'), join(root, 'mirror-link'))
+    await expect(syncer.add({ url: repo.dir, dir: join(root, 'mirror-link', 'x') })).rejects.toMatchObject({ code: 'conflict' })
+  })
+
   it('removes a sync with its index and keeps the files', async () => {
     const repo = origin()
     const { root, syncer } = setup()
     const dir = join(root, 'out')
     const { id } = await syncer.add({ url: repo.dir, dir })
-    expect(existsSync(join(root, 'syncs', `${id}.index`))).toBe(true)
+    expect(readdirSync(join(root, 'syncs')).filter(name => name.startsWith(id))).toHaveLength(1)
     expect(await syncer.remove(id)).toBe(true)
     expect(await syncer.remove(id)).toBe(false)
     expect(syncer.list()).toEqual([])
-    expect(existsSync(join(root, 'syncs', `${id}.index`))).toBe(false)
+    expect(readdirSync(join(root, 'syncs'))).toEqual([])
     expect(existsSync(join(dir, 'alpha', 'SKILL.md'))).toBe(true)
     expect(JSON.parse(readFileSync(join(root, 'syncs.json'), 'utf8'))).toEqual({ syncs: [] })
   })
