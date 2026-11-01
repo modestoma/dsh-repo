@@ -80,7 +80,10 @@ export interface WorkspaceStart {
 export interface PushRequest {
   readonly branch?: string
   readonly message?: string
+  /** Author of the new commit; absent means the committer. */
   readonly author?: CommitAuthor
+  /** Committer of the new commit; absent means the machine's git identity. */
+  readonly committer?: CommitAuthor
   /** Session recorded as the commit's `DSH-Session:` trailer. */
   readonly session?: string
   /** Validated trailers recorded after `DSH-Session:`. */
@@ -286,18 +289,20 @@ export class WorkspaceStore {
   }
 
   private async commitAndPush(ws: Located, branch: string, first: boolean, request: PushRequest): Promise<WorkspacePushResult> {
+    const author = request.author ?? request.committer
     let committed = false
     try {
       await this.workspaceGit(ws, ['add', '--all'], {}, request.signal)
       const pending = await this.workspaceGit(ws, ['diff', '--cached', '--name-only', '-z', 'HEAD'], {}, request.signal)
       if (pending !== '') {
         if (request.message === undefined || request.message.trim() === '') throw new RepoError('invalid', '工作区有未提交的改动，推送时要给出提交说明')
-        const identity = request.author === undefined ? [] : ['-c', `user.name=${request.author.name}`, '-c', `user.email=${request.author.email}`]
+        const identity = request.committer === undefined ? [] : ['-c', `user.name=${request.committer.name}`, '-c', `user.email=${request.committer.email}`]
+        const authorEnv: Record<string, string> = author === undefined ? {} : { GIT_AUTHOR_NAME: author.name, GIT_AUTHOR_EMAIL: author.email }
         const trailers = [
           ...request.session === undefined ? [] : [`DSH-Session: ${request.session}`],
           ...(request.trailers ?? []).map(trailer => `${trailer.token}: ${trailer.value}`),
         ].flatMap(line => ['--trailer', line])
-        await this.workspaceGit(ws, [...identity, 'commit', '--quiet', '--no-verify', '-m', request.message, ...trailers], {}, request.signal)
+        await this.workspaceGit(ws, [...identity, 'commit', '--quiet', '--no-verify', '-m', request.message, ...trailers], authorEnv, request.signal)
         committed = true
       }
       const head = (await this.workspaceGit(ws, ['rev-parse', 'HEAD'], {}, request.signal)).trim()
@@ -316,7 +321,7 @@ export class WorkspaceStore {
         throw error instanceof RepoError ? error : pushFailure(error, branch)
       }
       if (first) await this.git(['config', `${SECTION}.${ws.id}.branch`, branch], ws.mirror)
-      return { url: ws.url, branch, baseBranch: ws.baseBranch, commit: head, committed, created: first }
+      return { url: ws.url, branch, baseBranch: ws.baseBranch, commit: head, committed, ...committed && author !== undefined ? { author } : {}, created: first }
     } catch (error) {
       throw failure(error, `推送工作区 ${ws.dir} `)
     }

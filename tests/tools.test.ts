@@ -21,10 +21,10 @@ function fakeService(overrides: Record<string, unknown> = {}): DshRepoService {
 /** The tools the settings offer, by name. */
 function tools(
   settings = testSettings(), service = fakeService(), approval?: HostApproval, workingDirectory?: WorkingDirectoryService,
-  commitTrailers?: ToolDeps['commitTrailers'],
+  commitDetails?: ToolDeps['commitDetails'],
 ): Map<string, ToolDefinition> {
   return new Map(createTools({
-    service, settings: () => settings.tools, approval: () => approval, workingDirectory: () => workingDirectory, ...commitTrailers === undefined ? {} : { commitTrailers },
+    service, settings: () => settings.tools, approval: () => approval, workingDirectory: () => workingDirectory, ...commitDetails === undefined ? {} : { commitDetails },
   }).filter(tool => toolOffered(tool.access, settings.tools)).map(tool => [tool.definition.name, tool.definition]))
 }
 
@@ -298,7 +298,7 @@ describe('createTools', () => {
     expect(openWorkspace).toHaveBeenCalledWith('https://github.com/a/b.git', { dir: join(root, 'b-2'), baseBranch: 'dev', branch: 'fix/a', signal: run.signal })
   })
 
-  it('adds the trailers other plugins contribute for the calling Session to the push', async () => {
+  it('adds the trailers and author other plugins contribute for the calling Session to the push', async () => {
     const { root, workingDirectory, exec: run } = session('ws')
     checkout(join(root, 'ws'))
     const changes = {
@@ -308,19 +308,20 @@ describe('createTools', () => {
     const pushWorkspace = vi.fn(async () => ({ url: 'https://github.com/a/b.git', branch: 'fix/a', baseBranch: 'main' }))
     const service = fakeService({ workspaceChanges: async () => changes, pushWorkspace, listChanges: async () => ({ items: [] }) })
     const request = async () => 'allowed-once' as const
-    const commitTrailers = vi.fn(async () => [{ token: 'Feishu-User', value: '张三 <u_1>' }])
-    const push = tools(testSettings(), service, { request }, workingDirectory, commitTrailers).get('repo_workspace_push')!
+    const zhang = { name: '张三', email: 'zhang@example.com' }
+    const commitDetails = vi.fn<NonNullable<ToolDeps['commitDetails']>>(async () => ({ trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }], author: zhang }))
+    const push = tools(testSettings(), service, { request }, workingDirectory, commitDetails).get('repo_workspace_push')!
     await push.execute({ branch: 'fix/a', message: 'fix: a' }, run)
-    expect(commitTrailers).toHaveBeenCalledWith({ session: 'session-1', dir: join(root, 'ws') })
+    expect(commitDetails).toHaveBeenCalledWith({ session: 'session-1', dir: join(root, 'ws') })
     expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), {
-      branch: 'fix/a', message: 'fix: a', session: 'session-1', trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }], signal: run.signal,
+      branch: 'fix/a', message: 'fix: a', session: 'session-1', trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }], author: zhang, signal: run.signal,
     })
 
-    // No Session, no event; no trailers, no option.
+    // No Session, no event; no trailers or author, no options.
     await push.execute({ dir: join(root, 'ws'), branch: 'fix/a', message: 'fix: b' }, { ...run, agent: { id: 'agent-1' } })
-    expect(commitTrailers).toHaveBeenCalledTimes(1)
+    expect(commitDetails).toHaveBeenCalledTimes(1)
     expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: b', signal: run.signal })
-    commitTrailers.mockResolvedValueOnce([])
+    commitDetails.mockResolvedValueOnce({ trailers: [] })
     await push.execute({ branch: 'fix/a', message: 'fix: c' }, run)
     expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: c', session: 'session-1', signal: run.signal })
   })

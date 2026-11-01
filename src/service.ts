@@ -475,12 +475,15 @@ export class RepoService implements DshRepoService {
     const trailers = options.trailers === undefined ? undefined : checkTrailers(options.trailers)
     const { url } = await this.workspaces.locate(dir)
     const env = await this.mirrorAuth(url, true)
-    const author = options.author === undefined ? await this.tokenIdentity(url, options.signal) : { name: options.author.name.trim(), email: options.author.email.trim() }
+    const given = options.author === undefined ? undefined : { name: options.author.name.trim(), email: options.author.email.trim() }
+    const committer = await this.tokenIdentity(url, options.signal) ?? given
+    const author = given ?? committer
     return await this.workspaces.push(dir, {
       env,
       ...options.branch === undefined ? {} : { branch: options.branch },
       ...options.message === undefined ? {} : { message: options.message },
       ...author === undefined ? {} : { author },
+      ...committer === undefined ? {} : { committer },
       ...session === undefined ? {} : { session },
       ...trailers === undefined || trailers.length === 0 ? {} : { trailers },
       ...options.signal === undefined ? {} : { signal: options.signal },
