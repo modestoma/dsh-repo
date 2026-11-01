@@ -204,6 +204,17 @@ describe('local syncs', () => {
     await expect(syncer.add({ url: repo.dir, dir: join(root, 'mirror-link', 'x') })).rejects.toMatchObject({ code: 'conflict' })
   })
 
+  it('refuses to sync once the mirror directory was moved over the sync directory', async () => {
+    const repo = origin()
+    const { root, service, syncer } = setup()
+    const dir = join(root, 'out')
+    const { id } = await syncer.add({ url: repo.dir, dir })
+    await service.setMirrorDir(join(dir, 'mirrors'))
+    const refused = await syncer.syncNow(id)
+    expect(refused.error).toContain('镜像目录')
+    expect(existsSync(join(dir, 'mirrors', 'local'))).toBe(false)
+  })
+
   it('removes a sync with its index and keeps the files', async () => {
     const repo = origin()
     const { root, syncer } = setup()

@@ -423,9 +423,15 @@ export class LocalSyncer {
 
   /**
    * Fetch the mirror and expand the branch head into the sync's directory.
-   * @throws {RepoError} the mirror's failures; `conflict` when a first sync finds a non-empty directory; `unavailable` when the claim or the result cannot be saved.
+   * @throws {RepoError} the mirror's failures; `conflict` when the directory now overlaps the mirror directory or a first sync finds a non-empty directory; `unavailable` when the claim or the result cannot be saved.
    */
   private async expand(record: SyncRecord, signal: AbortSignal): Promise<void> {
+    // The mirror directory can change after the sync was added, so the overlap is checked again here.
+    const mirrors = this.deps.service.mirrorSettings().dir
+    const [realDir, realMirrors] = await Promise.all([realPathOf(record.dir), realPathOf(mirrors)])
+    if (within(mirrors, record.dir) || within(record.dir, mirrors) || within(realMirrors, realDir) || within(realDir, realMirrors)) {
+      throw new RepoError('conflict', `本地目录 ${record.dir} 与镜像目录 ${mirrors} 重叠，没有同步；请把本地同步或镜像目录换到不重叠的位置`)
+    }
     const mirror = await this.deps.service.syncMirror(record.url, { ...record.branch === undefined ? {} : { branch: record.branch }, signal })
     const index = this.indexFile(record.id, record.dir)
     if (record.last?.dir !== record.dir && record.claimedDir !== record.dir) {
