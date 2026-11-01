@@ -49,6 +49,7 @@ export interface SettingsDraft {
   readonly enabled: boolean
   readonly writes: RepoSettingsWire['tools']['writes']
   readonly merge: boolean
+  readonly deleteSourceBranch: boolean
   readonly signature: string
   readonly otherHosts: boolean
 }
@@ -106,6 +107,7 @@ export function toDraft(settings: RepoSettingsWire): SettingsDraft {
     enabled: settings.tools.enabled,
     writes: settings.tools.writes,
     merge: settings.tools.merge,
+    deleteSourceBranch: settings.tools.deleteSourceBranch,
     signature: settings.tools.signature,
     otherHosts: settings.mirror.otherHosts,
   }
@@ -164,7 +166,7 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
         maxTreeEntries: numbers.maxTreeEntries,
         maxComments: numbers.maxComments,
       },
-      tools: { enabled: draft.enabled, writes: draft.writes, merge: draft.merge, signature: draft.signature },
+      tools: { enabled: draft.enabled, writes: draft.writes, merge: draft.merge, deleteSourceBranch: draft.deleteSourceBranch, signature: draft.signature },
       mirror: { gitTimeoutMs: numbers.gitTimeoutMs, otherHosts: draft.otherHosts },
     },
   }

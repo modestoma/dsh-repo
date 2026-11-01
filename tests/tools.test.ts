@@ -52,7 +52,7 @@ describe('createTools', () => {
       'repo_info', 'repo_list_branches', 'repo_list_commits', 'repo_list_tree', 'repo_read_file',
       'repo_issue_list', 'repo_issue_get', 'repo_mr_list', 'repo_mr_get', 'repo_mr_diff', 'repo_mr_status',
       'repo_workspace_open', 'repo_workspace_changes',
-      'repo_workspace_push', 'repo_issue_create', 'repo_issue_update', 'repo_issue_comment', 'repo_mr_create', 'repo_mr_update', 'repo_mr_comment',
+      'repo_workspace_push', 'repo_issue_create', 'repo_issue_update', 'repo_issue_comment', 'repo_mr_create', 'repo_mr_update', 'repo_mr_comment', 'repo_branch_delete',
     ])
     expect(tools(testSettings({ tools: { writes: 'off', merge: true } })).has('repo_issue_create')).toBe(false)
     expect(tools(testSettings({ tools: { writes: 'off' } })).has('repo_workspace_push')).toBe(false)
@@ -73,6 +73,32 @@ describe('createTools', () => {
     await expect(built.get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'Bug' }, exec)).rejects.toThrow(/\[forbidden\].*关闭写操作/)
     expect(createIssue).toHaveBeenCalledTimes(1)
     expect(mergeChange).not.toHaveBeenCalled()
+  })
+
+  it('deletes source branches on create and merge as the settings say, and asks before deleting a merged branch', async () => {
+    let settings = testSettings({ tools: { writes: 'allow', merge: true } })
+    const createChange = vi.fn(async () => ({ number: 1 }))
+    const mergeChange = vi.fn(async () => ({ sha: 'm1' }))
+    const deleteMergedBranch = vi.fn(async () => ({ branch: 'f' }))
+    const built = new Map(createTools({ service: fakeService({ createChange, mergeChange, deleteMergedBranch }), settings: () => settings.tools, approval: () => undefined, workingDirectory: () => undefined })
+      .map(tool => [tool.definition.name, tool.definition]))
+    await built.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'T', sourceBranch: 'f' }, exec)
+    await built.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)
+    expect(createChange).toHaveBeenLastCalledWith('github.com/a/b', expect.objectContaining({ deleteSourceBranch: true }))
+    expect(mergeChange).toHaveBeenLastCalledWith('github.com/a/b', 1, expect.objectContaining({ deleteSourceBranch: true }))
+    settings = testSettings({ tools: { writes: 'allow', merge: true, deleteSourceBranch: false } })
+    await built.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'T', sourceBranch: 'f' }, exec)
+    await built.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)
+    expect(createChange).toHaveBeenLastCalledWith('github.com/a/b', expect.objectContaining({ deleteSourceBranch: false }))
+    expect(mergeChange).toHaveBeenLastCalledWith('github.com/a/b', 1, expect.objectContaining({ deleteSourceBranch: false }))
+
+    const request = vi.fn(async () => 'allowed-once' as const)
+    const asked = tools(testSettings({ tools: { merge: true } }), fakeService({ deleteMergedBranch, mergeChange }), { request })
+    expect(await asked.get('repo_branch_delete')!.execute({ repo: 'github.com/a/b', branch: 'f' }, exec)).toEqual({ branch: 'f' })
+    expect(deleteMergedBranch).toHaveBeenCalledWith('github.com/a/b', 'f', { signal: exec.signal })
+    expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ toolName: 'repo_branch_delete', reason: '删除已合并的分支\n仓库：github.com/a/b\n分支：f' }))
+    await asked.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)
+    expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ reason: expect.stringContaining('合并后删除源分支') }))
   })
 
   it('exposes JSON Schema parameters', () => {

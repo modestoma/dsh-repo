@@ -15,8 +15,8 @@ import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type {
-  CallOptions, ChangeCreate, CommitAuthor, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
-  HostCreate, HostInfo, HostsChange, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, PageOptions, RepoRef, RepoTarget,
+  CallOptions, ChangeCreate, ChangeInfo, CommitAuthor, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
+  HostCreate, HostInfo, HostsChange, MergedBranchDeletion, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, Page, PageOptions, RepoRef, RepoTarget,
   SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
 } from './contract.ts'
 import { apiBaseUrl, DEFAULT_SETTINGS, expandHome, resolveSettings } from './config.ts'
@@ -45,6 +45,21 @@ export const defaultProviderFactory: ProviderFactory = (spec, token, timeoutMs) 
   : new GitlabProvider(apiBaseUrl(spec), token, timeoutMs)
 
 const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
+
+/** Pages of change requests from one branch read before giving up. */
+const MAX_BRANCH_CHANGE_PAGES = 10
+
+/** Every change request, in any state, from a branch of the repository. */
+async function allChangesFrom(provider: Provider, ref: RepoRef, branch: string, call: Call): Promise<ChangeInfo[]> {
+  const found: ChangeInfo[] = []
+  for (let page: number | undefined = 1; page !== undefined;) {
+    if (page > MAX_BRANCH_CHANGE_PAGES) throw new RepoError('too-large', `分支 ${branch} 上的 PR/MR 超过 ${MAX_BRANCH_CHANGE_PAGES * call.limits.maxPerPage} 个`)
+    const result: Page<ChangeInfo> = await provider.listChanges(ref, { page, perPage: call.limits.maxPerPage, state: 'all', sourceBranch: branch }, call)
+    found.push(...result.items)
+    page = result.nextPage
+  }
+  return found
+}
 
 function requireBranch(value: string, label: string): void {
   if (!BRANCH.test(value) || value.startsWith('/') || value === '@') throw new RepoError('invalid', `${label}不合法：${value}`)
@@ -279,7 +294,7 @@ export class RepoService implements DshRepoService {
       const targetBranch = change.targetBranch ?? (await provider.repoInfo(ref, call)).defaultBranch
       if (targetBranch === change.sourceBranch) throw new RepoError('invalid', '源分支和目标分支不能相同')
       const { signal: _signal, ...fields } = change
-      return await provider.createChange(ref, { ...fields, targetBranch, draft: change.draft === true }, call)
+      return await provider.createChange(ref, { ...fields, targetBranch, draft: change.draft === true, deleteSourceBranch: change.deleteSourceBranch === true }, call)
     })
   }
 
@@ -299,8 +314,26 @@ export class RepoService implements DshRepoService {
   async mergeChange(repo: RepoTarget, number: number, options: MergeOptions) {
     requireNumber(number)
     if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(options.headSha)) throw new RepoError('invalid', `headSha 必须是完整的提交号：${options.headSha}`)
-    const request = { headSha: options.headSha, ...options.method === undefined ? {} : { method: options.method } }
+    const request = { headSha: options.headSha, ...options.method === undefined ? {} : { method: options.method }, deleteSourceBranch: options.deleteSourceBranch === true }
     return await this.run(repo, options, `合并 PR/MR #${number}`, (provider, ref, call) => provider.mergeChange(ref, number, request, call))
+  }
+
+  async deleteMergedBranch(repo: RepoTarget, branch: string, options: CallOptions = {}): Promise<MergedBranchDeletion> {
+    requireBranch(branch, '分支名')
+    return await this.run(repo, options, `删除分支 ${branch}`, async (provider, ref, call) => {
+      // The hosts' branch deletion takes no expected commit, so the head is read last, right before the deletion, to keep the window for a concurrent push small.
+      const changes = await allChangesFrom(provider, ref, branch, call)
+      const head = await provider.getBranch(ref, branch, call)
+      if (head === undefined) throw new RepoError('not-found', `没有分支 ${branch}`)
+      if (head.default) throw new RepoError('forbidden', `${branch} 是默认分支，不能删除`)
+      if (head.protected) throw new RepoError('forbidden', `${branch} 是受保护分支，不能删除`)
+      const open = changes.find(change => change.state === 'open')
+      if (open !== undefined) throw new RepoError('conflict', `${branch} 还是打开中的 PR/MR #${open.number} 的源分支，不能删除`)
+      const merged = changes.find(change => change.state === 'merged' && change.headSha === head.commit)
+      if (merged === undefined) throw new RepoError('conflict', `${branch} 的最新提交 ${head.commit.slice(0, 12)} 没有通过已合并的 PR/MR 合入，可能还有没合入的工作，不删除`)
+      await provider.deleteBranch(ref, branch, call)
+      return { branch, commit: head.commit, change: { number: merged.number, webUrl: merged.webUrl } }
+    })
   }
 
   async listHosts(): Promise<readonly HostInfo[]> {

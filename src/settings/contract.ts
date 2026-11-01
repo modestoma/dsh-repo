@@ -57,6 +57,7 @@ export interface RepoSettingsWire {
     enabled: boolean
     writes: 'ask' | 'allow' | 'off'
     merge: boolean
+    deleteSourceBranch: boolean
     signature: string
   }
   mirror: {

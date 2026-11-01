@@ -52,6 +52,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | 模型工具 | `tools.enabled`：是否提供 `repo_*` 工具 | 提供 | 保存条 |
 | 模型工具 | `tools.writes`：`ask` 每次审批、`allow` 不审批、`off` 不提供写工具 | `ask` | 保存条 |
 | 模型工具 | `tools.merge`：是否提供合并工具（审批跟随 `writes`） | 不提供 | 保存条 |
+| 模型工具 | `tools.deleteSourceBranch`：合并后删除源分支，见[合并后的分支](#合并后的分支) | 删除 | 保存条 |
 | 模型工具 | `tools.signature`：追加到模型写的正文和评论末尾 | 空 | 保存条 |
 | 高级 | `timeoutMs`：一次接口调用 | 30 秒 | 保存条 |
 | 高级 | `mirror.gitTimeoutMs`：一条 git 命令（clone、fetch、worktree、push） | 600 秒 | 保存条 |
@@ -94,7 +95,8 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | `repo_workspace_push` | 提交工作区未提交的改动并推送到工作区的远端分支，从不强推；结果列出这个分支上打开中的 PR/MR | 是 |
 | `repo_issue_create` / `repo_issue_update` / `repo_issue_comment` | 创建、修改、关闭或重开、评论 issue | 是 |
 | `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR | 是 |
-| `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；默认不提供 | 是 |
+| `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；按设置一并删除源分支；默认不提供 | 是 |
+| `repo_branch_delete` | 删除已经合并的遗留分支，见[合并后的分支](#合并后的分支) | 是 |
 
 - 写操作在设置页选「每次审批」（`writes: ask`）时每次调用都经 `ctx.approval` 请用户确认一次，被拒绝时工具返回 `{ "status": "declined" }`，不会调用主机。组合里没有审批服务时写工具报错。
 - 审批提示首行写要做的事，之后每行一项「标签：值」，文件列表缩进两格；审批端按行展示即可。`repo_workspace_push` 列出目标分支、仓库、起点、提交说明首行、改动总数与增删行数，以及按改动量排序的前 12 项文件改动，整个目录的移动合并成一行。
@@ -113,6 +115,21 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 
 工作区目录由 Agent 写入，dsh-repo 把它当作不可信内容：每次操作前核对工作区的 `.git` 文件与镜像里的记录互相指向、且元数据属于 dsh-repo 的镜像目录，再显式指定 `--git-dir` 和 `--work-tree` 运行 git，所以伪造的 `.git` 不能让插件进程在 Agent 控制的仓库配置下运行 git。镜像目录不要放在 Agent 可写的目录里。
 
+## 合并后的分支
+
+设置页「合并后删除源分支」（`tools.deleteSourceBranch`，默认开）打开时：
+
+- `repo_mr_create` 在 GitLab 上创建的 MR 勾选「合并后删除源分支」，之后不论在网页上还是用工具合并，GitLab 都会删除源分支。GitHub 的 PR 没有对应选项，网页合并后的分支由仓库设置「Automatically delete head branches」或下面的 `repo_branch_delete` 清理。
+- `repo_mr_merge` 合并后删除源分支：GitHub 在合并成功后删除，GitLab 在合并请求里带上 `should_remove_source_branch`。来自 fork 的分支、默认分支和受保护分支不删（GitHub 的保护规则即使允许删除也不删）；GitHub 上分支在合并后又有了新提交时也不删。删除失败不影响合并结果，结果的 `sourceBranch` 写明分支名、是否删除和没删的原因；GitHub 仓库已经自动删除了这个分支时按已删除报告。
+
+`repo_branch_delete` 不受这个开关控制，跟随写操作审批，用来清理已经留下来的分支。它只删除同时满足以下条件的分支，其余情况拒绝，所以不会丢掉没合入的工作：
+
+- 分支的最新提交是本仓库某个已合并 PR/MR 的 head 提交，即合并之后没有再推送新提交；否则以 `conflict` 拒绝。
+- 没有从它发起、仍打开中的 PR/MR；否则以 `conflict` 拒绝。
+- 不是默认分支，也不是受保护分支；否则以 `forbidden` 拒绝。
+
+GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支的最新提交在列出 PR/MR 之后、紧挨着删除时读取；这一次读取和删除之间如果恰好有人推送，新提交仍可能随分支一起删除。
+
 ## `dshRepos` 服务
 
 其他插件经 `ctx.get('dshRepos')` 取得服务，类型从 `dsh-repo/contract` 用 `import type` 引入，调用前检查 `version`：
@@ -126,7 +143,7 @@ if (repos?.version === 1) {
 }
 ```
 
-接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并，以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit, branch })` 在调用方给的目录（必须不存在）检出工作区，给出 `branch` 时接着这个已有分支修改，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session, trailers })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并，以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit, branch })` 在调用方给的目录（必须不存在）检出工作区，给出 `branch` 时接着这个已有分支修改，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session, trailers })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。`deleteMergedBranch(repo, branch)` 删除已经合并的分支，`createChange` / `mergeChange` 的 `deleteSourceBranch` 让源分支在合并后删除，规则见[合并后的分支](#合并后的分支)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
 
 ### 提交尾注事件
 
@@ -171,6 +188,7 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 | 指派人 | 统一用用户名；GitLab 先查用户 id |
 | CI 状态 | GitHub 合并 check runs 与 commit statuses；GitLab 读 MR 的 head pipeline |
 | 合并方式 | GitHub 支持 merge / squash / rebase；GitLab 支持 merge / squash |
+| 合并后删除源分支 | GitLab 创建 MR 时勾选 `remove_source_branch`、合并时带 `should_remove_source_branch`；GitHub 没有逐个 PR 的选项，合并成功后删除 `heads/<分支>` |
 
 ## 已知限制
 

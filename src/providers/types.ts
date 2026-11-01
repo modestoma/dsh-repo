@@ -31,6 +31,8 @@ export interface Provider {
   repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo>
   getBranch(ref: RepoRef, name: string, call: Call): Promise<BranchInfo | undefined>
   listBranches(ref: RepoRef, query: Paging & { readonly search?: string }, call: Call): Promise<Page<BranchInfo>>
+  /** Delete a branch; the service has already checked it may go. */
+  deleteBranch(ref: RepoRef, name: string, call: Call): Promise<void>
   listCommits(ref: RepoRef, query: Paging & { readonly ref?: string; readonly path?: string }, call: Call): Promise<Page<CommitInfo>>
   listTree(ref: RepoRef, query: { readonly ref?: string; readonly path: string; readonly recursive: boolean }, call: Call): Promise<TreeListing>
   readFile(ref: RepoRef, path: string, at: string | undefined, call: Call): Promise<FileContent>
@@ -45,10 +47,11 @@ export interface Provider {
   getChange(ref: RepoRef, number: number, call: Call): Promise<ChangeDetail>
   changeDiff(ref: RepoRef, number: number, call: Call): Promise<ChangeDiff>
   changeStatus(ref: RepoRef, number: number, call: Call): Promise<ChangeStatus>
-  createChange(ref: RepoRef, change: IssueFields & { readonly title: string; readonly sourceBranch: string; readonly targetBranch: string; readonly draft: boolean }, call: Call): Promise<ChangeInfo>
+  createChange(ref: RepoRef, change: IssueFields & { readonly title: string; readonly sourceBranch: string; readonly targetBranch: string; readonly draft: boolean; readonly deleteSourceBranch: boolean }, call: Call): Promise<ChangeInfo>
   updateChange(ref: RepoRef, number: number, update: IssueFields & { readonly state?: 'open' | 'closed'; readonly targetBranch?: string }, call: Call): Promise<ChangeInfo>
   commentChange(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
-  mergeChange(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod }, call: Call): Promise<MergeResult>
+  /** With `deleteSourceBranch`, the result reports the source branch; a failed deletion does not throw. */
+  mergeChange(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod; readonly deleteSourceBranch: boolean }, call: Call): Promise<MergeResult>
 }
 
 /** Editable fields shared by issues and change requests. */
@@ -85,6 +88,15 @@ export function truncateBytes(text: string, maxBytes: number): { text: string; t
   // Step back over UTF-8 continuation bytes so no character is split.
   while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1
   return { text: bytes.subarray(0, end).toString('utf8'), truncated: true }
+}
+
+/**
+ * The message of a thrown value.
+ * @param error - anything thrown.
+ * @returns its message, or its string form.
+ */
+export function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /**
