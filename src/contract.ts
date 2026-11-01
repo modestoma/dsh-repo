@@ -342,6 +342,12 @@ export interface ChangeCreate extends CallOptions {
   readonly draft?: boolean
   readonly labels?: readonly string[]
   readonly assignees?: readonly string[]
+  /**
+   * GitLab: tick the merge request's "delete source branch" option, so GitLab
+   * deletes the branch when the request is merged, by any means. GitHub has
+   * no per-request option and ignores it. Default false.
+   */
+  readonly deleteSourceBranch?: boolean
 }
 
 /** Fields to change on a change request; omitted fields stay. */
@@ -363,12 +369,39 @@ export interface MergeOptions extends CallOptions {
   readonly headSha: string
   /** Default: the repository's setting. GitLab honors `squash`; `rebase` is GitHub only. */
   readonly method?: MergeMethod
+  /**
+   * Delete the source branch after the merge. Only a branch of the same
+   * repository is deleted, never one in a fork or the default branch; a
+   * failed deletion is reported in {@link MergeResult.sourceBranch} and does
+   * not fail the merge. Default false.
+   */
+  readonly deleteSourceBranch?: boolean
 }
 
 /** Outcome of a merge. */
 export interface MergeResult {
   /** The merge (or squash) commit, when the host reports it. */
   readonly sha?: string
+  /** Present when {@link MergeOptions.deleteSourceBranch} was set. */
+  readonly sourceBranch?: SourceBranchDeletion
+}
+
+/** What happened to the source branch of a merged change request. */
+export interface SourceBranchDeletion {
+  readonly name: string
+  /** Whether the branch is gone or the host deletes it as part of the merge (GitLab). */
+  readonly deleted: boolean
+  /** Why the branch was kept, when {@link deleted} is false. */
+  readonly reason?: string
+}
+
+/** A branch deleted by {@link DshRepoService.deleteMergedBranch}. */
+export interface MergedBranchDeletion {
+  readonly branch: string
+  /** The commit the branch pointed to. */
+  readonly commit: string
+  /** The merged change request whose head was that commit. */
+  readonly change: { readonly number: number; readonly webUrl: string }
 }
 
 /** Whether a credential reference has a value — never the value. */
@@ -629,6 +662,17 @@ export interface DshRepoService {
   commentChange(repo: RepoTarget, number: number, body: string, options?: CallOptions): Promise<CommentInfo>
   /** @returns the merge outcome. */
   mergeChange(repo: RepoTarget, number: number, options: MergeOptions): Promise<MergeResult>
+  /**
+   * Delete a branch whose work is already merged: its head is the head of a
+   * merged change request from this repository, and no open change request
+   * comes from it.
+   * @param repo - repository target.
+   * @param branch - branch name.
+   * @param options - cancellation.
+   * @returns the deleted branch and the change request that merged it.
+   * @throws `not-found` when the branch does not exist, `forbidden` for the default or a protected branch, `conflict` when its head is not merged or a change request from it is open.
+   */
+  deleteMergedBranch(repo: RepoTarget, branch: string, options?: CallOptions): Promise<MergedBranchDeletion>
 
   /** @returns every host, configured ones first, with the status of its token. */
   listHosts(): Promise<readonly HostInfo[]>

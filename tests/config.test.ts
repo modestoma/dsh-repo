@@ -23,7 +23,7 @@ describe('resolveConfig', () => {
 
 describe('resolveSettings', () => {
   it('fills every missing field with its default', () => {
-    expect(DEFAULT_SETTINGS.tools).toEqual({ enabled: true, writes: 'ask', merge: false, signature: '' })
+    expect(DEFAULT_SETTINGS.tools).toEqual({ enabled: true, writes: 'ask', merge: false, deleteSourceBranch: true, signature: '' })
     expect(resolveSettings({ limits: { perPage: 50 } })).toEqual({ ...DEFAULT_SETTINGS, limits: { ...DEFAULT_SETTINGS.limits, perPage: 50 } })
   })
 

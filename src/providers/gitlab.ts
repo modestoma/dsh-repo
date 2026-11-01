@@ -9,7 +9,7 @@
 
 import { Gitlab } from '@gitbeaker/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { nextPage, titleOf, truncateBytes } from './types.ts'
@@ -68,6 +68,13 @@ interface GitlabMergeRequest extends GitlabIssue {
   readonly sha: string
   readonly source_project_id?: number
   readonly target_project_id?: number
+  readonly should_remove_source_branch?: boolean | null
+  readonly force_remove_source_branch?: boolean | null
+}
+
+/** Whether a merge request comes from a fork. */
+function fromFork(value: GitlabMergeRequest): boolean {
+  return value.source_project_id !== undefined && value.source_project_id !== value.target_project_id
 }
 
 function mergeRequest(value: GitlabMergeRequest): ChangeInfo {
@@ -98,6 +105,12 @@ function pipelineState(status: string): CheckInfo['state'] {
   if (status === 'success' || status === 'skipped') return 'success'
   if (status === 'failed' || status === 'canceled') return 'failure'
   return 'pending'
+}
+
+/** What GitLab does with the source branch of a merged merge request; GitLab itself never deletes the default or a protected branch. */
+function mergedSource(value: GitlabMergeRequest): SourceBranchDeletion {
+  if (value.should_remove_source_branch === true || value.force_remove_source_branch === true) return { name: value.source_branch, deleted: true }
+  return { name: value.source_branch, deleted: false, reason: 'GitLab 没有接受删除源分支' }
 }
 
 /** Detailed merge statuses GitLab reports while it is still computing mergeability. */
@@ -148,6 +161,11 @@ export class GitlabProvider implements Provider {
     const data = await this.api.Branches.all(ref.path, { ...paging(query), ...query.search === undefined ? {} : { search: query.search } })
     const items: BranchInfo[] = data.map(branch => ({ name: branch.name, commit: String(branch.commit.id), protected: branch.protected, default: branch.default }))
     return { items, ...nextPage(query, data.length) }
+  }
+
+  async deleteBranch(ref: RepoRef, name: string, call: Call) {
+    call.signal.throwIfAborted()
+    await this.api.Branches.remove(ref.path, name)
   }
 
   async getBranch(ref: RepoRef, name: string, call: Call) {
@@ -264,7 +282,7 @@ export class GitlabProvider implements Provider {
       ...query.targetBranch === undefined ? {} : { targetBranch: query.targetBranch },
     })
     // A source branch names a branch of this project, as GitHub's `head=owner:branch` does; MRs from forks with the same branch name are left out.
-    const items = query.sourceBranch === undefined ? data : data.filter(entry => entry.source_project_id === entry.target_project_id)
+    const items = query.sourceBranch === undefined ? data : data.filter(entry => !fromFork(entry))
     return { items: items.map(entry => mergeRequest(entry)), ...nextPage(query, data.length) }
   }
 
@@ -309,7 +327,7 @@ export class GitlabProvider implements Provider {
     }
   }
 
-  async createChange(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
+  async createChange(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; deleteSourceBranch: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
     const assigneeIds = await this.userIds(fields.assignees, call)
     call.signal.throwIfAborted()
     const title = fields.draft && !fields.title.startsWith(DRAFT_PREFIX) ? `${DRAFT_PREFIX}${fields.title}` : fields.title
@@ -317,6 +335,7 @@ export class GitlabProvider implements Provider {
       ...fields.body === undefined ? {} : { description: fields.body },
       ...fields.labels === undefined ? {} : { labels: fields.labels.join(',') },
       ...assigneeIds === undefined ? {} : { assigneeIds },
+      ...fields.deleteSourceBranch ? { removeSourceBranch: true } : {},
     })
     return mergeRequest(data)
   }
@@ -340,15 +359,21 @@ export class GitlabProvider implements Provider {
     return note(await this.api.MergeRequestNotes.create(ref.path, number, body))
   }
 
-  async mergeChange(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase' }, call: Call) {
+  async mergeChange(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase'; deleteSourceBranch: boolean }, call: Call) {
     if (request.method === 'rebase') throw new RepoError('invalid', 'GitLab 的合并接口不支持 rebase 方式；可用 merge 或 squash')
+    call.signal.throwIfAborted()
+    // GitLab would also delete a fork's branch when the token may; look first so only same-project branches go.
+    const fork = request.deleteSourceBranch && fromFork(await this.api.MergeRequests.show(ref.path, number))
     call.signal.throwIfAborted()
     const data = await this.api.MergeRequests.merge(ref.path, number, {
       sha: request.headSha,
       ...request.method === undefined ? {} : { squash: request.method === 'squash' },
+      ...request.deleteSourceBranch && !fork ? { shouldRemoveSourceBranch: true } : {},
     })
     const sha = data.merge_commit_sha ?? data.squash_commit_sha
-    return typeof sha === 'string' ? { sha } : {}
+    const merged = typeof sha === 'string' ? { sha } : {}
+    if (!request.deleteSourceBranch) return merged
+    return { ...merged, sourceBranch: fork ? { name: data.source_branch, deleted: false, reason: '源分支在 fork 项目里，不删除' } : mergedSource(data) }
   }
 
   /** User ids for usernames; GitLab assigns by id. */

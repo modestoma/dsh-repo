@@ -8,10 +8,10 @@
 
 import { Octokit } from '@octokit/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CheckState, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CheckState, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
-import { nextPage, titleOf, truncateBytes } from './types.ts'
+import { errorText, nextPage, titleOf, truncateBytes } from './types.ts'
 import type { Call, Provider, TokenSource } from './types.ts'
 
 /** GitHub's largest page. */
@@ -175,6 +175,10 @@ export class GithubProvider implements Provider {
       .filter(branch => query.search === undefined || branch.name.includes(query.search))
       .map(branch => ({ name: branch.name, commit: branch.commit.sha, protected: branch.protected, default: branch.name === info.data.default_branch }))
     return { items, ...nextPage(query, data.length) }
+  }
+
+  async deleteBranch(ref: RepoRef, name: string, call: Call) {
+    await this.octokit.rest.git.deleteRef({ ...split(ref.path), ref: `heads/${name}`, request: { signal: call.signal } })
   }
 
   async getBranch(ref: RepoRef, name: string, call: Call) {
@@ -351,6 +355,7 @@ export class GithubProvider implements Provider {
     return { headSha: sha, checks, overall: overall(checks), ...change.mergeable === null ? {} : { mergeable: change.mergeable } }
   }
 
+  /** GitHub has no per-request "delete source branch" option, so `deleteSourceBranch` is not sent. */
   async createChange(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
     const repo = split(ref.path)
     const { data } = await this.octokit.rest.pulls.create({
@@ -402,7 +407,7 @@ export class GithubProvider implements Provider {
     return await this.commentIssue(ref, number, body, call)
   }
 
-  async mergeChange(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase' }, call: Call) {
+  async mergeChange(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase'; deleteSourceBranch: boolean }, call: Call) {
     const { data } = await this.octokit.rest.pulls.merge({
       ...split(ref.path),
       pull_number: number,
@@ -410,7 +415,25 @@ export class GithubProvider implements Provider {
       ...request.method === undefined ? {} : { merge_method: request.method },
       request: { signal: call.signal },
     })
-    return { sha: data.sha }
+    if (!request.deleteSourceBranch) return { sha: data.sha }
+    return { sha: data.sha, sourceBranch: await this.deleteMergedHead(ref, number, call) }
+  }
+
+  /** Delete the head branch of a just-merged pull request when it lives in the same repository; never throws. */
+  private async deleteMergedHead(ref: RepoRef, number: number, call: Call): Promise<SourceBranchDeletion> {
+    let name = ''
+    try {
+      const { data } = await this.octokit.rest.pulls.get({ ...split(ref.path), pull_number: number, request: { signal: call.signal } })
+      name = data.head.ref
+      if (data.head.repo?.id !== data.base.repo.id) return { name, deleted: false, reason: '源分支在 fork 仓库里，不删除' }
+      if (name === data.base.repo.default_branch) return { name, deleted: false, reason: '源分支是默认分支，不删除' }
+      await this.deleteBranch(ref, name, call)
+      return { name, deleted: true }
+    } catch (error) {
+      // The repository's "automatically delete head branches" setting may already have removed it.
+      if ((error as { status?: number }).status === 422 && /Reference does not exist/i.test(errorText(error))) return { name, deleted: true }
+      return { name, deleted: false, reason: `删除源分支失败：${errorText(error)}` }
+    }
   }
 
   /** Every page of a list endpoint, so an aggregate never rests on a partial list. */

@@ -279,6 +279,10 @@ function ToolsTab({ current, defaults, errors, busy, edit }: FormProps): JSX.Ele
       <Row label="合并 PR/MR" summary="审批方式同写操作。">
         <Switch label="合并 PR/MR" checked={current.merge} disabled={busy || off || current.writes === 'off'} onChange={(value) => { edit({ merge: value }) }} />
       </Row>
+      <Row label="合并后删除源分支" summary="GitLab 新建的 MR 勾选「合并后删除源分支」，用工具合并时也一并删除；fork、默认和受保护分支不删。">
+        <ResetLink shown={current.deleteSourceBranch !== defaults.deleteSourceBranch} busy={busy} onReset={() => { edit({ deleteSourceBranch: defaults.deleteSourceBranch }) }} />
+        <Switch label="合并后删除源分支" checked={current.deleteSourceBranch} disabled={busy || off || current.writes === 'off'} onChange={(value) => { edit({ deleteSourceBranch: value }) }} />
+      </Row>
       <Row label="署名" summary="追加到模型写的正文和评论末尾。" error={errors.signature}>
         <input className="dr__input dr__input--wide" aria-label="署名" placeholder="不追加" value={current.signature} disabled={busy || off || current.writes === 'off'} onChange={(event) => { edit({ signature: event.target.value }) }} />
       </Row>

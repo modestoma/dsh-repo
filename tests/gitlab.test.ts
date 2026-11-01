@@ -96,6 +96,39 @@ describe('GitLab provider', () => {
     await expect(service.mergeChange(REPO, 7, { headSha: SHA, method: 'rebase' })).rejects.toMatchObject({ code: 'invalid' })
   })
 
+  it('ticks "delete source branch" on new merge requests and asks GitLab to delete it on merge, except for forks', async () => {
+    let shown = mr({ source_project_id: 1, target_project_id: 1 })
+    const { requests } = fakeHttp([
+      { method: 'POST', path: `${API}/merge_requests`, reply: { status: 201, body: mr({ force_remove_source_branch: true }) } },
+      { method: 'GET', path: `${API}/merge_requests/7`, reply: () => ({ body: shown }) },
+      { method: 'PUT', path: `${API}/merge_requests/7/merge`, reply: request => ({ body: mr({ state: 'merged', merge_commit_sha: 'm1', should_remove_source_branch: (request.body as { should_remove_source_branch?: boolean }).should_remove_source_branch ?? null, force_remove_source_branch: false }) }) },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', deleteSourceBranch: true })
+    expect(requests.at(-1)?.body).toMatchObject({ remove_source_branch: true })
+    await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main' })
+    expect(requests.at(-1)?.body).not.toHaveProperty('remove_source_branch')
+
+    expect(await service.mergeChange(REPO, 7, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: true } })
+    expect(requests.at(-1)?.body).toEqual({ sha: SHA, should_remove_source_branch: true })
+    shown = mr({ source_project_id: 2, target_project_id: 1 })
+    expect(await service.mergeChange(REPO, 7, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: false, reason: expect.stringContaining('fork') } })
+    expect(requests.at(-1)?.body).toEqual({ sha: SHA })
+  })
+
+  it('deletes a merged branch through the Branches API', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/repository/branches/f`, reply: { body: { name: 'f', protected: false, default: false, commit: { id: SHA } } } },
+      { method: 'GET', path: `${API}/merge_requests`, reply: { body: [mr({ state: 'merged', source_project_id: 1, target_project_id: 1 })] } },
+      { method: 'DELETE', path: `${API}/repository/branches/f`, reply: { status: 204 } },
+    ])
+    expect(await createService(testConfig(), TOKENS).deleteMergedBranch(REPO, 'f')).toEqual({ branch: 'f', commit: SHA, change: { number: 7, webUrl: `${REPO}/-/merge_requests/7` } })
+    const list = requests.find(request => request.url.pathname === `${API}/merge_requests`)
+    expect(list?.url.searchParams.get('source_branch')).toBe('f')
+    expect(list?.url.searchParams.has('state')).toBe(false)
+    expect(requests.at(-1)?.method).toBe('DELETE')
+  })
+
   it('builds a unified diff from the per-file diffs', async () => {
     fakeHttp([{ method: 'GET', path: `${API}/merge_requests/7/diffs`, reply: { body: [
       { old_path: 'a.txt', new_path: 'a.txt', new_file: false, deleted_file: false, diff: '@@ -1 +1 @@\n-a\n+b\n' },

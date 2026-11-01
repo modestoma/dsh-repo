@@ -80,6 +80,63 @@ describe('GitHub provider', () => {
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, merge_method: 'squash' })
   })
 
+  it('deletes the head branch after a merge, keeping a fork\'s branch and treating an auto-deleted branch as deleted', async () => {
+    const merged = (headRepo: number | null, ref = 'f') => ({ number: 5, head: { ref, sha: SHA, repo: headRepo === null ? null : { id: headRepo } }, base: { ref: 'main', repo: { id: 1, default_branch: 'main' } } })
+    let pull = merged(1)
+    let deleteReply: { status: number; body: unknown } = { status: 204, body: undefined }
+    const { requests } = fakeHttp([
+      { method: 'PUT', path: `${API}/pulls/5/merge`, reply: { body: { sha: 'm1', merged: true } } },
+      { method: 'GET', path: `${API}/pulls/5`, reply: () => ({ body: pull }) },
+      { method: 'DELETE', path: new RegExp(`${API}/git/refs/heads(/|%2F)f$`), reply: () => deleteReply },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    expect(await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: true } })
+    expect(requests.filter(request => request.method === 'DELETE')).toHaveLength(1)
+    deleteReply = { status: 422, body: { message: 'Reference does not exist' } }
+    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
+    deleteReply = { status: 422, body: { message: 'Cannot delete protected branch' } }
+    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'f', deleted: false, reason: expect.stringContaining('protected') })
+    pull = merged(2)
+    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('fork') })
+    pull = merged(1, 'main')
+    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'main', deleted: false })
+    const deletes = requests.filter(request => request.method === 'DELETE').length
+    expect(await service.mergeChange(REPO, 5, { headSha: SHA })).toEqual({ sha: 'm1' })
+    expect(requests.filter(request => request.method === 'DELETE')).toHaveLength(deletes)
+  })
+
+  it('deletes a branch only when its head was merged through a PR and no PR from it is open', async () => {
+    const pr = (number: number, state: string, mergedAt: string | null, sha = SHA) => ({ number, title: 'T', body: null, state, draft: false, merged_at: mergedAt, head: { ref: 'f', sha }, base: { ref: 'main' }, user: author, labels: [], assignees: [], created_at: 'c', updated_at: 'u', html_url: `${REPO}/pull/${number}` })
+    let pulls = [pr(4, 'closed', null, 'c'.repeat(40)), pr(5, 'closed', '2026-10-30')]
+    let branch = { name: 'f', protected: false, commit: { sha: SHA } }
+    const { requests } = fakeHttp([
+      { method: 'GET', path: API, reply: { body: repoBody } },
+      { method: 'GET', path: `${API}/branches/f`, reply: () => ({ body: branch }) },
+      { method: 'GET', path: `${API}/branches/main`, reply: { body: { name: 'main', protected: false, commit: { sha: SHA } } } },
+      { method: 'GET', path: `${API}/branches/none`, reply: { status: 404, body: { message: 'Branch not found' } } },
+      { method: 'GET', path: `${API}/pulls`, reply: () => ({ body: pulls }) },
+      { method: 'DELETE', path: new RegExp(`${API}/git/refs/heads(/|%2F)f$`), reply: { status: 204 } },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    expect(await service.deleteMergedBranch(REPO, 'f')).toEqual({ branch: 'f', commit: SHA, change: { number: 5, webUrl: `${REPO}/pull/5` } })
+    const list = requests.find(request => request.url.pathname === `${API}/pulls`)
+    expect(list?.url.searchParams.get('head')).toBe('modestoma:f')
+    expect(list?.url.searchParams.get('state')).toBe('all')
+    expect(requests.filter(request => request.method === 'DELETE')).toHaveLength(1)
+
+    pulls = [pr(5, 'closed', '2026-10-30'), pr(6, 'open', null)]
+    await expect(service.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('#6') })
+    pulls = [pr(5, 'closed', '2026-10-30', 'c'.repeat(40))]
+    await expect(service.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('没有通过已合并') })
+    pulls = [pr(5, 'closed', null)]
+    await expect(service.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'conflict' })
+    branch = { ...branch, protected: true }
+    await expect(service.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'forbidden' })
+    await expect(service.deleteMergedBranch(REPO, 'main')).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('默认分支') })
+    await expect(service.deleteMergedBranch(REPO, 'none')).rejects.toMatchObject({ code: 'not-found' })
+    expect(requests.filter(request => request.method === 'DELETE')).toHaveLength(1)
+  })
+
   it('aggregates every page of check runs with commit statuses', async () => {
     const passing = Array.from({ length: 100 }, (_, index) => ({ name: `ok${index}`, status: 'completed', conclusion: 'success', html_url: null }))
     fakeHttp([

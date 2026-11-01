@@ -275,13 +275,18 @@ export function createTools(deps: ToolDeps): RepoTool[] {
     }),
     define(deps, {
       name: 'repo_mr_create',
-      description: 'Open a pull request (GitHub) or merge request (GitLab) from a pushed branch. Requires user approval.',
+      description: 'Open a pull request (GitHub) or merge request (GitLab) from a pushed branch. When the settings delete source branches, a GitLab MR is opened with "delete source branch" ticked, so GitLab removes the branch once it is merged. Requires user approval.',
       schema: z.object({ repo, title: z.string().min(1), body: z.string().optional(), sourceBranch: z.string().min(1), targetBranch: z.string().optional(), draft: z.boolean().optional(), labels, assignees }).strict(),
       describe: args => ({
         zh: `创建${args.draft === true ? '草稿 ' : ''}PR/MR\n仓库：${args.repo}\n分支：${args.sourceBranch} → ${args.targetBranch ?? '默认分支'}\n标题：${args.title}`,
         en: `Open a ${args.draft === true ? 'draft ' : ''}PR/MR\nRepository: ${args.repo}\nBranches: ${args.sourceBranch} → ${args.targetBranch ?? 'default branch'}\nTitle: ${args.title}`,
       }),
-      run: (args, signal) => service.createChange(args.repo, { ...args, ...args.body === undefined ? {} : { body: sign(args.body) }, signal }),
+      run: (args, signal) => service.createChange(args.repo, {
+        ...args,
+        ...args.body === undefined ? {} : { body: sign(args.body) },
+        deleteSourceBranch: deps.settings().deleteSourceBranch,
+        signal,
+      }),
     }),
     define(deps, {
       name: 'repo_mr_update',
@@ -297,18 +302,34 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       describe: args => ({ zh: `评论 ${args.repo} 的 PR/MR #${args.number}`, en: `Comment on PR/MR #${args.number} in ${args.repo}` }),
       run: (args, signal) => service.commentChange(args.repo, args.number, signRequired(args.body), { signal }),
     }),
+    define(deps, {
+      name: 'repo_branch_delete',
+      description: 'Delete a leftover branch whose work is already merged, e.g. after a PR/MR was merged on the web. Only deletes a branch whose head commit is the head of a merged PR/MR from this repository and that is not the source of an open PR/MR, the default branch, or protected; anything else is refused, so unmerged work is never lost. Find candidates with repo_mr_list (state merged). Requires user approval.',
+      schema: z.object({ repo, branch: z.string().min(1).describe('Branch to delete') }).strict(),
+      describe: args => ({ zh: `删除已合并的分支\n仓库：${args.repo}\n分支：${args.branch}`, en: `Delete a merged branch\nRepository: ${args.repo}\nBranch: ${args.branch}` }),
+      run: (args, signal) => service.deleteMergedBranch(args.repo, args.branch, { signal }),
+    }),
   ]
   const merge = define(deps, {
     name: 'repo_mr_merge',
-    description: 'Merge a pull/merge request, only while its head is still `headSha` (read it with repo_mr_status first). Requires user approval.',
+    description: 'Merge a pull/merge request, only while its head is still `headSha` (read it with repo_mr_status first). When the settings delete source branches, its source branch is deleted too (never a fork\'s); `sourceBranch` in the result says whether it was. Requires user approval.',
     schema: z.object({ repo, number, headSha: z.string().min(40), method: z.enum(['merge', 'squash', 'rebase']).optional() }).strict(),
     describe: (args) => {
       requireMerge(deps)
-      return { zh: `合并 ${args.repo} 的 PR/MR #${args.number}（head ${args.headSha.slice(0, 12)}${args.method === undefined ? '' : `，方式 ${args.method}`}）`, en: `Merge PR/MR #${args.number} in ${args.repo} at ${args.headSha.slice(0, 12)}` }
+      const drop = deps.settings().deleteSourceBranch
+      return {
+        zh: `合并 ${args.repo} 的 PR/MR #${args.number}（head ${args.headSha.slice(0, 12)}${args.method === undefined ? '' : `，方式 ${args.method}`}${drop ? '，合并后删除源分支' : ''}）`,
+        en: `Merge PR/MR #${args.number} in ${args.repo} at ${args.headSha.slice(0, 12)}${drop ? ', then delete its source branch' : ''}`,
+      }
     },
     run: (args, signal) => {
       requireMerge(deps)
-      return service.mergeChange(args.repo, args.number, { headSha: args.headSha, ...args.method === undefined ? {} : { method: args.method }, signal })
+      return service.mergeChange(args.repo, args.number, {
+        headSha: args.headSha,
+        ...args.method === undefined ? {} : { method: args.method },
+        deleteSourceBranch: deps.settings().deleteSourceBranch,
+        signal,
+      })
     },
   })
   return [
