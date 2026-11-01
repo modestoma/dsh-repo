@@ -148,11 +148,15 @@ describe('createTools', () => {
     expect(workspaceChanges).toHaveBeenCalledWith(join(root, 'ws'), { signal: run.signal })
     expect(await all.get('repo_workspace_push')!.execute({ branch: 'fix/a', message: 'fix: a\n\nbody' }, run)).toEqual({ branch: 'fix/a' })
     const reason = request.mock.calls[0]?.[0].reason ?? ''
-    expect(reason).toContain('推送到分支 fix/a（起点 main')
-    expect(reason).toContain('2 个文件，+3 −1')
-    expect(reason).toContain('提交说明：fix: a')
-    expect(reason).toContain('src/a.ts +3 −1')
-    expect(reason).toContain('logo.png（二进制）')
+    expect(reason.split('\n')).toEqual([
+      '推送工作区改动到新分支 fix/a',
+      '仓库：https://github.com/a/b.git',
+      `起点：main @ ${'c'.repeat(12)}`,
+      '提交说明：fix: a（另有 1 行正文）',
+      '改动：2 个文件，+3 −1（相对起点）',
+      '  修改 src/a.ts  +3 −1',
+      '  新增 logo.png（二进制）',
+    ])
     expect(pushWorkspace).toHaveBeenCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: a\n\nbody', session: 'session-1', signal: run.signal })
     await expect(all.get('repo_workspace_changes')!.execute({ dir: tmpdir() }, run)).rejects.toThrow(/^\[not-found\]/)
   })
