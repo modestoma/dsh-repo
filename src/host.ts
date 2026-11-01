@@ -139,6 +139,44 @@ export interface HostLogger {
   error?(message: string, ...args: unknown[]): void
 }
 
+/**
+ * One user-role message (`@deepseek-ai/dsh-llm` `UserMessage`). `source.kind`
+ * names the producer; `form: 'notice'` with `summary` makes transcripts show
+ * the one-line summary.
+ */
+export interface UserMessage {
+  readonly id: string
+  readonly role: 'user'
+  readonly content: readonly ContentBlock[]
+  readonly source: { readonly kind: string; readonly form?: 'notice'; readonly summary?: string }
+}
+
+/** A live Agent's inbox (`@deepseek-ai/dsh-agent`). */
+export interface LiveAgent {
+  readonly session: { readonly header: { readonly id: string } }
+  /** Queue a follow-up turn holding only `message` and wake the driver. */
+  followup(message: UserMessage): void
+  /** Queue context for the next step without waking the driver; cancellation or disposal may discard it. */
+  inject(message: UserMessage): void
+}
+
+/** The `ctx.agents` slice: live Agents by Session id. */
+export interface AgentRegistry {
+  get(sessionId: string): LiveAgent | undefined
+}
+
+/** The optional `ctx.sessionController` slice (`@deepseek-ai/dsh-api-session-controller`). */
+export interface SessionController {
+  /** Resolve or resume one ordinary Session; `error.code` is `session/not-found` for a deleted Session. */
+  resolveAgent(sessionId: string): Promise<{ readonly agent: LiveAgent } | { readonly error: Error & { readonly code?: string } }>
+}
+
+/** The `ctx.sessions` slice (`@deepseek-ai/dsh-session`). */
+export interface SessionStore {
+  /** @returns whether at least one durability listener stored the Session's buffered events. */
+  flush(session: LiveAgent['session']): Promise<boolean>
+}
+
 /** The plugin context slice this plugin uses. */
 export interface HostContext {
   readonly tools: ToolRegistry
@@ -152,6 +190,11 @@ export interface HostContext {
    * them; rejects with an `AggregateError` of the listeners that threw.
    */
   parallel?(name: string, ...args: unknown[]): Promise<void>
+  /**
+   * Run the listeners of a Cordis event as a chain around `next`, the last
+   * argument; each listener returns its result or delegates to `next()`.
+   */
+  waterfall?(name: string, ...args: unknown[]): unknown
   /** Run `callback` with a context that has every named service, again whenever they are replaced. */
   inject?(dependencies: string[], callback: (child: HostContext) => void): unknown
 }

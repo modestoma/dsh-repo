@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -174,9 +174,31 @@ describe('settings routes', () => {
     expect((await native.call('/dsh-repo/pick-directory', { method: 'POST' })).body).toEqual({ ok: true, path: null })
   })
 
+  it('lists watched PRs/MRs, stops one on request, and reports whether watching can wake Sessions', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-repo-settings-'))
+    mkdirSync(join(home, 'dsh-repo'), { recursive: true })
+    const watch = {
+      id: 'github.com/a/b!5@s1', kind: 'github', host: 'github.com', path: 'a/b', number: 5, title: 'Fix', webUrl: 'https://github.com/a/b/pull/5', session: 's1', source: 'created',
+      startedAt: '2026-11-01T00:00:00.000Z', lastActivityAt: '2026-11-01T00:00:00.000Z', ownComments: [], ownHeads: [], wakes: { day: '2026-11-01', count: 0 }, pending: [], dropped: 0, failures: 3, lastError: '检查失败',
+    }
+    writeFileSync(join(home, 'dsh-repo', 'watches.json'), JSON.stringify({ watches: [watch] }))
+    // Watching off: the seeded watch is listed but never polled, so no request leaves the test.
+    writeFileSync(join(home, 'dsh-repo', 'hosts.json'), JSON.stringify({ hosts: [], settings: { watch: { enabled: false } } }))
+    const { call, json } = await serve(undefined, { sessionController: { resolveAgent: async () => ({ error: new Error('unused') }) } }, home)
+    const state = (await call('/dsh-repo/state')).body as unknown as SettingsState
+    expect(state.watchAvailable).toBe(false)
+    expect(state.watches).toEqual([{ id: watch.id, repo: 'github.com/a/b', number: 5, title: 'Fix', webUrl: watch.webUrl, session: 's1', source: 'created', startedAt: watch.startedAt, lastActivityAt: watch.lastActivityAt, failures: 3, lastError: '检查失败', pending: 0 }])
+    expect((await call('/dsh-repo/watches', json('DELETE', { id: 'missing' }))).status).toBe(404)
+    const stopped = await call('/dsh-repo/watches', json('DELETE', { id: watch.id }))
+    expect((stopped.body.state as SettingsState).watches).toEqual([])
+    expect(JSON.parse(readFileSync(join(home, 'dsh-repo', 'watches.json'), 'utf8'))).toEqual({ watches: [] })
+    expect(((await (await serve(undefined, { sessionController: {} })).call('/dsh-repo/state')).body as unknown as SettingsState).watchAvailable).toBe(true)
+    expect(((await (await serve()).call('/dsh-repo/state')).body as unknown as SettingsState).watchAvailable).toBe(false)
+  })
+
   it('removes its routes when the Web server goes away', async () => {
     const { routes, disposers } = await serve()
-    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/pick-directory', '/dsh-repo/settings', '/dsh-repo/state'])
+    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/pick-directory', '/dsh-repo/settings', '/dsh-repo/state', '/dsh-repo/watches'])
     for (const dispose of disposers) dispose()
     expect(routes.size).toBe(0)
   })

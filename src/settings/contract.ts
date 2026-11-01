@@ -19,6 +19,8 @@ export const MIRROR_ROUTE = '/dsh-repo/mirror'
 export const SETTINGS_ROUTE = '/dsh-repo/settings'
 /** POST：打开宿主机的系统目录选择框，响应 {@link PickedDirectory}。 */
 export const PICK_DIRECTORY_ROUTE = '/dsh-repo/pick-directory'
+/** DELETE：body `{ id }` 停止跟踪一个 PR/MR。 */
+export const WATCHES_ROUTE = '/dsh-repo/watches'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
@@ -33,12 +35,31 @@ export const SETTING_BOUNDS = {
   maxDiffBytes: { min: 1, max: 64 * 1024 * 1024 },
   maxTreeEntries: { min: 1, max: 100_000 },
   maxComments: { min: 1, max: 100 },
+  activeIntervalMs: { min: 15_000, max: 3_600_000 },
+  quietIntervalMs: { min: 60_000, max: 86_400_000 },
+  quietAfterMs: { min: 60_000, max: 7 * 86_400_000 },
+  batchMs: { min: 0, max: 3_600_000 },
+  idleDays: { min: 1, max: 90 },
+  dailyWakeLimit: { min: 1, max: 100 },
+  maxWatches: { min: 1, max: 500 },
 } as const satisfies Record<string, { readonly min: number; readonly max: number }>
 
 /** Longest tool signature. */
 export const MAX_SIGNATURE_LENGTH = 500
 /** Most repository patterns. */
 export const MAX_REPO_PATTERNS = 200
+
+/** PR/MR activity a watch reports, named as in {@link WatchEventsWire}. */
+export const WATCH_EVENT_KINDS = ['ciFailed', 'ciPassed', 'comment', 'changesRequested', 'approved', 'conflict', 'pushed', 'merged', 'closed', 'idle'] as const
+
+/** One kind of PR/MR activity. */
+export type WatchEventKind = typeof WATCH_EVENT_KINDS[number]
+
+/** `wake`: start a turn of the Session; `note`: hand it to the Session without starting a turn; `off`: drop it. */
+export type WatchAction = 'wake' | 'note' | 'off'
+
+/** What a watch does with each kind of activity. */
+export type WatchEventsWire = Record<WatchEventKind, WatchAction>
 
 /** Complete run-time settings as sent to and from the settings page. */
 export interface RepoSettingsWire {
@@ -64,6 +85,39 @@ export interface RepoSettingsWire {
     gitTimeoutMs: number
     otherHosts: boolean
   }
+  watch: {
+    enabled: boolean
+    activeIntervalMs: number
+    quietIntervalMs: number
+    quietAfterMs: number
+    batchMs: number
+    idleDays: number
+    dailyWakeLimit: number
+    maxWatches: number
+    events: WatchEventsWire
+  }
+}
+
+/** One watched PR/MR as the settings page lists it. */
+export interface WatchInfo {
+  /** Stable id: `host/path!number@session`. */
+  id: string
+  /** `host/path`. */
+  repo: string
+  number: number
+  title: string
+  webUrl: string
+  /** Session the activity is delivered to. */
+  session: string
+  /** How the watch started: the PR/MR was opened or pushed to through the tools, or the model asked to watch it. */
+  source: 'created' | 'pushed' | 'requested'
+  startedAt: string
+  lastActivityAt: string
+  /** Consecutive failed polls or deliveries. */
+  failures: number
+  lastError?: string
+  /** Activity waiting to be delivered. */
+  pending: number
 }
 
 /** Body of a host addition. */
@@ -90,6 +144,10 @@ export interface SettingsState {
   file: string
   /** Whether the Host can open a system directory dialog. */
   pickerAvailable: boolean
+  /** Watched PRs/MRs, most recent activity first. */
+  watches: readonly WatchInfo[]
+  /** Whether this composition can start a turn of a Session, which PR/MR watching needs. */
+  watchAvailable: boolean
 }
 
 /** `POST /dsh-repo/pick-directory` response: the chosen path, or null when cancelled. */

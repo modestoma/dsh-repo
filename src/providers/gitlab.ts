@@ -9,11 +9,11 @@
 
 import { Gitlab } from '@gitbeaker/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { nextPage, titleOf, truncateBytes } from './types.ts'
-import type { Call, Paging, Provider, TokenSource } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitLab's maximum page size. */
 const MAX_PAGE = 100
@@ -95,6 +95,39 @@ interface GitlabNote {
   readonly author: GitlabUser
   readonly created_at: string
   readonly system?: boolean
+  readonly position?: { readonly new_path?: string | null } | null
+}
+
+/**
+ * The activity of one note: user notes are comments; GitLab records approvals
+ * and change requests as system notes with fixed English bodies; other
+ * system notes are not activity.
+ */
+function noteKind(value: GitlabNote): ActivityItem['kind'] | undefined {
+  if (value.system !== true) return 'comment'
+  if (value.body === 'approved this merge request') return 'approved'
+  if (value.body.startsWith('requested changes')) return 'changes-requested'
+  return undefined
+}
+
+interface GitlabMergeStatus {
+  readonly sha: string
+  readonly head_pipeline?: { readonly id: number; readonly status: string; readonly web_url?: string } | null
+  readonly detailed_merge_status?: unknown
+}
+
+function statusOf(data: GitlabMergeStatus): ChangeStatus {
+  const pipeline = data.head_pipeline
+  const checks: CheckInfo[] = pipeline === undefined || pipeline === null
+    ? []
+    : [{ name: `pipeline #${pipeline.id}`, state: pipelineState(pipeline.status), ...pipeline.web_url === undefined ? {} : { webUrl: pipeline.web_url } }]
+  const detailed = data.detailed_merge_status
+  return {
+    headSha: data.sha,
+    checks,
+    overall: checks[0]?.state ?? 'none' as const,
+    ...typeof detailed !== 'string' || COMPUTING.has(detailed) ? {} : { mergeable: detailed === 'mergeable' },
+  }
 }
 
 function note(value: GitlabNote): CommentInfo {
@@ -313,18 +346,26 @@ export class GitlabProvider implements Provider {
 
   async changeStatus(ref: RepoRef, number: number, call: Call) {
     call.signal.throwIfAborted()
+    return statusOf(await this.api.MergeRequests.show(ref.path, number))
+  }
+
+  /** The merge request carries its head pipeline, so CI comes with every poll; notes are read only when its `updated_at` moved. */
+  async changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity> {
+    call.signal.throwIfAborted()
     const data = await this.api.MergeRequests.show(ref.path, number)
-    const pipeline = data.head_pipeline
-    const checks: CheckInfo[] = pipeline === undefined || pipeline === null
-      ? []
-      : [{ name: `pipeline #${pipeline.id}`, state: pipelineState(pipeline.status), ...pipeline.web_url === undefined ? {} : { webUrl: pipeline.web_url } }]
-    const detailed = data.detailed_merge_status
-    return {
-      headSha: data.sha,
-      checks,
-      overall: checks[0]?.state ?? 'none' as const,
-      ...typeof detailed !== 'string' || COMPUTING.has(detailed) ? {} : { mergeable: detailed === 'mergeable' },
+    const change = mergeRequest(data)
+    let items: ActivityItem[] | undefined
+    if (request.updatedAt !== change.updatedAt) {
+      call.signal.throwIfAborted()
+      const notes: readonly GitlabNote[] = await this.api.MergeRequestNotes.all(ref.path, number, { sort: 'desc', orderBy: 'created_at', perPage: MAX_PAGE, maxPages: 1 })
+      items = notes.filter(entry => entry.created_at >= request.since).reverse().flatMap((entry): ActivityItem[] => {
+        const kind = noteKind(entry)
+        if (kind === undefined) return []
+        const path = entry.position?.new_path
+        return [{ ...note(entry), kind, webUrl: `${change.webUrl}#note_${entry.id}`, ...typeof path === 'string' ? { path } : {} }]
+      })
     }
+    return { change, conflict: data.has_conflicts === true, status: statusOf(data), ...items === undefined ? {} : { items } }
   }
 
   async createChange(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; deleteSourceBranch: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {

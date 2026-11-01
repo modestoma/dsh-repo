@@ -94,10 +94,17 @@ const CSS = `
 .dr__field--full{grid-column:1/-1}
 .dr__formActions{display:flex;justify-content:flex-end;gap:8px}
 .dr__help{color:var(--dr-fg3);font-size:12px;line-height:18px}
+.dr__watch{display:flex;align-items:center;gap:12px;padding:5px 8px 5px 14px;min-height:28px;font-size:12px;line-height:18px}
+.dr__watchName{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dr-fg)}
+.dr__watchName a{color:inherit;text-decoration:none}
+.dr__watchName a:hover{text-decoration:underline}
+.dr__watchMeta{flex:none;color:var(--dr-fg3);white-space:nowrap;font-variant-numeric:tabular-nums}
+.dr__watchMeta--session{width:88px;overflow:hidden;text-overflow:ellipsis}
+.dr__watchMeta--time{width:72px;text-align:right}
 .dr__help summary{cursor:pointer;width:max-content}
 .dr__help p{margin:6px 0 0}
 .dr__footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--dr-fg3);font-size:12px;line-height:18px;overflow-wrap:anywhere}
-@media (max-width:560px){.dr__row{flex-direction:column;gap:8px}.dr__rowCtl{justify-content:flex-start}.dr__formGrid{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:560px){.dr__row{flex-direction:column;gap:8px}.dr__rowCtl{justify-content:flex-start}.dr__formGrid{grid-template-columns:minmax(0,1fr)}.dr__watchMeta--session{display:none}}
 @media (prefers-reduced-motion:reduce){.dr__switch,.dr__switch::after{transition:none}}
 `
 

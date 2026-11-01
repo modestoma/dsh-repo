@@ -24,6 +24,8 @@ import { lstat, readFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { ChangeInfo, CommitDetails, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
 import type { Agent, ContentBlock, HostApproval, ToolDefinition, ToolRunContext, WorkingDirectoryService } from './host.ts'
+import type { WatchInfo } from './settings/contract.ts'
+import type { TrackRequest } from './watch/watcher.ts'
 
 /** Outcome of a write the user did not approve. */
 export interface Declined {
@@ -46,6 +48,17 @@ export interface ToolDeps {
    * `repo/commit-trailers` event); absent means none.
    */
   readonly commitDetails?: (request: { readonly session: string; readonly dir: string }) => Promise<CommitDetails>
+  /** PR/MR watching; absent means PRs/MRs are not watched. */
+  readonly watch?: WatchHooks
+}
+
+/** The PR/MR watcher as the tools use it. */
+export interface WatchHooks {
+  /** @returns whether watching is on and can start a turn of a Session. */
+  readonly active: boolean
+  track(request: TrackRequest): Promise<WatchInfo>
+  untrack(repo: string, number: number, session: string): Promise<boolean>
+  ownComment(repo: string, number: number, commentId: string): Promise<void>
 }
 
 const repo = z.string().min(1).describe('Repository: web or clone URL (https://github.com/owner/name, git@gitlab.example.com:group/project.git) or host/path')
@@ -54,6 +67,7 @@ const page = z.number().int().min(1).optional().describe('1-based page, default 
 const perPage = z.number().int().min(1).max(100).optional().describe('Items per page')
 const labels = z.array(z.string().min(1)).optional()
 const assignees = z.array(z.string().min(1)).optional().describe('Usernames')
+const changeBody = z.string().optional().describe('Description for reviewers: what changed and why, how it was verified, and anything risky or left undone. Keep it short; link issues instead of restating them; never paste conversation transcripts')
 
 /** Approval prompt text. */
 interface Prompt { readonly zh: string; readonly en: string }
@@ -76,8 +90,8 @@ function withSignature(body: string | undefined, signature: string): string | un
   return `${body}\n\n${signature}`
 }
 
-/** Which settings offer a tool: reads always, writes unless `writes` is `off`, merge also needs `merge`. */
-export type ToolAccess = 'read' | 'write' | 'merge'
+/** Which settings offer a tool: reads and watch always, writes unless `writes` is `off`, merge also needs `merge`; the plugin offers watch only while watching is active. */
+export type ToolAccess = 'read' | 'watch' | 'write' | 'merge'
 
 /** One built tool and the settings that offer it. */
 export interface RepoTool {
@@ -93,7 +107,7 @@ export interface RepoTool {
  */
 export function toolOffered(access: ToolAccess, settings: RepoSettings['tools']): boolean {
   if (!settings.enabled) return false
-  if (access === 'read') return true
+  if (access === 'read' || access === 'watch') return true
   if (settings.writes === 'off') return false
   return access === 'write' || settings.merge
 }
@@ -250,7 +264,10 @@ export function createTools(deps: ToolDeps): RepoTool[] {
           ...details?.author === undefined ? {} : { author: details.author },
           signal,
         })
-        return { ...pushed, ...await openChangesOf(service, pushed, signal) }
+        const { changes, ...open } = await openChangesOf(service, pushed, signal)
+        const watching = []
+        for (const change of changes) watching.push((await watchChange(deps, pushed.url, change, exec, 'pushed', pushed.commit)).watching)
+        return { ...pushed, ...open, ...watching.includes(true) ? { watching: true } : {} }
       },
     }),
     define(deps, {
@@ -272,36 +289,50 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       description: 'Comment on an issue. Requires user approval.',
       schema: z.object({ repo, number, body: z.string().min(1) }).strict(),
       describe: args => ({ zh: `评论 ${args.repo} 的 issue #${args.number}`, en: `Comment on issue #${args.number} in ${args.repo}` }),
-      run: (args, signal) => service.commentIssue(args.repo, args.number, signRequired(args.body), { signal }),
+      run: async (args, signal) => {
+        const comment = await service.commentIssue(args.repo, args.number, signRequired(args.body), { signal })
+        await rememberComment(deps, args.repo, args.number, comment.id)
+        return comment
+      },
     }),
     define(deps, {
       name: 'repo_mr_create',
-      description: 'Open a pull request (GitHub) or merge request (GitLab) from a pushed branch. When the settings delete source branches, a GitLab MR is opened with "delete source branch" ticked, so GitLab removes the branch once it is merged. Requires user approval.',
-      schema: z.object({ repo, title: z.string().min(1), body: z.string().optional(), sourceBranch: z.string().min(1), targetBranch: z.string().optional(), draft: z.boolean().optional(), labels, assignees }).strict(),
+      description: 'Open a pull request (GitHub) or merge request (GitLab) from a pushed branch. When the settings delete source branches, a GitLab MR is opened with "delete source branch" ticked, so GitLab removes the branch once it is merged. While PR/MR watching is on, its CI results, comments, reviews, and merge or close arrive in this session as messages (`watching` in the result), so do not poll it. Requires user approval.',
+      schema: z.object({ repo, title: z.string().min(1), body: changeBody, sourceBranch: z.string().min(1), targetBranch: z.string().optional(), draft: z.boolean().optional(), labels, assignees }).strict(),
       describe: args => ({
         zh: `创建${args.draft === true ? '草稿 ' : ''}PR/MR\n仓库：${args.repo}\n分支：${args.sourceBranch} → ${args.targetBranch ?? '默认分支'}\n标题：${args.title}`,
         en: `Open a ${args.draft === true ? 'draft ' : ''}PR/MR\nRepository: ${args.repo}\nBranches: ${args.sourceBranch} → ${args.targetBranch ?? 'default branch'}\nTitle: ${args.title}`,
       }),
-      run: (args, signal) => service.createChange(args.repo, {
-        ...args,
-        ...args.body === undefined ? {} : { body: sign(args.body) },
-        deleteSourceBranch: deps.settings().deleteSourceBranch,
-        signal,
-      }),
+      run: async (args, signal, exec) => {
+        const change = await service.createChange(args.repo, {
+          ...args,
+          ...args.body === undefined ? {} : { body: sign(args.body) },
+          deleteSourceBranch: deps.settings().deleteSourceBranch,
+          signal,
+        })
+        return { ...change, ...await watchChange(deps, args.repo, change, exec, 'created') }
+      },
     }),
     define(deps, {
       name: 'repo_mr_update',
-      description: 'Change a pull/merge request\'s title, body, target branch, labels, or assignees, or close/reopen it. Requires user approval.',
-      schema: z.object({ repo, number, title: z.string().min(1).optional(), body: z.string().optional(), state: z.enum(['open', 'closed']).optional(), targetBranch: z.string().optional(), labels, assignees }).strict(),
+      description: 'Change a pull/merge request\'s title, body, target branch, labels, or assignees, or close/reopen it. A reopened PR/MR is watched again while watching is on. Requires user approval.',
+      schema: z.object({ repo, number, title: z.string().min(1).optional(), body: changeBody, state: z.enum(['open', 'closed']).optional(), targetBranch: z.string().optional(), labels, assignees }).strict(),
       describe: args => ({ zh: `修改 ${args.repo} 的 PR/MR #${args.number}${args.state === 'closed' ? '（关闭）' : args.state === 'open' ? '（重新打开）' : ''}`, en: `Update PR/MR #${args.number} in ${args.repo}` }),
-      run: (args, signal) => service.updateChange(args.repo, args.number, { ...args, signal }),
+      run: async (args, signal, exec) => {
+        const change = await service.updateChange(args.repo, args.number, { ...args, signal })
+        return args.state === 'open' ? { ...change, ...await watchChange(deps, args.repo, change, exec, 'requested') } : change
+      },
     }),
     define(deps, {
       name: 'repo_mr_comment',
       description: 'Comment on a pull/merge request conversation. Requires user approval.',
       schema: z.object({ repo, number, body: z.string().min(1) }).strict(),
       describe: args => ({ zh: `评论 ${args.repo} 的 PR/MR #${args.number}`, en: `Comment on PR/MR #${args.number} in ${args.repo}` }),
-      run: (args, signal) => service.commentChange(args.repo, args.number, signRequired(args.body), { signal }),
+      run: async (args, signal) => {
+        const comment = await service.commentChange(args.repo, args.number, signRequired(args.body), { signal })
+        await rememberComment(deps, args.repo, args.number, comment.id)
+        return comment
+      },
     }),
     define(deps, {
       name: 'repo_branch_delete',
@@ -311,6 +342,22 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       run: (args, signal) => service.deleteMergedBranch(args.repo, args.branch, { signal }),
     }),
   ]
+  const watch = define(deps, {
+    name: 'repo_mr_watch',
+    description: 'Watch a pull/merge request for this session, or stop watching it. While watched, CI results, comments and reviews (except ones posted through these tools), pushes by others, and merge or close arrive in this session as messages, so do not poll it. PRs/MRs opened, reopened, or pushed to through these tools are watched without this call. Watching ends on merge or close, after a long time without activity, or when stopped here.',
+    schema: z.object({ repo, number, watch: z.boolean().optional().describe('false stops watching; default true') }).strict(),
+    run: async (args, signal, exec) => {
+      const session = requireAgent(exec, 'repo_mr_watch').session?.header.id
+      if (session === undefined) throw new RepoError('invalid', 'repo_mr_watch 需要在会话中调用')
+      if (deps.watch === undefined || !deps.watch.active) throw new RepoError('unavailable', 'PR/MR 跟踪没有开启，或当前 DSH 组合不能唤醒会话')
+      if (args.watch === false) return { watching: false, stopped: await deps.watch.untrack(args.repo, args.number, session) }
+      const change = await service.getChange(args.repo, args.number, { signal })
+      if (change.state !== 'open') throw new RepoError('invalid', `PR/MR #${args.number} ${change.state === 'merged' ? '已合并' : '已关闭'}，不需要跟踪`)
+      const { comments: _comments, ...info } = change
+      const watched = await deps.watch.track({ repo: args.repo, change: info, session, source: 'requested' })
+      return { watching: true, number: watched.number, title: watched.title, webUrl: watched.webUrl, next: 'Activity on this PR/MR will arrive in this session as messages; nothing to poll.' }
+    },
+  })
   const merge = define(deps, {
     name: 'repo_mr_merge',
     description: 'Merge a pull/merge request, only while its head is still `headSha` (read it with repo_mr_status first). When the settings delete source branches, its source branch is deleted too (never a fork\'s); `sourceBranch` in the result says whether it was. Requires user approval.',
@@ -335,6 +382,7 @@ export function createTools(deps: ToolDeps): RepoTool[] {
   })
   return [
     ...reads.map(definition => ({ definition, access: 'read' as const })),
+    { definition: watch, access: 'watch' },
     ...writes.map(definition => ({ definition, access: 'write' as const })),
     { definition: merge, access: 'merge' },
   ]
@@ -378,19 +426,44 @@ async function openChangesFrom(service: DshRepoService, repo: string, branch: st
 }
 
 /** Open PRs/MRs from the pushed branch, so the model updates them instead of opening another. */
-async function openChangesOf(service: DshRepoService, pushed: WorkspacePushResult, signal: AbortSignal): Promise<{ readonly openChanges?: readonly OpenChange[]; readonly next: string }> {
+async function openChangesOf(service: DshRepoService, pushed: WorkspacePushResult, signal: AbortSignal): Promise<{ readonly openChanges?: readonly OpenChange[]; readonly next: string; readonly changes: readonly ChangeInfo[] }> {
   let items: readonly ChangeInfo[]
   try {
     items = await openChangesFrom(service, pushed.url, pushed.branch, signal)
   } catch (error) {
     // The push already succeeded; report the failed lookup instead of failing the call.
     const reason = error instanceof Error ? error.message : String(error)
-    return { next: `Pushed. Could not list the PRs/MRs from ${pushed.branch} (${reason}); check with repo_mr_list before creating one.` }
+    return { changes: [], next: `Pushed. Could not list the PRs/MRs from ${pushed.branch} (${reason}); check with repo_mr_list before creating one.` }
   }
   const openChanges = items.map(change => ({ number: change.number, title: change.title, targetBranch: change.targetBranch, webUrl: change.webUrl }))
   const first = openChanges[0]
-  if (first === undefined) return { openChanges, next: `Open a PR/MR with repo_mr_create (sourceBranch ${pushed.branch}, targetBranch ${pushed.baseBranch}) if the work needs one.` }
-  return { openChanges, next: `PR/MR #${first.number} from ${pushed.branch} now includes this push; do not create another. Use repo_mr_update to change its title or description if needed.` }
+  if (first === undefined) return { changes: items, openChanges, next: `Open a PR/MR with repo_mr_create (sourceBranch ${pushed.branch}, targetBranch ${pushed.baseBranch}) if the work needs one.` }
+  return { changes: items, openChanges, next: `PR/MR #${first.number} from ${pushed.branch} now includes this push; do not create another. Use repo_mr_update to change its title or description if needed.` }
+}
+
+/**
+ * Watch a PR/MR for the calling Session while watching is active. The write
+ * already succeeded, so a failure is reported in the result, not thrown.
+ * @returns `watching`, with the reason when the watch could not start.
+ */
+async function watchChange(deps: ToolDeps, repo: string, change: ChangeInfo, exec: ToolRunContext, source: TrackRequest['source'], pushed?: string): Promise<{ readonly watching: boolean; readonly watchError?: string }> {
+  const session = exec.agent?.session?.header.id
+  if (deps.watch === undefined || !deps.watch.active || session === undefined || change.state !== 'open') return { watching: false }
+  try {
+    await deps.watch.track({ repo, change, session, source, ...pushed === undefined ? {} : { pushed } })
+    return { watching: true }
+  } catch (error) {
+    return { watching: false, watchError: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** Keep watches from reporting a comment the tools posted; the comment already exists, so a failure only loses that. */
+async function rememberComment(deps: ToolDeps, repo: string, number: number, commentId: string): Promise<void> {
+  try {
+    await deps.watch?.ownComment(repo, number, commentId)
+  } catch {
+    // A failed store write: the watch may report this comment once; the comment itself was posted.
+  }
 }
 
 /** An open PR/MR from a pushed branch, as the push result lists it. */

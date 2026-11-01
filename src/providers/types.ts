@@ -7,7 +7,7 @@
 
 import type {
   BranchInfo, ChangeDetail, CommitAuthor, ChangeDiff, ChangeInfo, ChangeState, ChangeStatus, CommentInfo, CommitInfo,
-  FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, TreeListing,
+  FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, RepoUser, TreeListing,
 } from '../contract.ts'
 import type { RepoLimits } from '../config.ts'
 
@@ -52,6 +52,42 @@ export interface Provider {
   commentChange(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
   /** With `deleteSourceBranch`, the result reports the source branch; a failed deletion does not throw. */
   mergeChange(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod; readonly deleteSourceBranch: boolean }, call: Call): Promise<MergeResult>
+  /** One poll for a watch: always the change request, CI and comments only as `request` asks. */
+  changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity>
+}
+
+/** What a watch already knows about a change request, so a poll reads only what may have changed. */
+export interface ActivityRequest {
+  /** `updatedAt` of the last poll; comments and reviews are read only when the change request's differs. */
+  readonly updatedAt?: string
+  /** Whether CI is read: the head moved, CI was still running, or CI had not reported yet. */
+  readonly withStatus: boolean
+  /** Comments and reviews created before this time are left out. */
+  readonly since: string
+}
+
+/** One comment, review comment, or review on a change request, in creation order. */
+export interface ActivityItem {
+  readonly id: string
+  /** `comment` covers conversation comments, code-line comments, and reviews that only comment. */
+  readonly kind: 'comment' | 'approved' | 'changes-requested'
+  readonly author: RepoUser
+  readonly body: string
+  readonly createdAt: string
+  readonly webUrl?: string
+  /** File of a code-line comment. */
+  readonly path?: string
+}
+
+/** One poll of a change request. */
+export interface ChangeActivity {
+  readonly change: ChangeInfo
+  /** Whether the change request conflicts with its target branch. */
+  readonly conflict: boolean
+  /** Present when CI was read. */
+  readonly status?: ChangeStatus
+  /** Present when comments and reviews were read: those created at or after `since`, oldest first. */
+  readonly items?: readonly ActivityItem[]
 }
 
 /** Editable fields shared by issues and change requests. */

@@ -10,8 +10,9 @@
  * @module dsh-repo
  */
 
-import { defaultMirrorDir, hostsFile, resolveConfig } from './config.ts'
+import { defaultMirrorDir, hostsFile, resolveConfig, watchesFile } from './config.ts'
 import type { HostApproval, HostContext, WorkingDirectoryService } from './host.ts'
+import type { WatchDelivery } from './watch/delivery.ts'
 import { HostStore } from './hosts.ts'
 import { runGit } from './mirror/git.ts'
 import type { GitRunner } from './mirror/git.ts'
@@ -21,6 +22,9 @@ import { DSH_REPOS_SERVICE, RepoService } from './service.ts'
 import type { ProviderFactory } from './service.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
 import { createTools, toolOffered } from './tools.ts'
+import { hostDelivery } from './watch/delivery.ts'
+import { WatchStore } from './watch/store.ts'
+import { ChangeWatcher } from './watch/watcher.ts'
 import type { CommitAuthor, CommitDetails, CommitTrailer, CommitTrailersEvent } from './contract.ts'
 import { RepoError } from './errors.ts'
 
@@ -47,7 +51,18 @@ export type { HostAddRequest, MutationError, MutationOk, PickedDirectory, RepoSe
 export { hostDirectoryPicker } from './settings/directory-picker.ts'
 export type { DirectoryPicker } from './settings/directory-picker.ts'
 export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes, settingsState } from './settings/routes.ts'
-export type { Declined, RepoTool, ToolAccess, ToolDeps } from './tools.ts'
+export type { Declined, RepoTool, ToolAccess, ToolDeps, WatchHooks } from './tools.ts'
+export { ACTIVITY_SOURCE, RESOLVE_AGENT_EVENT, activityMessage, hostDelivery } from './watch/delivery.ts'
+export type { DeliveryOutcome, WatchDelivery } from './watch/delivery.ts'
+export { WatchStore } from './watch/store.ts'
+export { ChangeWatcher } from './watch/watcher.ts'
+export type { TrackRequest, WatcherDeps, WatchService } from './watch/watcher.ts'
+export { detect, renderMessage, watchId } from './watch/activity.ts'
+export type { WatchCursor, WatchEvent, WatchMessage, WatchRecord, WatchSource } from './watch/activity.ts'
+export { WATCH_EVENT_KINDS, WATCHES_ROUTE } from './settings/contract.ts'
+export type { WatchAction, WatchEventKind, WatchInfo } from './settings/contract.ts'
+export type { ActivityItem, ActivityRequest, ChangeActivity } from './providers/types.ts'
+export type { WatchList } from './settings/routes.ts'
 
 /** Cordis event other plugins listen to for extra trailers and the author of a pushed commit; payload {@link CommitTrailersEvent}. */
 export const COMMIT_TRAILERS_EVENT = 'repo/commit-trailers'
@@ -97,13 +112,16 @@ export interface RepoPluginOptions {
   readonly git?: GitRunner
   /** Environment `$DSH_HOME` is read from; default `process.env`. */
   readonly env?: NodeJS.ProcessEnv
+  /** Substitute how activity reaches Sessions. */
+  readonly delivery?: WatchDelivery
 }
 
 /**
- * Provide the `dshRepos` service, mount the settings routes while the Host
- * serves the Web, and register the model tools, each offered only while at
- * least one host is configured or added and the current tool settings allow
- * it.
+ * Provide the `dshRepos` service, start the PR/MR watcher, mount the
+ * settings routes while the Host serves the Web, and register the model
+ * tools, each offered only while at least one host is configured or added
+ * and the current tool settings allow it (`repo_mr_watch` also needs
+ * watching to be active).
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
  * @param options - test seams.
@@ -140,7 +158,18 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     ...options.providerFactory === undefined ? {} : { factory: options.providerFactory },
   })
   ctx.provide?.(DSH_REPOS_SERVICE, service)
-  mountSettingsRoutes(ctx, service)
+  const watcher = new ChangeWatcher({
+    service,
+    store: new WatchStore(watchesFile(hosts.file), ctx.logger),
+    settings: () => service.settings.watch,
+    delivery: options.delivery ?? hostDelivery(ctx),
+    ...ctx.logger === undefined ? {} : { logger: ctx.logger },
+  })
+  ctx.effect(() => {
+    watcher.start()
+    return () => { void watcher.stop() }
+  }, 'dsh-repo: PR/MR watcher')
+  mountSettingsRoutes(ctx, service, watcher)
   if (!service.configured) ctx.logger?.info?.('dsh-repo: 还没有主机，代码仓库工具在添加主机后提供')
   const tools = createTools({
     service,
@@ -148,8 +177,11 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     approval: () => ctx.get?.('approval') as HostApproval | undefined,
     workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
     commitDetails: request => collectDetails(ctx, request),
+    watch: watcher,
   })
   for (const { definition, access } of tools) {
-    ctx.effect(() => ctx.tools.register(definition, { when: () => service.configured && toolOffered(access, service.settings.tools) }), `dsh-repo: ${definition.name}`)
+    ctx.effect(() => ctx.tools.register(definition, {
+      when: () => service.configured && toolOffered(access, service.settings.tools) && (access !== 'watch' || watcher.active),
+    }), `dsh-repo: ${definition.name}`)
   }
 }

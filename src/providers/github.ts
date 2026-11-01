@@ -8,11 +8,11 @@
 
 import { Octokit } from '@octokit/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CheckState, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CheckState, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { errorText, nextPage, titleOf, truncateBytes } from './types.ts'
-import type { Call, Provider, TokenSource } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Provider, TokenSource } from './types.ts'
 
 /** GitHub's largest page. */
 const PAGE = 100
@@ -337,12 +337,45 @@ export class GithubProvider implements Provider {
 
   async changeStatus(ref: RepoRef, number: number, call: Call) {
     const repo = split(ref.path)
-    const signal = call.signal
-    const { data: change } = await this.octokit.rest.pulls.get({ ...repo, pull_number: number, request: { signal } })
+    const { data: change } = await this.octokit.rest.pulls.get({ ...repo, pull_number: number, request: { signal: call.signal } })
+    return await this.statusOf(repo, change, call.signal)
+  }
+
+  /** Pull request comments and reviews are read only when its `updated_at` moved; check runs never move it, so CI is read as asked. */
+  async changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity> {
+    const repo = split(ref.path)
+    const { data } = await this.octokit.rest.pulls.get({ ...repo, pull_number: number, request: { signal: call.signal } })
+    const change = pull(data)
+    const [status, items] = await Promise.all([
+      request.withStatus ? this.statusOf(repo, data, call.signal) : undefined,
+      request.updatedAt === change.updatedAt ? undefined : this.activitySince(repo, number, request.since, call.signal),
+    ])
+    return { change, conflict: data.mergeable_state === 'dirty', ...status === undefined ? {} : { status }, ...items === undefined ? {} : { items } }
+  }
+
+  private async activitySince(repo: { owner: string; repo: string }, number: number, since: string, signal: AbortSignal): Promise<ActivityItem[]> {
+    const [comments, lineComments, reviews] = await Promise.all([
+      this.octokit.rest.issues.listComments({ ...repo, issue_number: number, since, per_page: PAGE, request: { signal } }).then(response => response.data),
+      this.octokit.rest.pulls.listReviewComments({ ...repo, pull_number: number, since, sort: 'created', direction: 'asc', per_page: PAGE, request: { signal } }).then(response => response.data),
+      this.allPages(page => this.octokit.rest.pulls.listReviews({ ...repo, pull_number: number, per_page: PAGE, page, request: { signal } }).then(response => response.data), '评审'),
+    ])
+    const items: ActivityItem[] = [
+      ...comments.map(value => ({ ...comment(value), kind: 'comment' as const })),
+      ...lineComments.map(value => ({ id: `line-${value.id}`, kind: 'comment' as const, author: user(value.user), body: value.body, createdAt: value.created_at, webUrl: value.html_url, path: value.path })),
+      ...reviews.flatMap((review): ActivityItem[] => {
+        const kind = review.state === 'APPROVED' ? 'approved' as const : review.state === 'CHANGES_REQUESTED' ? 'changes-requested' as const : review.state === 'COMMENTED' && review.body !== '' ? 'comment' as const : undefined
+        if (kind === undefined || review.submitted_at === undefined) return []
+        return [{ id: `review-${review.id}`, kind, author: user(review.user), body: review.body, createdAt: review.submitted_at, webUrl: review.html_url }]
+      }),
+    ]
+    return items.filter(item => item.createdAt >= since).sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+  }
+
+  private async statusOf(repo: { owner: string; repo: string }, change: { readonly head: { readonly sha: string }; readonly mergeable?: boolean | null }, signal: AbortSignal): Promise<ChangeStatus> {
     const sha = change.head.sha
     const [runs, statuses] = await Promise.all([
-      this.allPages(page => this.octokit.rest.checks.listForRef({ ...repo, ref: sha, per_page: PAGE, page, request: { signal } }).then(response => response.data.check_runs)),
-      this.allPages(page => this.octokit.rest.repos.getCombinedStatusForRef({ ...repo, ref: sha, per_page: PAGE, page, request: { signal } }).then(response => response.data.statuses)),
+      this.allPages(page => this.octokit.rest.checks.listForRef({ ...repo, ref: sha, per_page: PAGE, page, request: { signal } }).then(response => response.data.check_runs), 'CI 检查'),
+      this.allPages(page => this.octokit.rest.repos.getCombinedStatusForRef({ ...repo, ref: sha, per_page: PAGE, page, request: { signal } }).then(response => response.data.statuses), 'CI 检查'),
     ])
     const checks: CheckInfo[] = [
       ...runs.map(run => ({ name: run.name, state: checkRunState(run.status, run.conclusion), ...run.html_url === null ? {} : { webUrl: run.html_url } })),
@@ -352,7 +385,7 @@ export class GithubProvider implements Provider {
         ...status.target_url === null ? {} : { webUrl: status.target_url },
       })),
     ]
-    return { headSha: sha, checks, overall: overall(checks), ...change.mergeable === null ? {} : { mergeable: change.mergeable } }
+    return { headSha: sha, checks, overall: overall(checks), ...change.mergeable === null || change.mergeable === undefined ? {} : { mergeable: change.mergeable } }
   }
 
   /** GitHub has no per-request "delete source branch" option, so `deleteSourceBranch` is not sent. */
@@ -442,14 +475,14 @@ export class GithubProvider implements Provider {
   }
 
   /** Every page of a list endpoint, so an aggregate never rests on a partial list. */
-  private async allPages<T>(read: (page: number) => Promise<readonly T[]>): Promise<T[]> {
+  private async allPages<T>(read: (page: number) => Promise<readonly T[]>, what: string): Promise<T[]> {
     const items: T[] = []
     for (let page = 1; page <= MAX_STATUS_PAGES; page += 1) {
       const batch = await read(page)
       items.push(...batch)
       if (batch.length < PAGE) return items
     }
-    throw new RepoError('too-large', `CI 检查超过 ${MAX_STATUS_PAGES * PAGE} 条，无法给出完整状态`)
+    throw new RepoError('too-large', `${what}超过 ${MAX_STATUS_PAGES * PAGE} 条，无法给出完整状态`)
   }
 
   private async comments(ref: RepoRef, number: number, call: Call): Promise<CommentInfo[]> {
