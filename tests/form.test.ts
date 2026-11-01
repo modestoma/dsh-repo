@@ -19,7 +19,7 @@ describe('settings form', () => {
       ok: false,
       errors: {
         timeoutMs: '接口调用超时须在 1 秒 到 2147483.647 秒 之间',
-        maxComments: '评论条数要填数字，须在 1 条 到 100 条 之间',
+        maxComments: '附带评论条数要填数字，须在 1 条 到 100 条 之间',
         perPage: '默认每页条数不能大于每页上限',
       },
     })

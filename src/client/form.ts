@@ -25,21 +25,21 @@ export interface NumberField {
 
 /** Every integer setting in page order. */
 export const NUMBER_FIELDS: Readonly<Record<NumberKey, NumberField>> = {
-  timeoutMs: { key: 'timeoutMs', label: '接口调用超时', summary: '一次 GitHub / GitLab 接口调用的最长等待时间。', unit: '秒', scale: 1000 },
-  gitTimeoutMs: { key: 'gitTimeoutMs', label: 'git 命令超时', summary: '一条 git 命令（克隆、拉取、建工作区、推送）的最长运行时间；大仓库首次克隆需要更长。', unit: '秒', scale: 1000 },
-  perPage: { key: 'perPage', label: '默认每页条数', summary: '列出分支、提交、issue、PR/MR 时模型没有指定条数的每页条数。', unit: '条', scale: 1 },
-  maxPerPage: { key: 'maxPerPage', label: '每页上限', summary: '模型一次最多可以要求的条数。', unit: '条', scale: 1 },
-  maxComments: { key: 'maxComments', label: '评论条数', summary: '读取 issue 或 PR/MR 时附带的评论条数。', unit: '条', scale: 1 },
-  maxTreeEntries: { key: 'maxTreeEntries', label: '目录条目上限', summary: '列一个目录时最多返回的条目数，超出时报告过大。', unit: '个', scale: 1 },
-  maxFileBytes: { key: 'maxFileBytes', label: '单文件上限', summary: '读取一个文件的大小上限，接口读取超出部分截断，镜像读取超出时拒绝。', unit: 'KiB', scale: 1024 },
-  maxDiffBytes: { key: 'maxDiffBytes', label: 'diff 上限', summary: 'PR/MR diff 和工作区改动 diff 的大小上限，超出部分截断。', unit: 'KiB', scale: 1024 },
+  timeoutMs: { key: 'timeoutMs', label: '接口调用超时', summary: '一次 GitHub / GitLab 接口调用', unit: '秒', scale: 1000 },
+  gitTimeoutMs: { key: 'gitTimeoutMs', label: 'git 命令超时', summary: '克隆、拉取、推送等一条 git 命令', unit: '秒', scale: 1000 },
+  perPage: { key: 'perPage', label: '默认每页条数', summary: '模型没有指定条数时', unit: '条', scale: 1 },
+  maxPerPage: { key: 'maxPerPage', label: '每页上限', summary: '模型一次最多能要的条数', unit: '条', scale: 1 },
+  maxComments: { key: 'maxComments', label: '附带评论条数', summary: '读取 issue、PR/MR 时附带', unit: '条', scale: 1 },
+  maxTreeEntries: { key: 'maxTreeEntries', label: '目录条目上限', summary: '列一个目录最多返回', unit: '个', scale: 1 },
+  maxFileBytes: { key: 'maxFileBytes', label: '单文件上限', summary: '超出截断（镜像读取时拒绝）', unit: 'KiB', scale: 1024 },
+  maxDiffBytes: { key: 'maxDiffBytes', label: 'diff 上限', summary: 'PR/MR 与工作区 diff，超出截断', unit: 'KiB', scale: 1024 },
 }
 
 /** Write-tool modes with their labels. */
 export const WRITE_MODES: readonly { readonly id: RepoSettingsWire['tools']['writes']; readonly label: string }[] = [
-  { id: 'ask', label: '每次请用户审批' },
-  { id: 'allow', label: '直接执行，不审批' },
-  { id: 'off', label: '不提供写工具' },
+  { id: 'ask', label: '每次审批' },
+  { id: 'allow', label: '不审批' },
+  { id: 'off', label: '关闭' },
 ]
 
 /** Editable form of {@link RepoSettingsWire}: numbers as typed text in display units, repositories one per line. */
