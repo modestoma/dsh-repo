@@ -410,11 +410,21 @@ export class RepoService implements DshRepoService {
   }
 
   async openWorkspace(url: string, options: WorkspaceOpenOptions): Promise<WorkspaceInfo> {
+    const { branch, signal } = options
     if (options.commit !== undefined && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(options.commit)) throw new RepoError('invalid', `起点提交必须是完整的十六进制提交 id：${options.commit}`)
+    if (branch !== undefined) {
+      requireBranch(branch, '分支名')
+      if (options.commit !== undefined) throw new RepoError('invalid', `接着分支 ${branch} 修改时从它的最新提交开始，不能再指定起点提交`)
+    }
     if (!isAbsolute(options.dir)) throw new RepoError('invalid', `工作区目录必须是绝对路径：${options.dir}`)
     const env = await this.mirrorAuth(url)
-    const state = await this.mirrors.sync(url, options.baseBranch, env, options.signal)
-    return await this.workspaces.open(url, options.dir, options.commit ?? state.commit, state.branch, env, options.signal)
+    const base = await this.mirrors.sync(url, options.baseBranch, env, signal)
+    if (branch === undefined) return await this.workspaces.open(url, options.dir, { commit: options.commit ?? base.commit, baseBranch: base.branch }, env, signal)
+    if (branch === base.branch) throw new RepoError('invalid', `分支 ${branch} 是合入目标，不能同时作为要接着修改的分支`)
+    const defaultBranch = options.baseBranch === undefined ? base.branch : await this.mirrors.remoteDefaultBranch(url, env, signal)
+    if (branch === defaultBranch) throw new RepoError('invalid', `不能接着默认分支 ${branch} 修改；从默认分支开始时用 baseBranch，推送到新分支`)
+    const head = await this.mirrors.sync(url, branch, env, signal)
+    return await this.workspaces.open(url, options.dir, { commit: head.commit, baseBranch: base.branch, branch }, env, signal)
   }
 
   async workspaceChanges(dir: string, options: CallOptions = {}): Promise<WorkspaceChanges> {

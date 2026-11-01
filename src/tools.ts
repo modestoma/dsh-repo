@@ -22,7 +22,7 @@ import type { RepoSettings } from './config.ts'
 import { RepoError } from './errors.ts'
 import { lstat, readFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import type { CommitTrailer, WorkspaceChanges } from './contract.ts'
+import type { ChangeInfo, CommitTrailer, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
 import type { Agent, ContentBlock, HostApproval, ToolDefinition, ToolRunContext, WorkingDirectoryService } from './host.ts'
 
 /** Outcome of a write the user did not approve. */
@@ -177,26 +177,45 @@ export function createTools(deps: ToolDeps): RepoTool[] {
     }),
     define(deps, {
       name: 'repo_workspace_open',
-      description: 'Check out a repository as a writable workspace to change its code: a new directory under the current working directory, which then becomes the working directory. Edit, build, and test there with the ordinary file and shell tools; the git metadata is kept elsewhere, so do not run git commands that write (add, commit, checkout, push). Record and push the changes with repo_workspace_push. Starts from the head of `baseBranch` (default: the default branch) or from `commit`.',
+      description: 'Check out a repository as a writable workspace to change its code: a new directory under the current working directory, which then becomes the working directory. Edit, build, and test there with the ordinary file and shell tools; the git metadata is kept elsewhere, so do not run git commands that write (add, commit, checkout, push). Record and push the changes with repo_workspace_push. Starts from the head of `baseBranch` (default: the default branch) or from `commit`, for work that goes to a new branch. To change work that was already pushed, such as follow-up fixes to an open PR/MR, do not open a workspace on top of its branch: keep editing the workspace that pushed it and push again, or, when that workspace is gone, pass the branch as `branch` to continue it.',
       schema: z.object({
         repo,
-        baseBranch: z.string().min(1).optional().describe('Branch to start from and later merge into; default: the default branch'),
+        baseBranch: z.string().min(1).optional().describe('Branch the work merges into, and starts from unless `branch` is given; default: the default branch. Never the source branch of an open PR/MR'),
         commit: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/).optional().describe('Full commit id to start from, e.g. the commit a log analysis looked at'),
+        branch: z.string().min(1).optional().describe('Existing remote branch to continue, e.g. the source branch of an open PR/MR to update: the workspace starts from its head and every push adds commits to it. When the current workspace already pushes to this branch, it is reused'),
       }).strict(),
       run: async (args, signal, exec) => {
         const agent = requireAgent(exec, 'repo_workspace_open')
         const ref = service.resolve(args.repo)
+        const url = `${ref.webUrl}.git`
+        if (args.branch !== undefined) {
+          const reused = await currentWorkspace(deps, agent, url, args.branch, signal)
+          if (reused !== undefined) return { ...reused, reused: true, next: continueHint(reused.branch) }
+        } else if (args.baseBranch !== undefined) {
+          const open = await service.listChanges(args.repo, { state: 'open', sourceBranch: args.baseBranch, perPage: 1, signal })
+          const change = open.items[0]
+          if (change !== undefined) {
+            throw new RepoError('invalid', `${args.baseBranch} 是打开中的 PR/MR #${change.number} 的源分支，不要在它上面再开分支。要更新这个 PR/MR：在推送它的工作区继续修改后再次调用 repo_workspace_push（不传 branch）；那个工作区不在了时，用 repo_workspace_open 的 branch: ${args.baseBranch} 接着它修改`)
+          }
+        }
         const parent = await workspaceParent(deps, agent, signal)
         const dir = await freeDirectory(parent, basename(ref.path))
-        const info = await service.openWorkspace(`${ref.webUrl}.git`, {
+        const info = await service.openWorkspace(url, {
           dir,
           ...args.baseBranch === undefined ? {} : { baseBranch: args.baseBranch },
           ...args.commit === undefined ? {} : { commit: args.commit },
+          ...args.branch === undefined ? {} : { branch: args.branch },
           signal,
         })
         const workingDirectory = deps.workingDirectory()
         const current = workingDirectory === undefined ? undefined : await workingDirectory.set(agent, info.dir, signal)
-        return { ...info, workingDirectory: current ?? null, next: 'Edit files in this directory, then call repo_workspace_push with a new branch name and a commit message, then repo_mr_create.' }
+        return {
+          ...info,
+          workingDirectory: current ?? null,
+          next: info.branch === undefined
+            ? 'Edit files in this directory, then call repo_workspace_push with a new branch name and a commit message, then repo_mr_create. For later changes to the same work, keep editing this directory and call repo_workspace_push again without branch; the PR/MR updates by itself.'
+            : continueHint(info.branch),
+        }
       },
     }),
     define(deps, {
@@ -209,7 +228,7 @@ export function createTools(deps: ToolDeps): RepoTool[] {
   const writes: ToolDefinition[] = [
     define(deps, {
       name: 'repo_workspace_push',
-      description: 'Commit the uncommitted changes of a workspace opened by repo_workspace_open and push it to a new remote branch, never forcing. The commit is made as the account that owns the host token and records the id of this session, plus any trailers other plugins add. The first push names the branch, which must not exist yet and cannot be the default or starting branch; later pushes go to the same branch. Open a PR/MR afterwards with repo_mr_create (sourceBranch = the branch, targetBranch = baseBranch). Requires user approval.',
+      description: 'Commit the uncommitted changes of a workspace opened by repo_workspace_open and push it to its remote branch, never forcing. The commit is made as the account that owns the host token and records the id of this session, plus any trailers other plugins add. The first push of a new piece of work names a new branch, which must not exist yet and cannot be the default or starting branch; later pushes, and pushes of a workspace opened with `branch`, add commits to the same branch: omit `branch` then. A PR/MR from the branch updates by itself; the result lists the open ones. Open a PR/MR only when none is listed, with repo_mr_create (sourceBranch = the branch, targetBranch = baseBranch). Requires user approval.',
       schema: z.object({
         dir: z.string().min(1).optional().describe('Workspace directory or a directory inside it; default: the current working directory'),
         branch: z.string().min(1).optional().describe('New remote branch, e.g. fix/order-timeout; required on the first push'),
@@ -223,13 +242,14 @@ export function createTools(deps: ToolDeps): RepoTool[] {
         const root = await workspaceRoot(deps, args.dir, exec, signal)
         const session = exec.agent?.session?.header.id
         const trailers = session === undefined || deps.commitTrailers === undefined ? [] : await deps.commitTrailers({ session, dir: root })
-        return await service.pushWorkspace(root, {
+        const pushed = await service.pushWorkspace(root, {
           ...args.branch === undefined ? {} : { branch: args.branch },
           ...args.message === undefined ? {} : { message: args.message },
           ...session === undefined ? {} : { session },
           ...trailers.length === 0 ? {} : { trailers },
           signal,
         })
+        return { ...pushed, ...await openChangesOf(service, pushed, signal) }
       },
     }),
     define(deps, {
@@ -296,6 +316,51 @@ export function createTools(deps: ToolDeps): RepoTool[] {
     ...writes.map(definition => ({ definition, access: 'write' as const })),
     { definition: merge, access: 'merge' },
   ]
+}
+
+/** Guidance after opening or reusing a workspace that continues an existing branch. */
+function continueHint(branch: string): string {
+  return `Edit files in this directory, then call repo_workspace_push without branch: the commit is added to ${branch} and an open PR/MR from it updates by itself, so do not create another one.`
+}
+
+/**
+ * The workspace containing the Agent's effective directory, when it is a
+ * workspace of `url` that already pushes to `branch`.
+ */
+async function currentWorkspace(deps: ToolDeps, agent: Agent, url: string, branch: string, signal: AbortSignal): Promise<WorkspaceChanges['workspace'] & { readonly branch: string } | undefined> {
+  const current = await currentDirectory(deps, agent, signal)
+  const root = agent.session?.header.cwd
+  for (let dir = current; dir !== dirname(dir) && (root === undefined || inside(dir, root)); dir = dirname(dir)) {
+    if (!await isWorkspaceCheckout(dir)) continue
+    const { workspace } = await deps.service.workspaceChanges(dir, { signal })
+    if (workspace.url !== url || workspace.branch !== branch) return undefined
+    return { ...workspace, branch: workspace.branch }
+  }
+  return undefined
+}
+
+/** Open PRs/MRs from the pushed branch, so the model updates them instead of opening another. */
+async function openChangesOf(service: DshRepoService, pushed: WorkspacePushResult, signal: AbortSignal): Promise<{ readonly openChanges?: readonly OpenChange[]; readonly next: string }> {
+  let items: readonly ChangeInfo[]
+  try {
+    items = (await service.listChanges(pushed.url, { state: 'open', sourceBranch: pushed.branch, signal })).items
+  } catch (error) {
+    // The push already succeeded; report the failed lookup instead of failing the call.
+    const reason = error instanceof Error ? error.message : String(error)
+    return { next: `Pushed. Could not list the PRs/MRs from ${pushed.branch} (${reason}); check with repo_mr_list before creating one.` }
+  }
+  const openChanges = items.map(change => ({ number: change.number, title: change.title, targetBranch: change.targetBranch, webUrl: change.webUrl }))
+  const first = openChanges[0]
+  if (first === undefined) return { openChanges, next: `Open a PR/MR with repo_mr_create (sourceBranch ${pushed.branch}, targetBranch ${pushed.baseBranch}) if the work needs one.` }
+  return { openChanges, next: `PR/MR #${first.number} from ${pushed.branch} now includes this push; do not create another. Use repo_mr_update to change its title or description if needed.` }
+}
+
+/** An open PR/MR from a pushed branch, as the push result lists it. */
+interface OpenChange {
+  readonly number: number
+  readonly title: string
+  readonly targetBranch: string
+  readonly webUrl: string
 }
 
 function requireMerge(deps: ToolDeps): void {
