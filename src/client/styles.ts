@@ -101,6 +101,9 @@ const CSS = `
 .dr__watchMeta{flex:none;color:var(--dr-fg3);white-space:nowrap;font-variant-numeric:tabular-nums}
 .dr__watchMeta--session{width:88px;overflow:hidden;text-overflow:ellipsis}
 .dr__watchMeta--time{width:72px;text-align:right}
+.dr__watchMeta--size{width:72px;text-align:right;color:var(--dr-fg2)}
+.dr__secHead{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.dr__inline--flush{padding-top:0}
 .dr__help summary{cursor:pointer;width:max-content}
 .dr__help p{margin:6px 0 0}
 .dr__footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--dr-fg3);font-size:12px;line-height:18px;overflow-wrap:anywhere}

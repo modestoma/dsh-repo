@@ -6,7 +6,7 @@
  * @module dsh-repo/client/form
  */
 
-import { MAX_REPO_PATTERNS, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS } from '../settings/contract.ts'
+import { MAX_REPO_PATTERNS, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
 import type { RepoSettingsWire, WatchAction, WatchEventKind } from '../settings/contract.ts'
 
 /** Integer settings, named as in {@link SETTING_BOUNDS}. */
@@ -221,4 +221,55 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
       },
     },
   }
+}
+
+/**
+ * A local sync's interval as typed in hours.
+ * @param text - hours, decimals allowed.
+ * @returns whole minutes, or a message when the value is not a number or out of range.
+ */
+export function parseIntervalHours(text: string): { ok: true; minutes: number } | { ok: false; message: string } {
+  const range = `同步间隔须在 ${formatInterval(SYNC_INTERVAL_BOUNDS.min)} 到 ${formatInterval(SYNC_INTERVAL_BOUNDS.max)} 之间`
+  const trimmed = text.trim()
+  const hours = Number(trimmed)
+  if (trimmed === '' || !Number.isFinite(hours)) return { ok: false, message: `同步间隔要填小时数，${range}` }
+  const minutes = Math.round(hours * 60)
+  if (minutes < SYNC_INTERVAL_BOUNDS.min || minutes > SYNC_INTERVAL_BOUNDS.max) return { ok: false, message: range }
+  return { ok: true, minutes }
+}
+
+/**
+ * A local sync's interval for display.
+ * @param minutes - whole minutes.
+ * @returns text such as `12 小时`, `30 分钟`, or `2 天`.
+ */
+export function formatInterval(minutes: number): string {
+  if (minutes % 60 !== 0) return `${minutes} 分钟`
+  const hours = minutes / 60
+  return hours % 24 === 0 ? `${hours / 24} 天` : `${hours} 小时`
+}
+
+/**
+ * A local sync's interval in the hours field.
+ * @param minutes - whole minutes.
+ * @returns hours without float noise.
+ */
+export function intervalHoursText(minutes: number): string {
+  return String(tidy(minutes / 60))
+}
+
+/**
+ * A size for display.
+ * @param bytes - size in bytes.
+ * @returns text such as `512 B`, `1.5 MiB`.
+ */
+export function formatBytes(bytes: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${unit === 0 || value >= 100 ? Math.round(value) : Number(value.toFixed(1))} ${units[unit]}`
 }

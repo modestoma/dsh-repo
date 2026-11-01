@@ -1,8 +1,8 @@
 /**
- * 左侧栏「代码仓库」整页设置，分五个标签页：主机（主机与令牌）、访问范围、
+ * 左侧栏「代码仓库」整页设置，分六个标签页：主机（主机与令牌）、访问范围、
  * 模型工具、MR 跟踪（各类动态的处理方式、检查频率、正在跟踪的 PR/MR）、
- * 高级（超时、上限、镜像目录）。主机、令牌、镜像目录和停止跟踪立即
- * 保存；其余运行时设置有改动时出现底部保存条，保存后对之后的调用立即生效。
+ * 本地同步（把仓库分支定时展开到本地目录）、高级（超时、上限、镜像目录、
+ * 镜像占用）。主机、令牌、镜像目录、停止跟踪和本地同步的改动立即保存；其余运行时设置有改动时出现底部保存条，保存后对之后的调用立即生效。
  * 令牌值存入 DSH 凭据库，页面只显示是否已设置。
  *
  * @module dsh-repo/client/page
@@ -11,9 +11,10 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { ForgeKind, HostInfo, TokenStatus } from '../contract.ts'
-import type { HostAddRequest, SettingsState, WatchInfo } from '../settings/contract.ts'
-import { addHost, clearHostToken, fetchState, messageOf, pickDirectory, removeHost, resetMirrorDir, resetSettings, saveHostToken, saveMirrorDir, saveSettings, stopWatch } from './api.ts'
-import { fromDraft, NUMBER_FIELDS, sameDraft, toDraft, WATCH_ACTIONS, WATCH_EVENTS, WRITE_MODES } from './form.ts'
+import { DEFAULT_SYNC_INTERVAL_MINUTES } from '../settings/contract.ts'
+import type { HostAddRequest, MirrorUsage, SettingsState, SyncInfo, SyncInput, WatchInfo } from '../settings/contract.ts'
+import { addHost, addSync, clearHostToken, fetchMirrorUsage, fetchState, messageOf, pickDirectory, removeHost, removeSync, resetMirrorDir, resetSettings, runSync, saveHostToken, saveMirrorDir, saveSettings, stopWatch, updateSync } from './api.ts'
+import { formatBytes, formatInterval, fromDraft, intervalHoursText, NUMBER_FIELDS, parseIntervalHours, sameDraft, toDraft, WATCH_ACTIONS, WATCH_EVENTS, WRITE_MODES } from './form.ts'
 import type { DraftField, NumberKey, SettingsDraft } from './form.ts'
 
 /** Page title, shared with the sidebar row. */
@@ -21,13 +22,14 @@ export const PAGE_TITLE = '代码仓库'
 
 type Notice = { kind: 'ok' | 'error'; text: string } | undefined
 
-type TabId = 'hosts' | 'access' | 'tools' | 'watch' | 'advanced'
+type TabId = 'hosts' | 'access' | 'tools' | 'watch' | 'sync' | 'advanced'
 
 const TABS: readonly { id: TabId; label: string }[] = [
   { id: 'hosts', label: '主机' },
   { id: 'access', label: '访问范围' },
   { id: 'tools', label: '模型工具' },
   { id: 'watch', label: 'MR 跟踪' },
+  { id: 'sync', label: '本地同步' },
   { id: 'advanced', label: '高级' },
 ]
 
@@ -41,6 +43,18 @@ function ago(iso: string, now: number): string {
   if (seconds < 86_400) return `${Math.floor(seconds / 3600)} 小时前`
   return `${Math.floor(seconds / 86_400)} 天前`
 }
+
+/** Relative future time such as `3 小时后`. */
+function until(iso: string, now: number): string {
+  const seconds = Math.round((Date.parse(iso) - now) / 1000)
+  if (seconds < 60) return '即将'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟后`
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)} 小时后`
+  return `${Math.floor(seconds / 86_400)} 天后`
+}
+
+/** How often the page refreshes while a local sync is queued or running. */
+const SYNC_POLL_MS = 2000
 
 /** Credential store layers of `@deepseek-ai/dsh-credentials-local` other than its own file. */
 const TOKEN_SOURCES: Readonly<Record<string, string>> = { 'env': '启动环境变量', 'project-env': '项目 .env', 'user-env': '$DSH_HOME/.env' }
@@ -93,7 +107,7 @@ export function bundlePointer(openPage: () => (() => void) | undefined): (props:
           <div className="dr__row">
             <div className="dr__rowText">
               <div className="dr__rowLabel">设置在左侧栏「{PAGE_TITLE}」</div>
-              <div className="dr__rowSummary">主机与令牌、访问范围、模型工具、MR 跟踪、超时与上限、本地镜像都在那里配置。</div>
+              <div className="dr__rowSummary">主机与令牌、访问范围、模型工具、MR 跟踪、本地同步、超时与上限、本地镜像都在那里配置。</div>
             </div>
             {open === undefined ? null : <div className="dr__rowCtl"><button type="button" className="dr__btn" onClick={open}>打开设置</button></div>}
           </div>
@@ -103,7 +117,8 @@ export function bundlePointer(openPage: () => (() => void) | undefined): (props:
   }
 }
 
-type Run = (action: () => Promise<SettingsState>, success: string) => Promise<boolean>
+/** Run a change; `success` is the notice after it, or derives the notice from the new state. */
+type Run = (action: () => Promise<SettingsState>, success: string | ((state: SettingsState) => Notice)) => Promise<boolean>
 
 function SettingsPanel(): JSX.Element {
   const [state, setState] = useState<SettingsState | undefined>()
@@ -125,12 +140,20 @@ function SettingsPanel(): JSX.Element {
 
   useEffect(() => { void reload() }, [reload])
 
+  const syncing = tab === 'sync' && !busy && state?.syncs.some(sync => sync.state !== 'idle') === true
+  useEffect(() => {
+    if (!syncing) return undefined
+    const timer = setTimeout(() => { void reload() }, SYNC_POLL_MS)
+    return () => { clearTimeout(timer) }
+  }, [syncing, state, reload])
+
   const run: Run = async (action, success) => {
     setBusy(true)
     setNotice(undefined)
     try {
-      setState(await action())
-      setNotice({ kind: 'ok', text: success })
+      const next = await action()
+      setState(next)
+      setNotice(typeof success === 'string' ? { kind: 'ok', text: success } : success(next))
       return true
     } catch (error) {
       setNotice({ kind: 'error', text: messageOf(error) })
@@ -202,11 +225,13 @@ function SettingsPanel(): JSX.Element {
             </>
           )
         : null}
+      {tab === 'sync' ? <SyncTab state={state} busy={busy} run={run} onError={(text) => { setNotice({ kind: 'error', text }) }} /> : null}
       {tab === 'advanced'
         ? (
             <>
               <AdvancedTab {...form} />
               <MirrorSection state={state} busy={busy} run={run} onError={(text) => { setNotice({ kind: 'error', text }) }} />
+              <MirrorUsageSection mirrorDir={state.mirror.dir} />
               <div className="dr__footer">
                 <span>设置文件 <span className="dr__mono">{state.file}</span>，重装插件不会清空。</span>
                 <button type="button" className="dr__link" disabled={busy} onClick={resetAll}>全部恢复默认</button>
@@ -527,5 +552,150 @@ function MirrorSection({ state, busy, run, onError }: { state: SettingsState; bu
         </div>
       </Row>
     </Section>
+  )
+}
+
+/** Notice after a change that synced: the sync's failure, or `success`. */
+function syncNotice(id: string | undefined, success: string): (state: SettingsState) => Notice {
+  return (state) => {
+    const sync = id === undefined ? state.syncs.at(-1) : state.syncs.find(item => item.id === id)
+    return sync?.error === undefined ? { kind: 'ok', text: success } : { kind: 'error', text: `同步失败：${sync.error}` }
+  }
+}
+
+function SyncTab({ state, busy, run, onError }: { state: SettingsState; busy: boolean; run: Run; onError: (text: string) => void }): JSX.Element {
+  const [adding, setAdding] = useState(false)
+  const [editing, setEditing] = useState<string | undefined>()
+  const now = Date.now()
+  return (
+    <>
+      <Section>
+        {state.syncs.length === 0 && !adding ? <div className="dr__emptyRow">还没有本地同步。添加后，仓库分支的最新提交会定时展开到你指定的本地目录。</div> : null}
+        {state.syncs.map(sync => sync.id === editing
+          ? <SyncForm key={sync.id} sync={sync} picker={state.pickerAvailable} busy={busy} onError={onError} onCancel={() => { setEditing(undefined) }} onSubmit={(input) => { void run(() => updateSync(sync.id, input), syncNotice(sync.id, '已保存')).then((ok) => { if (ok) setEditing(undefined) }) }} />
+          : <SyncRow key={sync.id} sync={sync} now={now} busy={busy} run={run} onEdit={() => { setEditing(sync.id) }} />)}
+        {adding
+          ? <SyncForm picker={state.pickerAvailable} busy={busy} onError={onError} onCancel={() => { setAdding(false) }} onSubmit={(input) => { void run(() => addSync(input), syncNotice(undefined, '已添加并完成第一次同步')).then((ok) => { if (ok) setAdding(false) }) }} />
+          : <div className="dr__addRow"><button type="button" className="dr__link" disabled={busy} onClick={() => { setAdding(true) }}>＋ 添加本地同步</button></div>}
+      </Section>
+      <p className="dr__secFoot">本地目录里是分支最新提交展开后的普通文件，没有 .git，git 对象只在镜像目录里存一份。每次同步只写入有变化的文件，删除分支上已删除的文件，本地改过或删掉的文件会恢复成仓库里的版本；目录里另外放的文件保留。第一次同步要求目录不存在或为空。删除本地同步不会删除目录里的文件。</p>
+    </>
+  )
+}
+
+function syncPill(sync: SyncInfo): JSX.Element {
+  if (sync.state === 'running') return <span className="dr__pill dr__pill--ok"><span className="dr__dot" />同步中</span>
+  if (sync.state === 'queued') return <span className="dr__pill"><span className="dr__dot" />排队中</span>
+  if (sync.error !== undefined) return <span className="dr__pill dr__pill--bad"><span className="dr__dot" />同步失败</span>
+  if (sync.commit === undefined) return <span className="dr__pill dr__pill--warn"><span className="dr__dot" />还没同步</span>
+  return <span className="dr__pill dr__pill--ok"><span className="dr__dot" />已同步</span>
+}
+
+function SyncRow({ sync, now, busy, run, onEdit }: { sync: SyncInfo; now: number; busy: boolean; run: Run; onEdit: () => void }): JSX.Element {
+  const parts = [`每 ${formatInterval(sync.intervalMinutes)}`]
+  if (sync.syncedAt !== undefined) parts.push(`上次 ${ago(sync.syncedAt, now)}${sync.commit === undefined ? '' : `（${sync.syncedBranch ?? ''} ${sync.commit.slice(0, 8)}）`}`)
+  if (sync.nextAt !== undefined) parts.push(`下次 ${until(sync.nextAt, now)}`)
+  const working = sync.state !== 'idle'
+  return (
+    <div className="dr__row dr__row--top">
+      <div className="dr__rowText">
+        <div className="dr__rowLabel">
+          <span className="dr__strong dr__mono">{sync.url}</span>
+          <span className="dr__tag">{sync.branch ?? '默认分支'}</span>
+          {syncPill(sync)}
+        </div>
+        <div className="dr__rowSummary"><span className="dr__mono">→ {sync.dir}</span></div>
+        <div className="dr__rowSummary">{parts.join(' · ')}</div>
+        {sync.error === undefined ? null : <div className="dr__rowError">{sync.error}</div>}
+      </div>
+      <div className="dr__rowCtl">
+        <button type="button" className="dr__btn" disabled={busy || working} onClick={() => { void run(() => runSync(sync.id), syncNotice(sync.id, `已同步 ${sync.url}`)) }}>立即同步</button>
+        <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onEdit}>编辑</button>
+        <button type="button" className="dr__btn dr__btn--ghost dr__btn--danger" disabled={busy} onClick={() => { if (window.confirm(`删除 ${sync.url} 的本地同步？目录 ${sync.dir} 里的文件会保留。`)) void run(() => removeSync(sync.id), '已删除本地同步，目录里的文件保留') }}>删除</button>
+      </div>
+    </div>
+  )
+}
+
+function SyncForm({ sync, picker, busy, onError, onCancel, onSubmit }: { sync?: SyncInfo; picker: boolean; busy: boolean; onError: (text: string) => void; onCancel: () => void; onSubmit: (input: SyncInput) => void }): JSX.Element {
+  const [url, setUrl] = useState(sync?.url ?? '')
+  const [branch, setBranch] = useState(sync?.branch ?? '')
+  const [dir, setDir] = useState(sync?.dir ?? '')
+  const [hours, setHours] = useState(intervalHoursText(sync?.intervalMinutes ?? DEFAULT_SYNC_INTERVAL_MINUTES))
+  const [error, setError] = useState<string | undefined>()
+  const complete = url.trim() !== '' && dir.trim() !== ''
+  const submit = (): void => {
+    if (!complete || busy) return
+    const interval = parseIntervalHours(hours)
+    if (!interval.ok) {
+      setError(interval.message)
+      return
+    }
+    setError(undefined)
+    onSubmit({ url: url.trim(), branch: branch.trim(), dir: dir.trim(), intervalMinutes: interval.minutes })
+  }
+  const choose = (): void => {
+    void pickDirectory().then((path) => { if (path !== null) setDir(path) }, (failure: unknown) => { onError(messageOf(failure)) })
+  }
+  const submitOnEnter = (event: { key: string }): void => { if (event.key === 'Enter') submit() }
+  return (
+    <div className="dr__addForm">
+      <div className="dr__formGrid">
+        <label className="dr__field dr__field--full">仓库地址<input className="dr__input dr__mono" spellCheck={false} placeholder="https://gitlab.example.com/team/shared-skills.git" value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+        <label className="dr__field">分支（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder="默认分支" value={branch} onChange={(event) => { setBranch(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+        <label className="dr__field">同步间隔（小时）<input className="dr__input dr__mono" inputMode="decimal" aria-invalid={error === undefined ? undefined : true} value={hours} onChange={(event) => { setHours(event.target.value); setError(undefined) }} onKeyDown={submitOnEnter} /></label>
+        <div className="dr__field dr__field--full">本地目录
+          <div className="dr__inline dr__inline--flush">
+            <input className="dr__input dr__mono" spellCheck={false} aria-label="本地目录" placeholder="/绝对路径/目录，不存在会自动创建" value={dir} onChange={(event) => { setDir(event.target.value) }} onKeyDown={submitOnEnter} />
+            {picker ? <button type="button" className="dr__btn" disabled={busy} onClick={choose}>选择…</button> : null}
+          </div>
+        </div>
+      </div>
+      {error === undefined ? null : <div className="dr__rowError">{error}</div>}
+      <div className="dr__formActions">
+        <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onCancel}>取消</button>
+        <button type="button" className="dr__btn dr__btn--primary" disabled={busy || !complete} onClick={submit}>{busy ? '同步中…' : sync === undefined ? '添加并同步' : '保存'}</button>
+      </div>
+    </div>
+  )
+}
+
+function MirrorUsageSection({ mirrorDir }: { mirrorDir: string }): JSX.Element {
+  const [usage, setUsage] = useState<MirrorUsage | undefined>()
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | undefined>()
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      setUsage(await fetchMirrorUsage())
+      setError(undefined)
+    } catch (failure) {
+      setError(messageOf(failure))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+  useEffect(() => { void load() }, [load, mirrorDir])
+  const now = Date.now()
+  return (
+    <section className="dr__sec">
+      <div className="dr__secHead">
+        <h2 className="dr__secTitle">镜像占用{usage === undefined ? '' : `（合计 ${formatBytes(usage.totalBytes)}）`}</h2>
+        <button type="button" className="dr__link dr__link--small" disabled={loading} onClick={() => { void load() }}>{loading ? '统计中…' : '重新统计'}</button>
+      </div>
+      <div className="dr__list">
+        {error === undefined ? null : <div className="dr__emptyRow dr__rowError">{error}</div>}
+        {usage === undefined && error === undefined ? <div className="dr__emptyRow">统计中…</div> : null}
+        {usage !== undefined && usage.mirrors.length === 0 ? <div className="dr__emptyRow">镜像目录里还没有仓库。</div> : null}
+        {usage?.mirrors.map(mirror => (
+          <div key={mirror.path} className="dr__watch">
+            <span className="dr__watchName dr__mono" title={mirror.url ?? mirror.path}>{mirror.path}</span>
+            {mirror.fetchedAt === undefined ? null : <span className="dr__watchMeta dr__watchMeta--time" title={`最近拉取 ${mirror.fetchedAt}`}>{ago(mirror.fetchedAt, now)}</span>}
+            <span className="dr__watchMeta dr__watchMeta--size">{formatBytes(mirror.bytes)}</span>
+          </div>
+        ))}
+      </div>
+      {usage === undefined ? null : <p className="dr__secFoot">快照 {formatBytes(usage.snapshotBytes)} · 其他 {formatBytes(usage.otherBytes)}。时间是最近一次拉取。</p>}
+    </section>
   )
 }

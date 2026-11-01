@@ -26,8 +26,10 @@ import { mkdir, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import type { MirrorState, MirrorTreeEntry, SnapshotLease } from '../contract.ts'
 import { RepoError } from '../errors.ts'
+import type { MirrorUsage } from '../settings/contract.ts'
 import { GitError } from './git.ts'
 import type { GitRunner } from './git.ts'
+import { measureMirrors } from './usage.ts'
 import { forgetAbandonedWorkspaces } from './workspace.ts'
 
 /** Collaborators and limits of the store. */
@@ -312,6 +314,27 @@ export class MirrorStore {
       throw gitFailure(error, `创建 ${url} 在 ${commit.slice(0, 12)} 的快照`)
     }
     return { url, commit, dir: snapshot.dir, release }
+  }
+
+  /**
+   * Disk usage of the current mirror directory.
+   * @returns each mirror with its address and last fetch, the snapshots, and the totals.
+   * @throws {RepoError} `unavailable` when the directory cannot be read.
+   */
+  async usage(): Promise<MirrorUsage> {
+    try {
+      return await measureMirrors(this.currentRoot, async (dir) => {
+        try {
+          const url = (await this.git(['config', '--get', 'remote.origin.url'], dir, {})).trim()
+          return url === '' ? undefined : url
+        } catch {
+          // A mirror without an origin is listed without its address.
+          return undefined
+        }
+      })
+    } catch (error) {
+      throw gitFailure(error, `统计镜像目录 ${this.currentRoot} 的占用`)
+    }
   }
 
   /**

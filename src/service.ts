@@ -21,6 +21,7 @@ import type {
 } from './contract.ts'
 import { apiBaseUrl, DEFAULT_SETTINGS, expandHome, resolveSettings } from './config.ts'
 import type { HostSpec, RepoSettings } from './config.ts'
+import type { MirrorUsage } from './settings/contract.ts'
 import { RepoError, toRepoError } from './errors.ts'
 import type { HostCredentials, HostLogger } from './host.ts'
 import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
@@ -434,6 +435,15 @@ export class RepoService implements DshRepoService {
     this.mirrors.setRoot(target)
     this.emitHostsChange({ kind: 'mirror', dir: target })
     return this.mirrorSettings()
+  }
+
+  /**
+   * Disk usage of the current mirror directory.
+   * @returns each mirror with its address and last fetch, the snapshots, and the totals.
+   * @throws {RepoError} `unavailable` when the directory cannot be read.
+   */
+  async mirrorUsage(): Promise<MirrorUsage> {
+    return await this.mirrors.usage()
   }
 
   async syncMirror(url: string, options: MirrorSyncOptions = {}): Promise<MirrorState> {
