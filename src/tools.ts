@@ -4,10 +4,11 @@
  *
  * - Every tool takes `repo` (URL or `host/path`); only configured hosts and
  *   repositories are reachable.
- * - Write tools ask once per call through `ctx.approval` when
- *   `tools.writes` is `ask`; without an approval service they refuse. With
- *   `off` they are not registered. The merge tool is registered only when
- *   `tools.merge` is true.
+ * - Every tool is built; {@link toolOffered} decides from the current
+ *   settings whether the model sees it. Write tools are offered unless
+ *   `tools.writes` is `off` and ask once per call through `ctx.approval`
+ *   while it is `ask`; without an approval service they refuse. The merge
+ *   tool is offered only while `tools.merge` is also true.
  * - A declined approval returns `{ status: 'declined' }`; a service failure
  *   throws with the failure code in brackets, e.g. `[not-found] …`.
  *
@@ -16,7 +17,7 @@
 
 import { z } from 'zod'
 import type { DshRepoService } from './contract.ts'
-import type { RepoConfig } from './config.ts'
+import type { RepoSettings } from './config.ts'
 import { RepoError } from './errors.ts'
 import { lstat, readFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
@@ -33,7 +34,8 @@ export interface Declined {
 /** Collaborators of the tool set. */
 export interface ToolDeps {
   readonly service: DshRepoService
-  readonly config: RepoConfig
+  /** Tool settings now in effect, read on every call. */
+  readonly settings: () => RepoSettings['tools']
   /** DSH's approval service, looked up per call. */
   readonly approval: () => HostApproval | undefined
   /** DSH's working-directory service, looked up per call; absent in compositions without it. */
@@ -73,15 +75,37 @@ function withSignature(body: string | undefined, signature: string): string | un
   return `${body}\n\n${signature}`
 }
 
+/** Which settings offer a tool: reads always, writes unless `writes` is `off`, merge also needs `merge`. */
+export type ToolAccess = 'read' | 'write' | 'merge'
+
+/** One built tool and the settings that offer it. */
+export interface RepoTool {
+  readonly definition: ToolDefinition
+  readonly access: ToolAccess
+}
+
 /**
- * Build the tool definitions the configuration enables.
- * @param deps - service, configuration, and approval lookup.
- * @returns the definitions to register.
+ * Whether the tool settings offer a tool to the model.
+ * @param access - the tool's access class.
+ * @param settings - tool settings now in effect.
+ * @returns whether the model sees the tool.
  */
-export function createTools(deps: ToolDeps): ToolDefinition[] {
-  const { service, config } = deps
-  const sign = (body: string | undefined) => withSignature(body, config.tools.signature)
-  const signRequired = (body: string) => withSignature(body, config.tools.signature) ?? body
+export function toolOffered(access: ToolAccess, settings: RepoSettings['tools']): boolean {
+  if (!settings.enabled) return false
+  if (access === 'read') return true
+  if (settings.writes === 'off') return false
+  return access === 'write' || settings.merge
+}
+
+/**
+ * Build every tool definition with its access class.
+ * @param deps - service, settings, and approval lookup.
+ * @returns the tools to register, each offered while {@link toolOffered} holds.
+ */
+export function createTools(deps: ToolDeps): RepoTool[] {
+  const { service } = deps
+  const sign = (body: string | undefined) => withSignature(body, deps.settings().signature)
+  const signRequired = (body: string) => withSignature(body, deps.settings().signature) ?? body
 
   const reads: ToolDefinition[] = [
     define(deps, {
@@ -181,8 +205,6 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       run: async (args, signal, exec) => service.workspaceChanges(await workspaceRoot(deps, args.dir, exec, signal), { signal }),
     }),
   ]
-  if (config.tools.writes === 'off') return reads
-
   const writes: ToolDefinition[] = [
     define(deps, {
       name: 'repo_workspace_push',
@@ -255,16 +277,28 @@ export function createTools(deps: ToolDeps): ToolDefinition[] {
       run: (args, signal) => service.commentChange(args.repo, args.number, signRequired(args.body), { signal }),
     }),
   ]
-  if (config.tools.merge) {
-    writes.push(define(deps, {
-      name: 'repo_mr_merge',
-      description: 'Merge a pull/merge request, only while its head is still `headSha` (read it with repo_mr_status first). Requires user approval.',
-      schema: z.object({ repo, number, headSha: z.string().min(40), method: z.enum(['merge', 'squash', 'rebase']).optional() }).strict(),
-      describe: args => ({ zh: `合并 ${args.repo} 的 PR/MR #${args.number}（head ${args.headSha.slice(0, 12)}${args.method === undefined ? '' : `，方式 ${args.method}`}）`, en: `Merge PR/MR #${args.number} in ${args.repo} at ${args.headSha.slice(0, 12)}` }),
-      run: (args, signal) => service.mergeChange(args.repo, args.number, { headSha: args.headSha, ...args.method === undefined ? {} : { method: args.method }, signal }),
-    }))
-  }
-  return [...reads, ...writes]
+  const merge = define(deps, {
+    name: 'repo_mr_merge',
+    description: 'Merge a pull/merge request, only while its head is still `headSha` (read it with repo_mr_status first). Requires user approval.',
+    schema: z.object({ repo, number, headSha: z.string().min(40), method: z.enum(['merge', 'squash', 'rebase']).optional() }).strict(),
+    describe: (args) => {
+      requireMerge(deps)
+      return { zh: `合并 ${args.repo} 的 PR/MR #${args.number}（head ${args.headSha.slice(0, 12)}${args.method === undefined ? '' : `，方式 ${args.method}`}）`, en: `Merge PR/MR #${args.number} in ${args.repo} at ${args.headSha.slice(0, 12)}` }
+    },
+    run: (args, signal) => {
+      requireMerge(deps)
+      return service.mergeChange(args.repo, args.number, { headSha: args.headSha, ...args.method === undefined ? {} : { method: args.method }, signal })
+    },
+  })
+  return [
+    ...reads.map(definition => ({ definition, access: 'read' as const })),
+    ...writes.map(definition => ({ definition, access: 'write' as const })),
+    { definition: merge, access: 'merge' },
+  ]
+}
+
+function requireMerge(deps: ToolDeps): void {
+  if (!deps.settings().merge) throw new RepoError('forbidden', 'dsh-repo 设置页没有开放合并，repo_mr_merge 不会执行')
 }
 
 function requireAgent(exec: ToolRunContext, toolName: string): Agent {
@@ -370,7 +404,9 @@ function define<S extends z.ZodType, V>(deps: ToolDeps, spec: Spec<S, V>): ToolD
       const parsed = spec.schema.safeParse(raw)
       if (!parsed.success) throw new Error(`[invalid] ${spec.name} 参数不合法：${parsed.error.issues.map(issue => `${issue.path.join('.') || '(根)'}：${issue.message}`).join('；')}`)
       const args = parsed.data
-      if (spec.describe !== undefined && deps.config.tools.writes === 'ask') {
+      const writes = spec.describe === undefined ? undefined : deps.settings().writes
+      if (writes === 'off') throw new Error(`[forbidden] dsh-repo 设置页已关闭写操作，${spec.name} 不会执行`)
+      if (spec.describe !== undefined && writes === 'ask') {
         let text: Prompt
         try {
           text = await spec.describe(args, exec)
@@ -393,7 +429,7 @@ function define<S extends z.ZodType, V>(deps: ToolDeps, spec: Spec<S, V>): ToolD
 
 async function approve(deps: ToolDeps, toolName: string, text: Prompt, exec: ToolRunContext): Promise<string> {
   const approval = deps.approval()
-  if (approval === undefined) throw new Error(`[forbidden] 当前 DSH 组合没有审批服务（@deepseek-ai/dsh-user-approval），dsh-repo 不会在未经授权时执行 ${toolName}；或把 tools.writes 设为 allow`)
+  if (approval === undefined) throw new Error(`[forbidden] 当前 DSH 组合没有审批服务（@deepseek-ai/dsh-user-approval），dsh-repo 不会在未经授权时执行 ${toolName}；或在 dsh-repo 设置页把写操作改为「不审批」`)
   if (exec.agent === undefined) throw new Error(`[forbidden] ${toolName} 需要由 Agent 调用`)
   const outcome = await approval.request({
     agent: exec.agent,

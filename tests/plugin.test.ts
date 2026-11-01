@@ -100,6 +100,20 @@ describe('plugin', () => {
     expect(() => plugin.apply(context().ctx, { hosts: 'github.com' })).toThrow(/配置不合法/)
   })
 
+  it('offers tools as the saved tool settings allow', async () => {
+    const { ctx, registered, provided, env } = context()
+    plugin.apply(ctx, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
+    const service = provided.get('dshRepos') as RepoService
+    const offered = async (name: string) => await registered.find(entry => entry.definition.name === name)!.when!()
+    expect([await offered('repo_info'), await offered('repo_issue_create'), await offered('repo_mr_merge')]).toEqual([true, true, false])
+    await service.updateSettings({ tools: { merge: true } })
+    expect(await offered('repo_mr_merge')).toBe(true)
+    await service.updateSettings({ tools: { writes: 'off', merge: true } })
+    expect([await offered('repo_info'), await offered('repo_issue_create'), await offered('repo_mr_merge')]).toEqual([true, false, false])
+    await service.updateSettings({ tools: { enabled: false } })
+    expect(await offered('repo_info')).toBe(false)
+  })
+
   it('reads added hosts at load and refuses an invalid hosts file', async () => {
     const first = context()
     plugin.apply(first.ctx, undefined, { env: first.env })
@@ -108,6 +122,6 @@ describe('plugin', () => {
     plugin.apply(second.ctx, undefined, { env: first.env })
     const hosts = await (second.provided.get('dshRepos') as RepoService).listHosts()
     expect(hosts).toMatchObject([{ kind: 'gitlab', url: 'https://code.example.com', alias: '公司 GitLab', origin: 'added' }])
-    expect(() => plugin.apply(context().ctx, { hostsFile: join(first.env.DSH_HOME, 'dsh-repo') })).toThrow(/无法读取主机文件/)
+    expect(() => plugin.apply(context().ctx, { hostsFile: join(first.env.DSH_HOME, 'dsh-repo') })).toThrow(/无法读取设置文件/)
   })
 })

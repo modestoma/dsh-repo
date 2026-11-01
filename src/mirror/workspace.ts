@@ -37,6 +37,12 @@ const ID = /^[0-9a-f]{16}$/
 export interface WorkspaceStoreDeps {
   readonly git: GitRunner
   readonly mirrors: MirrorStore
+  /** Git command timeout and diff cut, read on every use so saved settings apply to the next command. */
+  readonly limits: () => WorkspaceLimits
+}
+
+/** Limits of one workspace operation. */
+export interface WorkspaceLimits {
   /** Timeout of one git command. */
   readonly timeoutMs: number
   /** Cut of {@link WorkspaceChanges.diff}. */
@@ -190,7 +196,7 @@ export class WorkspaceStore {
   /** Whether Git LFS is installed and some LFS file differs between the workspace's base commit and HEAD. */
   private async changesLfsFiles(ws: Located, signal?: AbortSignal): Promise<boolean> {
     // A missing `git lfs` command is the only expected failure of `git lfs version`.
-    this.lfs ??= this.deps.git(['lfs', 'version'], { timeoutMs: this.deps.timeoutMs }).then(() => true, () => false)
+    this.lfs ??= this.deps.git(['lfs', 'version'], { timeoutMs: this.deps.limits().timeoutMs }).then(() => true, () => false)
     if (!await this.lfs) return false
     return (await this.workspaceGit(ws, ['lfs', 'ls-files', '--name-only', ws.baseCommit, 'HEAD'], {}, signal)).trim() !== ''
   }
@@ -216,7 +222,7 @@ export class WorkspaceStore {
       await mkdir(dirname(target), { recursive: true })
       await this.deps.mirrors.withWorktreeLock(mirror, async () => {
         signal?.throwIfAborted()
-        await this.deps.git(['worktree', 'add', '--quiet', '-b', `${BRANCH_PREFIX}${id}`, target, commit], { cwd: mirror, timeoutMs: this.deps.timeoutMs, env, ...signal === undefined ? {} : { signal } })
+        await this.deps.git(['worktree', 'add', '--quiet', '-b', `${BRANCH_PREFIX}${id}`, target, commit], { cwd: mirror, timeoutMs: this.deps.limits().timeoutMs, env, ...signal === undefined ? {} : { signal } })
         await this.git(['config', `${SECTION}.${id}.baseBranch`, baseBranch], mirror)
         await this.git(['config', `${SECTION}.${id}.baseCommit`, commit], mirror)
       })
@@ -367,15 +373,16 @@ export class WorkspaceStore {
 
   private async describe(ws: Located, signal?: AbortSignal): Promise<WorkspaceChanges> {
     await this.workspaceGit(ws, ['add', '--all'], {}, signal)
+    const { maxDiffBytes } = this.deps.limits()
     const [names, numbers, patch, log, pending] = await Promise.all([
       this.workspaceGit(ws, ['diff', '--cached', '-z', '--name-status', '-M', ws.baseCommit], {}, signal),
       this.workspaceGit(ws, ['diff', '--cached', '-z', '--numstat', '-M', ws.baseCommit], {}, signal),
-      this.workspaceGit(ws, ['diff', '--cached', '-M', ws.baseCommit], {}, signal, this.deps.maxDiffBytes + 1),
+      this.workspaceGit(ws, ['diff', '--cached', '-M', ws.baseCommit], {}, signal, maxDiffBytes + 1),
       this.workspaceGit(ws, ['log', '--reverse', '--format=%H%x1f%s', `${ws.baseCommit}..HEAD`], {}, signal),
       this.workspaceGit(ws, ['diff', '--cached', '--name-only', '-z', 'HEAD'], {}, signal),
     ])
     const bytes = Buffer.from(patch, 'utf8')
-    const truncated = bytes.length > this.deps.maxDiffBytes
+    const truncated = bytes.length > maxDiffBytes
     return {
       workspace: { url: ws.url, dir: ws.dir, baseBranch: ws.baseBranch, baseCommit: ws.baseCommit, ...ws.branch === undefined ? {} : { branch: ws.branch } },
       commits: log.split('\n').filter(line => line !== '').map((line) => {
@@ -384,7 +391,7 @@ export class WorkspaceStore {
       }),
       uncommitted: pending !== '',
       files: parseChanges(names, numbers),
-      diff: truncated ? bytes.subarray(0, this.deps.maxDiffBytes).toString('utf8') : patch,
+      diff: truncated ? bytes.subarray(0, maxDiffBytes).toString('utf8') : patch,
       truncated,
     }
   }
@@ -403,7 +410,7 @@ export class WorkspaceStore {
   private workspaceGit(ws: Located, args: readonly string[], env: Readonly<Record<string, string>>, signal?: AbortSignal, maxOutputBytes?: number): Promise<string> {
     return this.deps.git([`--git-dir=${ws.gitDir}`, `--work-tree=${ws.dir}`, ...args], {
       cwd: ws.dir,
-      timeoutMs: this.deps.timeoutMs,
+      timeoutMs: this.deps.limits().timeoutMs,
       env,
       ...signal === undefined ? {} : { signal },
       ...maxOutputBytes === undefined ? {} : { maxOutputBytes },
@@ -411,6 +418,6 @@ export class WorkspaceStore {
   }
 
   private git(args: readonly string[], cwd: string): Promise<string> {
-    return this.deps.git(args, { cwd, timeoutMs: this.deps.timeoutMs, env: {} })
+    return this.deps.git(args, { cwd, timeoutMs: this.deps.limits().timeoutMs, env: {} })
   }
 }

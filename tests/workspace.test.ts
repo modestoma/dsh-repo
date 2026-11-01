@@ -8,7 +8,7 @@ import { runGit } from '../src/mirror/git.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import { credentials, fakeHttp, testConfig, TOKENS, withMirrors } from './helpers.ts'
+import { credentials, fakeHttp, mirrorLimits, testConfig, TOKENS, withMirrors } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 const BOT = { name: 'Bot', email: 'bot@example.com' }
@@ -45,10 +45,10 @@ function origin(): { bare: string; commit: string } {
 function setup(tokens: Record<string, string> = {}, git: GitRunner = runGit) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-'))
   const config = testConfig()
-  const make = () => new RepoService(config, {
+  const make = () => new RepoService({
     credentials: credentials(tokens),
     hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
-    ...withMirrors(new MirrorStore({ git, root: join(root, 'mirrors'), timeoutMs: 30_000, maxFileBytes: 1024, maxTreeEntries: 100 }), git, 200),
+    ...withMirrors(new MirrorStore({ git, root: join(root, 'mirrors'), limits: mirrorLimits(1024, 100) }), git, 200),
   })
   const sandbox = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-session-'))
   return { root, sandbox, service: make(), make }

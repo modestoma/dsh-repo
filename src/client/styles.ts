@@ -1,5 +1,5 @@
 /**
- * 插件页设置样式。使用 DSH 语义 token（`--dsw-alias-*`）并带中性回退，
+ * 设置页样式。使用 DSH 语义 token（`--dsw-alias-*`）并带中性回退，
  * 随当前主题变化。
  *
  * @module dsh-repo/client/styles
@@ -45,6 +45,31 @@ const CSS = `
 .dr__notice--ok{color:var(--dr-ok);background:color-mix(in srgb,var(--dr-ok) 9%,transparent)}
 .dr__notice--error{color:var(--dr-bad);background:color-mix(in srgb,var(--dr-bad) 8%,transparent)}
 .dr__loading{padding:16px 0;color:var(--dr-fg3);font-size:12px}
+.dr-page{width:100%;height:100%;min-width:0;min-height:0;overflow:auto;scrollbar-gutter:stable;background:var(--dsw-alias-bg-base,#fff)}
+.dr-page__content{box-sizing:border-box;max-width:816px;margin:0 auto;padding:calc(18px + var(--dsh-frame-top-clearance,0px)) clamp(16px,4vw,48px) 48px}
+.dr__head{display:flex;flex-direction:column;gap:2px}
+.dr__title{margin:0;font-size:20px;font-weight:600;line-height:28px;letter-spacing:.01em}
+.dr__subtitle{margin:0;color:var(--dr-fg3);font-size:12px;line-height:18px}
+.dr__textarea{height:auto;padding:6px 10px;line-height:20px;resize:vertical}
+.dr__select{width:auto;min-width:168px}
+.dr__number{display:inline-flex;align-items:center;gap:6px}
+.dr__number .dr__input{width:112px;text-align:right}
+.dr__input[aria-invalid="true"]{border-color:var(--dr-bad)}
+.dr__input:disabled{color:var(--dr-dim)}
+.dr__unit{min-width:28px;color:var(--dr-fg3);font-size:12px}
+.dr__switch{position:relative;flex:none;width:34px;height:20px;padding:0;border:0;border-radius:10px;background:var(--dr-dim);cursor:pointer;transition:background .15s}
+.dr__switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:transform .15s}
+.dr__switch[aria-checked="true"]{background:var(--dr-accent)}
+.dr__switch[aria-checked="true"]::after{transform:translateX(14px)}
+.dr__switch:disabled{opacity:.5;cursor:default}
+.dr__switch:focus-visible{outline:2px solid var(--dr-accent);outline-offset:2px}
+.dr__saveBar{position:sticky;bottom:0;z-index:2;display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 0;border-top:1px solid var(--dr-line);background:var(--dsw-alias-bg-base,#fff)}
+.dr__saveText{flex:1 1 auto;color:var(--dr-fg3);font-size:12px}
+.dr__btn--primary{border-color:var(--dr-accent);background:var(--dr-accent);color:#fff}
+.dr__btn--primary:hover:not(:disabled){background:color-mix(in srgb,var(--dr-accent) 88%,#000)}
+.dr__btn--primary:disabled{border-color:var(--dr-line);background:transparent}
+@media (max-width:560px){.dr__row{flex-direction:column;gap:8px}.dr__rowCtl{justify-content:flex-start}}
+@media (prefers-reduced-motion:reduce){.dr__switch,.dr__switch::after{transition:none}}
 `
 
 /**

@@ -35,6 +35,12 @@ export interface MirrorStoreDeps {
   readonly git: GitRunner
   /** Absolute directory holding the mirrors at start; {@link MirrorStore.setRoot} changes it. */
   readonly root: string
+  /** Git command timeout and read limits, read on every use so saved settings apply to the next command. */
+  readonly limits: () => MirrorLimits
+}
+
+/** Limits of one mirror operation. */
+export interface MirrorLimits {
   /** Timeout of one git command. */
   readonly timeoutMs: number
   readonly maxFileBytes: number
@@ -156,7 +162,7 @@ export class MirrorStore {
   private readonly roots = new Map<string, string>()
   private currentRoot: string
 
-  /** @param deps - git runner, root, timeout, and limits. */
+  /** @param deps - git runner, root, and limits. */
   constructor(private readonly deps: MirrorStoreDeps) {
     this.currentRoot = deps.root
   }
@@ -237,7 +243,8 @@ export class MirrorStore {
       if (listed !== path) return undefined
       const [mode, type, object, size] = meta.split(/\s+/)
       if (type !== 'blob' || mode === '120000' || object === undefined) throw new RepoError('invalid', `${path} 不是普通文件`)
-      if (Number(size) > this.deps.maxFileBytes) throw new RepoError('too-large', `${path} 超过单文件上限 ${this.deps.maxFileBytes} 字节`)
+      const { maxFileBytes } = this.deps.limits()
+      if (Number(size) > maxFileBytes) throw new RepoError('too-large', `${path} 超过单文件上限 ${maxFileBytes} 字节`)
       return await this.git(['cat-file', 'blob', object], dir, {}, signal)
     } catch (error) {
       throw gitFailure(error, `读取 ${url} 的 ${path} `)
@@ -258,13 +265,14 @@ export class MirrorStore {
     try {
       const listing = await this.git(['ls-tree', '-r', '-t', '-z', commit, '--', ...path === '' ? [] : [`${path}/`]], dir, {}, signal)
       const entries: MirrorTreeEntry[] = []
+      const { maxTreeEntries } = this.deps.limits()
       for (const record of listing.split('\0')) {
         if (record === '') continue
         const tab = record.indexOf('\t')
         const [mode = '', type = ''] = record.slice(0, tab).split(' ')
         const entryPath = record.slice(tab + 1)
         if (path !== '' && !entryPath.startsWith(`${path}/`)) continue
-        if (entries.length >= this.deps.maxTreeEntries) throw new RepoError('too-large', `${path === '' ? '仓库' : path} 下的条目超过上限 ${this.deps.maxTreeEntries}`)
+        if (entries.length >= maxTreeEntries) throw new RepoError('too-large', `${path === '' ? '仓库' : path} 下的条目超过上限 ${maxTreeEntries}`)
         if (type === 'tree') entries.push({ path: entryPath, type: 'dir' })
         else if (type === 'commit') entries.push({ path: entryPath, type: 'submodule' })
         else if (mode === '120000') entries.push({ path: entryPath, type: 'symlink' })
@@ -352,7 +360,7 @@ export class MirrorStore {
   }
 
   private git(args: readonly string[], cwd: string | undefined, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string> {
-    return this.deps.git(args, { ...cwd === undefined ? {} : { cwd }, timeoutMs: this.deps.timeoutMs, env, ...signal === undefined ? {} : { signal } })
+    return this.deps.git(args, { ...cwd === undefined ? {} : { cwd }, timeoutMs: this.deps.limits().timeoutMs, env, ...signal === undefined ? {} : { signal } })
   }
 
   /**

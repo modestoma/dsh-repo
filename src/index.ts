@@ -5,7 +5,7 @@
  * GitHub（含 GitHub Enterprise Server）与 GitLab（含自建实例）的差异：
  * 对其他插件提供 `dshRepos` 服务（类型见 `dsh-repo/contract`），
  * 对模型提供代码、issue、PR/MR 工具，写操作逐次经用户审批。Web 组合中
- * 另在「插件 → dsh-repo」页面提供主机与令牌设置（见 `dsh-repo/client`）。
+ * 另在左侧栏「代码仓库」提供整页设置（见 `dsh-repo/client`）。
  *
  * @module dsh-repo
  */
@@ -20,33 +20,34 @@ import { WorkspaceStore } from './mirror/workspace.ts'
 import { DSH_REPOS_SERVICE, RepoService } from './service.ts'
 import type { ProviderFactory } from './service.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
-import { createTools } from './tools.ts'
+import { createTools, toolOffered } from './tools.ts'
 import type { CommitTrailer, CommitTrailersEvent } from './contract.ts'
 import { RepoError } from './errors.ts'
 
 export type * from './contract.ts'
-export type { HostSpec, RepoConfig, RepoLimits } from './config.ts'
-export { apiBaseUrl, defaultMirrorDir, hostsFile, normalizeHostUrl, pluginConfigSchema, resolveConfig } from './config.ts'
+export type { HostSpec, RepoConfig, RepoLimits, RepoSettings, SettingsOverrides } from './config.ts'
+export { DEFAULT_SETTINGS, apiBaseUrl, defaultMirrorDir, hostsFile, normalizeHostUrl, pluginConfigSchema, repoSettingsSchema, resolveConfig, resolveSettings, settingsOverrides } from './config.ts'
 export { RepoError, toRepoError } from './errors.ts'
 export { HostStore, addedTokenRef, isAcceptedToken } from './hosts.ts'
 export { GitError, credentialEnvironment, runGit } from './mirror/git.ts'
 export type { GitRunOptions, GitRunner } from './mirror/git.ts'
 export { MirrorStore, isAcceptedGitUrl, mirrorPath } from './mirror/store.ts'
+export type { MirrorLimits, MirrorStoreDeps } from './mirror/store.ts'
 export { WorkspaceStore, forgetAbandonedWorkspaces } from './mirror/workspace.ts'
-export type { PushRequest, WorkspaceStoreDeps } from './mirror/workspace.ts'
+export type { PushRequest, WorkspaceLimits, WorkspaceStoreDeps } from './mirror/workspace.ts'
 export { DSH_REPOS_SERVICE, RepoService, defaultProviderFactory } from './service.ts'
 export type { ProviderFactory, RepoServiceDeps } from './service.ts'
 export { GithubProvider } from './providers/github.ts'
 export { GitlabProvider } from './providers/gitlab.ts'
 export type { Provider } from './providers/types.ts'
 export { hostOf, matchesPattern, resolveTarget } from './target.ts'
-export { createTools } from './tools.ts'
-export { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, STATE_ROUTE } from './settings/contract.ts'
-export type { HostAddRequest, MutationError, MutationOk, PickedDirectory, SettingsState } from './settings/contract.ts'
+export { createTools, toolOffered } from './tools.ts'
+export { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, SETTING_BOUNDS, STATE_ROUTE } from './settings/contract.ts'
+export type { HostAddRequest, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState } from './settings/contract.ts'
 export { hostDirectoryPicker } from './settings/directory-picker.ts'
 export type { DirectoryPicker } from './settings/directory-picker.ts'
 export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes, settingsState } from './settings/routes.ts'
-export type { Declined, ToolDeps } from './tools.ts'
+export type { Declined, RepoTool, ToolAccess, ToolDeps } from './tools.ts'
 
 /** Cordis event other plugins listen to for extra trailers of a pushed commit; payload {@link CommitTrailersEvent}. */
 export const COMMIT_TRAILERS_EVENT = 'repo/commit-trailers'
@@ -94,27 +95,36 @@ export interface RepoPluginOptions {
 
 /**
  * Provide the `dshRepos` service, mount the settings routes while the Host
- * serves the Web, and register the model tools, which are offered only while
- * at least one host is configured or added.
+ * serves the Web, and register the model tools, each offered only while at
+ * least one host is configured or added and the current tool settings allow
+ * it.
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
  * @param options - test seams.
- * @throws when the configuration or the added-hosts file is invalid.
+ * @throws when the configuration or the settings file is invalid.
  */
 export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOptions = {}): void {
   const resolved = resolveConfig(config)
   const env = options.env ?? process.env
   const hosts = new HostStore(resolved.hosts, hostsFile(resolved, env))
-  const mirrors = new MirrorStore({
-    git: options.git ?? runGit,
-    root: hosts.mirrorDir() ?? defaultMirrorDir(env),
-    timeoutMs: resolved.mirror.gitTimeoutMs,
-    maxFileBytes: resolved.limits.maxFileBytes,
-    maxTreeEntries: resolved.limits.maxTreeEntries,
-  })
   const git = options.git ?? runGit
-  const workspaces = new WorkspaceStore({ git, mirrors, timeoutMs: resolved.mirror.gitTimeoutMs, maxDiffBytes: resolved.limits.maxDiffBytes })
-  const service = new RepoService(resolved, {
+  const mirrors = new MirrorStore({
+    git,
+    root: hosts.mirrorDir() ?? defaultMirrorDir(env),
+    limits: () => {
+      const { mirror, limits } = hosts.settings()
+      return { timeoutMs: mirror.gitTimeoutMs, maxFileBytes: limits.maxFileBytes, maxTreeEntries: limits.maxTreeEntries }
+    },
+  })
+  const workspaces = new WorkspaceStore({
+    git,
+    mirrors,
+    limits: () => {
+      const { mirror, limits } = hosts.settings()
+      return { timeoutMs: mirror.gitTimeoutMs, maxDiffBytes: limits.maxDiffBytes }
+    },
+  })
+  const service = new RepoService({
     credentials: ctx.credentials,
     hosts,
     mirrors,
@@ -125,16 +135,15 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   })
   ctx.provide?.(DSH_REPOS_SERVICE, service)
   mountSettingsRoutes(ctx, service)
-  if (!resolved.tools.enabled) return
   if (!service.configured) ctx.logger?.info?.('dsh-repo: 还没有主机，代码仓库工具在添加主机后提供')
   const tools = createTools({
     service,
-    config: resolved,
+    settings: () => service.settings.tools,
     approval: () => ctx.get?.('approval') as HostApproval | undefined,
     workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
     commitTrailers: request => collectTrailers(ctx, request),
   })
-  for (const definition of tools) {
-    ctx.effect(() => ctx.tools.register(definition, { when: () => service.configured }), `dsh-repo: ${definition.name}`)
+  for (const { definition, access } of tools) {
+    ctx.effect(() => ctx.tools.register(definition, { when: () => service.configured && toolOffered(access, service.settings.tools) }), `dsh-repo: ${definition.name}`)
   }
 }

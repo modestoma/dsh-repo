@@ -5,9 +5,9 @@ import { describe, expect, it, vi } from 'vitest'
 import type { DshRepoService } from '../src/contract.ts'
 import type { HostApproval, ToolDefinition, WorkingDirectoryService } from '../src/host.ts'
 import { RepoError } from '../src/errors.ts'
-import { createTools } from '../src/tools.ts'
+import { createTools, toolOffered } from '../src/tools.ts'
 import type { ToolDeps } from '../src/tools.ts'
-import { testConfig } from './helpers.ts'
+import { testSettings } from './helpers.ts'
 
 const agent = { id: 'agent-1' }
 const exec = { signal: new AbortController().signal, agent, callId: 'call-1' }
@@ -18,13 +18,14 @@ function fakeService(overrides: Record<string, unknown> = {}): DshRepoService {
   return new Proxy({} as DshRepoService, { get: (_target, key) => overrides[String(key)] ?? notUsed })
 }
 
+/** The tools the settings offer, by name. */
 function tools(
-  config = testConfig(), service = fakeService(), approval?: HostApproval, workingDirectory?: WorkingDirectoryService,
+  settings = testSettings(), service = fakeService(), approval?: HostApproval, workingDirectory?: WorkingDirectoryService,
   commitTrailers?: ToolDeps['commitTrailers'],
 ): Map<string, ToolDefinition> {
   return new Map(createTools({
-    service, config, approval: () => approval, workingDirectory: () => workingDirectory, ...commitTrailers === undefined ? {} : { commitTrailers },
-  }).map(tool => [tool.name, tool]))
+    service, settings: () => settings.tools, approval: () => approval, workingDirectory: () => workingDirectory, ...commitTrailers === undefined ? {} : { commitTrailers },
+  }).filter(tool => toolOffered(tool.access, settings.tools)).map(tool => [tool.definition.name, tool.definition]))
 }
 
 /** A Session rooted at a fresh directory whose effective directory starts at `sub`. */
@@ -46,16 +47,32 @@ function checkout(dir: string): string {
 }
 
 describe('createTools', () => {
-  it('registers reads, writes, and merge according to the configuration', () => {
+  it('offers reads, writes, and merge according to the settings', () => {
     expect([...tools().keys()]).toEqual([
       'repo_info', 'repo_list_branches', 'repo_list_commits', 'repo_list_tree', 'repo_read_file',
       'repo_issue_list', 'repo_issue_get', 'repo_mr_list', 'repo_mr_get', 'repo_mr_diff', 'repo_mr_status',
       'repo_workspace_open', 'repo_workspace_changes',
       'repo_workspace_push', 'repo_issue_create', 'repo_issue_update', 'repo_issue_comment', 'repo_mr_create', 'repo_mr_update', 'repo_mr_comment',
     ])
-    expect(tools(testConfig({ tools: { writes: 'off', merge: true } })).has('repo_issue_create')).toBe(false)
-    expect(tools(testConfig({ tools: { writes: 'off' } })).has('repo_workspace_push')).toBe(false)
-    expect(tools(testConfig({ tools: { merge: true } })).has('repo_mr_merge')).toBe(true)
+    expect(tools(testSettings({ tools: { writes: 'off', merge: true } })).has('repo_issue_create')).toBe(false)
+    expect(tools(testSettings({ tools: { writes: 'off' } })).has('repo_workspace_push')).toBe(false)
+    expect(tools(testSettings({ tools: { merge: true } })).has('repo_mr_merge')).toBe(true)
+    expect(tools(testSettings({ tools: { enabled: false } })).size).toBe(0)
+  })
+
+  it('follows settings saved after the tools were built', async () => {
+    let settings = testSettings({ tools: { writes: 'allow', merge: true } })
+    const createIssue = vi.fn(async () => ({ number: 1 }))
+    const mergeChange = vi.fn(async () => ({ merged: true }))
+    const built = new Map(createTools({ service: fakeService({ createIssue, mergeChange }), settings: () => settings.tools, approval: () => undefined, workingDirectory: () => undefined })
+      .map(tool => [tool.definition.name, tool.definition]))
+    expect(await built.get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'Bug' }, exec)).toEqual({ number: 1 })
+    settings = testSettings({ tools: { writes: 'allow' } })
+    await expect(built.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)).rejects.toThrow(/\[forbidden\].*合并/)
+    settings = testSettings({ tools: { writes: 'off' } })
+    await expect(built.get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'Bug' }, exec)).rejects.toThrow(/\[forbidden\].*关闭写操作/)
+    expect(createIssue).toHaveBeenCalledTimes(1)
+    expect(mergeChange).not.toHaveBeenCalled()
   })
 
   it('exposes JSON Schema parameters', () => {
@@ -66,7 +83,7 @@ describe('createTools', () => {
 
   it('runs reads without approval and renders the value as JSON text', async () => {
     const repoInfo = vi.fn(async () => ({ defaultBranch: 'main' }))
-    const tool = tools(testConfig(), fakeService({ repoInfo })).get('repo_info')!
+    const tool = tools(testSettings(), fakeService({ repoInfo })).get('repo_info')!
     const value = await tool.execute({ repo: 'github.com/a/b' }, exec)
     expect(repoInfo).toHaveBeenCalledWith('github.com/a/b', { signal: exec.signal })
     expect(tool.output.render({}, value)).toEqual([{ type: 'text', text: '{\n  "defaultBranch": "main"\n}' }])
@@ -75,7 +92,7 @@ describe('createTools', () => {
   it('asks once before a write and returns declined without calling the host', async () => {
     const createIssue = vi.fn(async () => ({ number: 1 }))
     const request = vi.fn(async () => 'rejected' as const)
-    const tool = tools(testConfig(), fakeService({ createIssue }), { request }).get('repo_issue_create')!
+    const tool = tools(testSettings(), fakeService({ createIssue }), { request }).get('repo_issue_create')!
     expect(await tool.execute({ repo: 'github.com/a/b', title: 'Bug' }, exec)).toEqual({ status: 'declined', outcome: 'rejected' })
     expect(createIssue).not.toHaveBeenCalled()
     expect(request).toHaveBeenCalledWith(expect.objectContaining({ agent, toolName: 'repo_issue_create', callId: 'call-1', reason: '在 github.com/a/b 创建 issue：Bug' }))
@@ -83,7 +100,7 @@ describe('createTools', () => {
 
   it('runs an approved write and appends the configured signature to bodies', async () => {
     const commentChange = vi.fn(async () => ({ id: '1' }))
-    const tool = tools(testConfig({ tools: { signature: '_via DSH_' } }), fakeService({ commentChange }), { request: async () => 'allowed-once' }).get('repo_mr_comment')!
+    const tool = tools(testSettings({ tools: { signature: '_via DSH_' } }), fakeService({ commentChange }), { request: async () => 'allowed-once' }).get('repo_mr_comment')!
     expect(await tool.execute({ repo: 'github.com/a/b', number: 3, body: 'LGTM' }, exec)).toEqual({ id: '1' })
     expect(commentChange).toHaveBeenCalledWith('github.com/a/b', 3, 'LGTM\n\n_via DSH_', { signal: exec.signal })
   })
@@ -91,14 +108,14 @@ describe('createTools', () => {
   it('skips approval in allow mode and refuses writes without an approval service in ask mode', async () => {
     const createIssue = vi.fn(async () => ({ number: 1 }))
     const service = fakeService({ createIssue })
-    await tools(testConfig({ tools: { writes: 'allow' } }), service).get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'x' }, exec)
+    await tools(testSettings({ tools: { writes: 'allow' } }), service).get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'x' }, exec)
     expect(createIssue).toHaveBeenCalledTimes(1)
-    await expect(tools(testConfig(), service).get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'x' }, exec)).rejects.toThrow(/\[forbidden\].*审批服务/)
+    await expect(tools(testSettings(), service).get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'x' }, exec)).rejects.toThrow(/\[forbidden\].*审批服务/)
   })
 
   it('rejects invalid arguments and surfaces RepoError codes', async () => {
     const getIssue = vi.fn(async () => { throw new RepoError('not-found', '读取 issue #9 失败') })
-    const tool = tools(testConfig(), fakeService({ getIssue })).get('repo_issue_get')!
+    const tool = tools(testSettings(), fakeService({ getIssue })).get('repo_issue_get')!
     await expect(tool.execute({ repo: 'github.com/a/b', number: 0 }, exec)).rejects.toThrow(/^\[invalid\]/)
     await expect(tool.execute({ repo: 'github.com/a/b', number: 9 }, exec)).rejects.toThrow('[not-found] 读取 issue #9 失败')
   })
@@ -108,7 +125,7 @@ describe('createTools', () => {
     mkdirSync(join(root, 'topics/t1/app'))
     const openWorkspace = vi.fn(async (url: string, options: { dir: string }) => ({ url, dir: options.dir, baseBranch: 'main', baseCommit: 'c'.repeat(40) }))
     const service = fakeService({ resolve: () => ({ kind: 'gitlab', host: 'code.example.com', path: 'team/app', webUrl: 'https://code.example.com/gitlab/team/app' }), openWorkspace })
-    const value = await tools(testConfig(), service, undefined, workingDirectory).get('repo_workspace_open')!.execute({ repo: 'git@code.example.com:team/app.git', commit: 'c'.repeat(40) }, run)
+    const value = await tools(testSettings(), service, undefined, workingDirectory).get('repo_workspace_open')!.execute({ repo: 'git@code.example.com:team/app.git', commit: 'c'.repeat(40) }, run)
     const dir = join(root, 'topics/t1/app-2')
     expect(openWorkspace).toHaveBeenCalledWith('https://code.example.com/gitlab/team/app.git', { dir, commit: 'c'.repeat(40), signal: run.signal })
     expect(set).toHaveBeenCalledWith(run.agent, dir, run.signal)
@@ -123,11 +140,11 @@ describe('createTools', () => {
     writeFileSync(join(ws, '.git'), `gitdir: ${gitDir}\n`)
     const openWorkspace = vi.fn(async (url: string, options: { dir: string }) => ({ url, dir: options.dir, baseBranch: 'main', baseCommit: 'c'.repeat(40) }))
     const service = fakeService({ resolve: () => ({ kind: 'github', host: 'github.com', path: 'a/lib', webUrl: 'https://github.com/a/lib' }), openWorkspace })
-    await tools(testConfig(), service, undefined, workingDirectory).get('repo_workspace_open')!.execute({ repo: 'github.com/a/lib' }, run)
+    await tools(testSettings(), service, undefined, workingDirectory).get('repo_workspace_open')!.execute({ repo: 'github.com/a/lib' }, run)
     expect(openWorkspace.mock.calls[0]?.[1].dir).toBe(join(root, 'topics/t1/lib'))
 
     const outside: WorkingDirectoryService = { ensure: async () => tmpdir(), set: async (_agent, path) => path }
-    await tools(testConfig(), service, undefined, outside).get('repo_workspace_open')!.execute({ repo: 'github.com/a/lib' }, run)
+    await tools(testSettings(), service, undefined, outside).get('repo_workspace_open')!.execute({ repo: 'github.com/a/lib' }, run)
     expect(openWorkspace.mock.calls[1]?.[1].dir).toBe(join(root, 'lib'))
   })
 
@@ -143,7 +160,7 @@ describe('createTools', () => {
     const pushWorkspace = vi.fn(async () => ({ branch: 'fix/a' }))
     const request = vi.fn(async (_request: { readonly reason?: string }) => 'allowed-once' as const)
     const service = fakeService({ workspaceChanges, pushWorkspace })
-    const all = tools(testConfig(), service, { request }, workingDirectory)
+    const all = tools(testSettings(), service, { request }, workingDirectory)
     expect(await all.get('repo_workspace_changes')!.execute({}, run)).toBe(changes)
     expect(workspaceChanges).toHaveBeenCalledWith(join(root, 'ws'), { signal: run.signal })
     expect(await all.get('repo_workspace_push')!.execute({ branch: 'fix/a', message: 'fix: a\n\nbody' }, run)).toEqual({ branch: 'fix/a' })
@@ -168,7 +185,7 @@ describe('createTools', () => {
     const service = fakeService({ workspaceChanges: async () => changes, pushWorkspace })
     const request = async () => 'allowed-once' as const
     const commitTrailers = vi.fn(async () => [{ token: 'Feishu-User', value: '张三 <u_1>' }])
-    const push = tools(testConfig(), service, { request }, workingDirectory, commitTrailers).get('repo_workspace_push')!
+    const push = tools(testSettings(), service, { request }, workingDirectory, commitTrailers).get('repo_workspace_push')!
     await push.execute({ branch: 'fix/a', message: 'fix: a' }, run)
     expect(commitTrailers).toHaveBeenCalledWith({ session: 'session-1', dir: join(root, 'ws') })
     expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), {
