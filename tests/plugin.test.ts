@@ -1,8 +1,9 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/index.ts'
+import type { CommitTrailersEvent } from '../src/contract.ts'
 import type { HostContext, ToolDefinition } from '../src/host.ts'
 import { RepoService } from '../src/service.ts'
 import { credentials } from './helpers.ts'
@@ -22,7 +23,55 @@ function context() {
   return { ctx, registered, provided, info, env }
 }
 
+/** Run the plugin's push tool for Session `s1` with the given `repo/commit-trailers` listeners. */
+async function pushWithListeners(listeners: Array<(event: CommitTrailersEvent) => void | Promise<void>>) {
+  const { ctx, registered, env } = context()
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-'))
+  writeFileSync(join(dir, '.git'), 'gitdir: /mirrors/x\n')
+  const changes = { workspace: { url: 'https://github.com/a/b.git', dir, baseBranch: 'main', baseCommit: 'c'.repeat(40) }, commits: [], uncommitted: true, files: [], diff: '', truncated: false }
+  vi.spyOn(RepoService.prototype, 'workspaceChanges').mockResolvedValue(changes)
+  const push = vi.spyOn(RepoService.prototype, 'pushWorkspace').mockResolvedValue({ url: '', branch: 'fix/a', baseBranch: 'main', commit: 'd', committed: true, created: true })
+  const events: unknown[] = []
+  const withEvents: HostContext = {
+    ...ctx,
+    get: name => (name === 'approval' ? { request: async () => 'allowed-once' } : undefined),
+    parallel: async (name, ...args) => {
+      events.push(name)
+      const results = await Promise.allSettled(listeners.map(async listener => await listener(args[0] as CommitTrailersEvent)))
+      const errors = results.filter(result => result.status === 'rejected').map(result => (result as PromiseRejectedResult).reason)
+      if (errors.length > 0) throw new AggregateError(errors)
+    },
+  }
+  plugin.apply(withEvents, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
+  const tool = registered.find(entry => entry.definition.name === 'repo_workspace_push')!.definition
+  const agent = { id: 'a1', session: { header: { id: 's1' } } }
+  const outcome = tool.execute({ dir, branch: 'fix/a', message: 'fix: a' }, { signal: new AbortController().signal, agent })
+  return { outcome, push, events, dir }
+}
+
 describe('plugin', () => {
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('collects repo/commit-trailers from every listener, in order, and ignores late additions', async () => {
+    let late: CommitTrailersEvent | undefined
+    const { outcome, push, events, dir } = await pushWithListeners([
+      event => { expect(event).toMatchObject({ session: 's1', dir }); event.add('Feishu-User', '张三 <u_1>') },
+      async event => { late = event; event.add('Reviewed-By', 'bot') },
+    ])
+    await outcome
+    late?.add('Late', 'x')
+    expect(events).toEqual([plugin.COMMIT_TRAILERS_EVENT])
+    expect(push.mock.calls[0]?.[1]).toMatchObject({
+      session: 's1', trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }, { token: 'Reviewed-By', value: 'bot' }],
+    })
+  })
+
+  it('fails the push without committing when a trailer listener throws', async () => {
+    const { outcome, push } = await pushWithListeners([event => { event.add('A', 'b') }, () => { throw new Error('directory down') }])
+    await expect(outcome).rejects.toThrow(/\[unavailable\] repo\/commit-trailers 监听者出错，没有提交：directory down/)
+    expect(push).not.toHaveBeenCalled()
+  })
+
   it('declares its Cordis surface', () => {
     expect(plugin.name).toBe('dsh-repo')
     expect([...plugin.inject]).toEqual(['tools', 'credentials'])

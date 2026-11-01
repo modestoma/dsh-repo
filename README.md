@@ -102,7 +102,7 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 
 1. **检出。** `repo_workspace_open` 先拉取镜像，再以 `baseBranch`（默认是默认分支）的最新提交或给定的 `commit` 为起点，在当前工作目录下新建 `<仓库名>/`（重名时加 `-2`、`-3`），并经 DSH 的 `workingDirectory` 服务把会话的工作目录切过去，仓库里的 AGENTS.md、项目 SKILL 随之生效。当前工作目录不在会话的项目目录（沙箱可写根）内时，工作区放在项目目录下；当前目录在另一个工作区里时，放在那个工作区旁边。
 2. **修改。** Agent 用普通的文件和命令工具编辑、构建、测试。工作区的 git 元数据（索引、HEAD、本地分支和提交）留在镜像里，Agent 只能改文件，`git status`、`git diff`、`git log` 这类只读命令可以用，`git add`、`git commit`、`git checkout` 会因为写不了元数据而失败。
-3. **推送。** `repo_workspace_push` 经用户审批后，由插件进程把未提交的改动（`git add --all`，`.gitignore` 生效）提交为一个提交，再把工作区推送到远端分支。第一次推送要给出分支名：不能是起点分支或远端默认分支，远端已有同名分支时以 `conflict` 失败，推送用 `--force-with-lease=<分支>:` 保证只创建、不覆盖；之后的推送只能去同一个分支，普通推送，远端被他人更新时以 `conflict` 失败。推送失败时撤销这次调用新建的提交。推送跳过 git 钩子；本机装了 Git LFS 且新提交改动了 LFS 文件时，先用 `git lfs push` 上传 LFS 对象，再推送分支。检出工作区时同样带上主机令牌，供 Git LFS 下载文件。推送用该主机的令牌，主机没有配置时报 `unauthenticated`。提交作者和提交者默认是令牌所属的账号（通常是公共账号）：推送前用令牌读一次主机的当前用户接口（GitHub `GET /user`，GitLab `GET /api/v4/user`），按令牌缓存；GitHub 账号没有公开邮箱时用 `<id>+<login>@users.noreply.<主机>`，GitLab 依次取提交邮箱、邮箱、公开邮箱，都没有时用 `<id>-<用户名>@users.noreply.<主机>`。令牌读不到自己的账号时推送以 `forbidden` 或 `unauthenticated` 失败（GitLab 令牌需要 `read_user` 或 `api` 权限）。服务调用可以用 `author` 指定身份；本地路径的仓库用本机的 git 身份。提交说明末尾自动加一行 `DSH-Session: <会话 id>`，记录是哪个 DSH 会话做的改动，可在 DSH 中按 id 找回对话。
+3. **推送。** `repo_workspace_push` 经用户审批后，由插件进程把未提交的改动（`git add --all`，`.gitignore` 生效）提交为一个提交，再把工作区推送到远端分支。第一次推送要给出分支名：不能是起点分支或远端默认分支，远端已有同名分支时以 `conflict` 失败，推送用 `--force-with-lease=<分支>:` 保证只创建、不覆盖；之后的推送只能去同一个分支，普通推送，远端被他人更新时以 `conflict` 失败。推送失败时撤销这次调用新建的提交。推送跳过 git 钩子；本机装了 Git LFS 且新提交改动了 LFS 文件时，先用 `git lfs push` 上传 LFS 对象，再推送分支。检出工作区时同样带上主机令牌，供 Git LFS 下载文件。推送用该主机的令牌，主机没有配置时报 `unauthenticated`。提交作者和提交者默认是令牌所属的账号（通常是公共账号）：推送前用令牌读一次主机的当前用户接口（GitHub `GET /user`，GitLab `GET /api/v4/user`），按令牌缓存；GitHub 账号没有公开邮箱时用 `<id>+<login>@users.noreply.<主机>`，GitLab 依次取提交邮箱、邮箱、公开邮箱，都没有时用 `<id>-<用户名>@users.noreply.<主机>`。令牌读不到自己的账号时推送以 `forbidden` 或 `unauthenticated` 失败（GitLab 令牌需要 `read_user` 或 `api` 权限）。服务调用可以用 `author` 指定身份；本地路径的仓库用本机的 git 身份。提交说明末尾自动加一行 `DSH-Session: <会话 id>`，记录是哪个 DSH 会话做的改动，可在 DSH 中按 id 找回对话。其他插件可以通过 `repo/commit-trailers` 事件在这一行后面追加尾注（例如飞书渠道追加 `Feishu-User: 名字 <user_id>`），见下文「提交尾注事件」。
 4. **开 PR/MR。** 用 `repo_mr_create`，`sourceBranch` 是推送的分支，`targetBranch` 是起点分支。
 
 工作区目录归调用方所有，dsh-repo 不删除它；删除目录即放弃这个工作区，进程下次启动后第一次同步该镜像时清理它在镜像里的本地分支。换了镜像目录后，旧目录里镜像的工作区不能再推送。
@@ -122,7 +122,29 @@ if (repos?.version === 1) {
 }
 ```
 
-接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并，以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit })` 在调用方给的目录（必须不存在）检出工作区，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并，以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit })` 在调用方给的目录（必须不存在）检出工作区，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session, trailers })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+
+### 提交尾注事件
+
+`repo_workspace_push` 为某个 Agent 的会话提交改动之前，用 `ctx.parallel('repo/commit-trailers', event)` 通知其他插件。`event` 带 `session`（会话 id）和 `dir`（工作区目录），监听者调用 `event.add(token, value)` 追加尾注，写在 `DSH-Session:` 之后，按添加顺序排列。监听者返回（或返回的 promise 结束）之后再调用 `add` 不生效。规则：
+
+- 尾注名以字母开头，只含字母、数字和 `-`，最长 64 个字符，不能是 `DSH-Session`；值是一行，1 到 200 个字符，不含控制字符。每次推送最多 20 条。不合规时推送以 `invalid` 失败。
+- 任何监听者抛错时推送以 `unavailable` 失败，不提交任何内容。
+- 只在工具调用里触发；服务调用直接传 `trailers`，规则相同。
+
+监听者不需要依赖 dsh-repo 的包，在本地声明事件类型即可：
+
+```ts
+interface CommitTrailersEvent {
+  readonly session: string
+  readonly dir: string
+  add(token: string, value: string): void
+}
+
+ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
+  event.add('Feishu-User', '张三 <u_123>')
+})
+```
 
 ## 本地镜像
 

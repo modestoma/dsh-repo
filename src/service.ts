@@ -14,7 +14,7 @@ import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type {
-  CallOptions, ChangeCreate, CommitAuthor, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
+  CallOptions, ChangeCreate, CommitAuthor, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
   HostCreate, HostInfo, HostsChange, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, PageOptions, RepoRef, RepoTarget,
   SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
 } from './contract.ts'
@@ -62,6 +62,27 @@ function requireNumber(value: number): void {
 
 function requireText(value: string, label: string): void {
   if (value.trim() === '') throw new RepoError('invalid', `${label}不能为空`)
+}
+
+/** Most trailers one push may add besides `DSH-Session:`. */
+const MAX_TRAILERS = 20
+const TRAILER_TOKEN = /^[A-Za-z][A-Za-z0-9-]{0,63}$/
+
+/**
+ * Validate extra commit trailers, trimming each value.
+ * @param trailers - trailers from the caller or the `repo/commit-trailers` listeners.
+ * @returns the trimmed trailers.
+ * @throws {RepoError} `invalid` naming the first bad trailer.
+ */
+function checkTrailers(trailers: readonly CommitTrailer[]): CommitTrailer[] {
+  if (trailers.length > MAX_TRAILERS) throw new RepoError('invalid', `提交尾注最多 ${MAX_TRAILERS} 条，收到 ${trailers.length} 条`)
+  return trailers.map(({ token, value }) => {
+    if (!TRAILER_TOKEN.test(token)) throw new RepoError('invalid', `提交尾注名只能是字母开头的字母、数字和 -，最长 64 个字符：${JSON.stringify(token)}`)
+    if (token.toLowerCase() === 'dsh-session') throw new RepoError('invalid', 'DSH-Session 尾注由 dsh-repo 自己写入，不能另外添加')
+    const trimmed = value.trim()
+    if (trimmed === '' || trimmed.length > 200 || /[\u0000-\u001f\u007f]/.test(trimmed)) throw new RepoError('invalid', `提交尾注 ${token} 的值不能为空、超过 200 个字符或包含换行等控制字符`)
+    return { token, value: trimmed }
+  })
 }
 
 /** Rejects with the signal's reason once it aborts. */
@@ -380,6 +401,7 @@ export class RepoService implements DshRepoService {
     }
     const session = options.session?.trim()
     if (session !== undefined && (session === '' || session.length > 200 || /[\u0000-\u001f\u007f]/.test(session))) throw new RepoError('invalid', '会话 id 不能为空、超过 200 个字符或包含换行等控制字符')
+    const trailers = options.trailers === undefined ? undefined : checkTrailers(options.trailers)
     const { url } = await this.workspaces.locate(dir)
     const env = await this.mirrorAuth(url, true)
     const author = options.author === undefined ? await this.tokenIdentity(url, options.signal) : { name: options.author.name.trim(), email: options.author.email.trim() }
@@ -389,6 +411,7 @@ export class RepoService implements DshRepoService {
       ...options.message === undefined ? {} : { message: options.message },
       ...author === undefined ? {} : { author },
       ...session === undefined ? {} : { session },
+      ...trailers === undefined || trailers.length === 0 ? {} : { trailers },
       ...options.signal === undefined ? {} : { signal: options.signal },
     }, async (remote, branch) => (await this.mirrors.remoteDefaultBranch(remote, env, options.signal)) === branch)
   }
