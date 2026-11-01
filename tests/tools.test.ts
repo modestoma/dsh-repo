@@ -168,7 +168,7 @@ describe('createTools', () => {
       url: 'https://github.com/a/b.git', branch: 'fix/a', baseBranch: 'main', openChanges: [],
       next: 'Open a PR/MR with repo_mr_create (sourceBranch fix/a, targetBranch main) if the work needs one.',
     })
-    expect(listChanges).toHaveBeenCalledWith('https://github.com/a/b.git', { state: 'open', sourceBranch: 'fix/a', signal: run.signal })
+    expect(listChanges).toHaveBeenCalledWith('https://github.com/a/b.git', { state: 'open', sourceBranch: 'fix/a', page: 1, perPage: 100, signal: run.signal })
     const reason = request.mock.calls[0]?.[0].reason ?? ''
     expect(reason.split('\n')).toEqual([
       '推送工作区改动到新分支 fix/a',
@@ -211,11 +211,14 @@ describe('createTools', () => {
   it('refuses to start new work from the source branch of an open PR/MR', async () => {
     const { workingDirectory, exec: run } = session()
     const openWorkspace = vi.fn()
-    const listChanges = vi.fn(async (_repo: string, options: { sourceBranch?: string }) => ({ items: options.sourceBranch === 'fix/a' ? [{ number: 7 }] : [] }))
+    // The match is on the second page; the first came back empty after the host filtered it.
+    const listChanges = vi.fn(async (_repo: string, options: { sourceBranch?: string; page?: number }) => options.page === 1
+      ? { items: [], ...options.sourceBranch === 'fix/a' ? { nextPage: 2 } : {} }
+      : { items: [{ number: 7 }] })
     const service = fakeService({ resolve: () => ({ kind: 'github', host: 'github.com', path: 'a/b', webUrl: 'https://github.com/a/b' }), openWorkspace, listChanges })
     const open = tools(testSettings(), service, undefined, workingDirectory).get('repo_workspace_open')!
     await expect(open.execute({ repo: 'github.com/a/b', baseBranch: 'fix/a' }, run)).rejects.toThrow(/^\[invalid\] fix\/a 是打开中的 PR\/MR #7 的源分支.*branch: fix\/a/)
-    expect(listChanges).toHaveBeenCalledWith('github.com/a/b', { state: 'open', sourceBranch: 'fix/a', perPage: 1, signal: run.signal })
+    expect(listChanges).toHaveBeenCalledWith('github.com/a/b', { state: 'open', sourceBranch: 'fix/a', page: 2, perPage: 100, signal: run.signal })
     expect(openWorkspace).not.toHaveBeenCalled()
 
     openWorkspace.mockImplementation(async (url: string, options: { dir: string }) => ({ url, dir: options.dir, baseBranch: 'dev', baseCommit: 'c'.repeat(40) }))

@@ -193,8 +193,7 @@ export function createTools(deps: ToolDeps): RepoTool[] {
           const reused = await currentWorkspace(deps, agent, url, args.branch, args.baseBranch, signal)
           if (reused !== undefined) return { ...reused, reused: true, next: continueHint(reused.branch) }
         } else if (args.baseBranch !== undefined) {
-          const open = await service.listChanges(args.repo, { state: 'open', sourceBranch: args.baseBranch, perPage: 1, signal })
-          const change = open.items[0]
+          const change = (await openChangesFrom(service, args.repo, args.baseBranch, signal))[0]
           if (change !== undefined) {
             throw new RepoError('invalid', `${args.baseBranch} 是打开中的 PR/MR #${change.number} 的源分支，不要在它上面再开分支。要更新这个 PR/MR：在推送它的工作区继续修改后再次调用 repo_workspace_push（不传 branch）；那个工作区不在了时，用 repo_workspace_open 的 branch: ${args.baseBranch} 接着它修改`)
           }
@@ -341,11 +340,26 @@ async function currentWorkspace(deps: ToolDeps, agent: Agent, url: string, branc
   return undefined
 }
 
+/**
+ * Open PRs/MRs from a branch of the repository, following pages: a host may
+ * return a page with every entry filtered out (GitLab drops fork MRs after
+ * fetching) and still have more pages.
+ */
+async function openChangesFrom(service: DshRepoService, repo: string, branch: string, signal: AbortSignal): Promise<readonly ChangeInfo[]> {
+  const found: ChangeInfo[] = []
+  for (let page: number | undefined = 1; page !== undefined;) {
+    const result = await service.listChanges(repo, { state: 'open', sourceBranch: branch, page, perPage: 100, signal })
+    found.push(...result.items)
+    page = result.nextPage
+  }
+  return found
+}
+
 /** Open PRs/MRs from the pushed branch, so the model updates them instead of opening another. */
 async function openChangesOf(service: DshRepoService, pushed: WorkspacePushResult, signal: AbortSignal): Promise<{ readonly openChanges?: readonly OpenChange[]; readonly next: string }> {
   let items: readonly ChangeInfo[]
   try {
-    items = (await service.listChanges(pushed.url, { state: 'open', sourceBranch: pushed.branch, signal })).items
+    items = await openChangesFrom(service, pushed.url, pushed.branch, signal)
   } catch (error) {
     // The push already succeeded; report the failed lookup instead of failing the call.
     const reason = error instanceof Error ? error.message : String(error)
