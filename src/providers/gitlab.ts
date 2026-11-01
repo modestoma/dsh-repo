@@ -9,14 +9,16 @@
 
 import { Gitlab } from '@gitbeaker/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, CheckInfo, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { nextPage, titleOf, truncateBytes } from './types.ts'
-import type { Call, Paging, Provider, TokenSource } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitLab's maximum page size. */
 const MAX_PAGE = 100
+/** Pages of notes read for one watch poll. */
+const MAX_NOTE_PAGES = 10
 
 /** Prefix GitLab uses to mark a draft merge request in its title. */
 const DRAFT_PREFIX = 'Draft: '
@@ -95,6 +97,39 @@ interface GitlabNote {
   readonly author: GitlabUser
   readonly created_at: string
   readonly system?: boolean
+  readonly position?: { readonly new_path?: string | null } | null
+}
+
+/**
+ * The activity of one note: user notes are comments; GitLab records approvals
+ * and change requests as system notes with fixed English bodies; other
+ * system notes are not activity.
+ */
+function noteKind(value: GitlabNote): ActivityItem['kind'] | undefined {
+  if (value.system !== true) return 'comment'
+  if (value.body === 'approved this merge request') return 'approved'
+  if (value.body.startsWith('requested changes')) return 'changes-requested'
+  return undefined
+}
+
+interface GitlabMergeStatus {
+  readonly sha: string
+  readonly head_pipeline?: { readonly id: number; readonly status: string; readonly web_url?: string } | null
+  readonly detailed_merge_status?: unknown
+}
+
+function statusOf(data: GitlabMergeStatus): ChangeStatus {
+  const pipeline = data.head_pipeline
+  const checks: CheckInfo[] = pipeline === undefined || pipeline === null
+    ? []
+    : [{ name: `pipeline #${pipeline.id}`, state: pipelineState(pipeline.status), ...pipeline.web_url === undefined ? {} : { webUrl: pipeline.web_url } }]
+  const detailed = data.detailed_merge_status
+  return {
+    headSha: data.sha,
+    checks,
+    overall: checks[0]?.state ?? 'none' as const,
+    ...typeof detailed !== 'string' || COMPUTING.has(detailed) ? {} : { mergeable: detailed === 'mergeable' },
+  }
 }
 
 function note(value: GitlabNote): CommentInfo {
@@ -313,18 +348,41 @@ export class GitlabProvider implements Provider {
 
   async changeStatus(ref: RepoRef, number: number, call: Call) {
     call.signal.throwIfAborted()
+    return statusOf(await this.api.MergeRequests.show(ref.path, number))
+  }
+
+  /** The merge request carries its head pipeline, so CI comes with every poll; notes are read only when its `updated_at` moved. */
+  async changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity> {
+    call.signal.throwIfAborted()
     const data = await this.api.MergeRequests.show(ref.path, number)
-    const pipeline = data.head_pipeline
-    const checks: CheckInfo[] = pipeline === undefined || pipeline === null
-      ? []
-      : [{ name: `pipeline #${pipeline.id}`, state: pipelineState(pipeline.status), ...pipeline.web_url === undefined ? {} : { webUrl: pipeline.web_url } }]
-    const detailed = data.detailed_merge_status
-    return {
-      headSha: data.sha,
-      checks,
-      overall: checks[0]?.state ?? 'none' as const,
-      ...typeof detailed !== 'string' || COMPUTING.has(detailed) ? {} : { mergeable: detailed === 'mergeable' },
+    const change = mergeRequest(data)
+    let items: ActivityItem[] | undefined
+    if (request.updatedAt !== change.updatedAt) {
+      call.signal.throwIfAborted()
+      const notes = await this.notesSince(ref.path, number, request.since, call.signal)
+      items = notes.filter(entry => entry.created_at >= request.since).reverse().flatMap((entry): ActivityItem[] => {
+        const kind = noteKind(entry)
+        if (kind === undefined) return []
+        const path = entry.position?.new_path
+        return [{ ...note(entry), kind, webUrl: `${change.webUrl}#note_${entry.id}`, ...typeof path === 'string' ? { path } : {} }]
+      })
     }
+    return { change, conflict: data.has_conflicts === true, status: statusOf(data), ...items === undefined ? {} : { items } }
+  }
+
+  /**
+   * Notes newest first, page by page until one predates `since`.
+   * @throws RepoError `too-large` beyond {@link MAX_NOTE_PAGES} pages, so a cursor never skips unread notes.
+   */
+  private async notesSince(project: string, number: number, since: string, signal: AbortSignal): Promise<GitlabNote[]> {
+    const notes: GitlabNote[] = []
+    for (let page = 1; page <= MAX_NOTE_PAGES; page += 1) {
+      signal.throwIfAborted()
+      const batch: readonly GitlabNote[] = await this.api.MergeRequestNotes.all(project, number, { sort: 'desc', orderBy: 'created_at', perPage: MAX_PAGE, page })
+      notes.push(...batch)
+      if (batch.length < MAX_PAGE || (batch.at(-1)?.created_at ?? '') < since) return notes
+    }
+    throw new RepoError('too-large', `新评论超过 ${MAX_NOTE_PAGES * MAX_PAGE} 条，无法完整读取`)
   }
 
   async createChange(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; deleteSourceBranch: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {

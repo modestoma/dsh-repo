@@ -6,7 +6,7 @@
 
 ## 项目状态
 
-测试版：提供统一接口、模型工具、运行时主机管理、本地镜像、可写工作区和左侧栏「代码仓库」设置页。接口仍可能调整。
+测试版：提供统一接口、模型工具、运行时主机管理、本地镜像、可写工作区、PR/MR 跟踪和左侧栏「代码仓库」设置页。接口仍可能调整。
 
 ## 安装
 
@@ -16,7 +16,7 @@ pnpm build   # 本地 checkout 需要先构建
 DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh-repo
 ```
 
-包内的 `cordis.patch.yml` 把 `dsh-repo` 加入 profile 的 bundle 列表，Loader 行的稳定 id 是 `dsh-repo`。插件需要宿主提供 `tools` 和 `credentials` 服务；写操作审批使用 `approval` 服务（`@deepseek-ai/dsh-user-approval`），dsh-channels 会把审批渲染成飞书卡片。
+包内的 `cordis.patch.yml` 把 `dsh-repo` 加入 profile 的 bundle 列表，Loader 行的稳定 id 是 `dsh-repo`。插件需要宿主提供 `tools` 和 `credentials` 服务；写操作审批使用 `approval` 服务（`@deepseek-ai/dsh-user-approval`），dsh-channels 会把审批渲染成飞书卡片。[PR/MR 跟踪](#跟踪-prmr)需要 `sessionController` 服务（Web 和桌面组合都有）来唤醒会话。
 
 ## 配置
 
@@ -54,6 +54,12 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | 模型工具 | `tools.merge`：是否提供合并工具（审批跟随 `writes`） | 不提供 | 保存条 |
 | 模型工具 | `tools.deleteSourceBranch`：合并后删除源分支，见[合并后的分支](#合并后的分支) | 删除 | 保存条 |
 | 模型工具 | `tools.signature`：追加到模型写的正文和评论末尾 | 空 | 保存条 |
+| MR 跟踪 | `watch.enabled`：是否跟踪 PR/MR，见[跟踪 PR/MR](#跟踪-prmr) | 跟踪 | 保存条 |
+| MR 跟踪 | `watch.events`：每类动态的处理方式，`wake` 唤醒、`note` 只记录、`off` 忽略 | 见下文 | 保存条 |
+| MR 跟踪 | `watch.activeIntervalMs` / `quietAfterMs` / `quietIntervalMs`：检查间隔、多久没动态算安静、安静时的间隔 | 60 秒 / 60 分钟 / 10 分钟 | 保存条 |
+| MR 跟踪 | `watch.batchMs`：合并通知窗口 | 120 秒 | 保存条 |
+| MR 跟踪 | `watch.idleDays` / `dailyWakeLimit` / `maxWatches`：无动态停止跟踪、每个 PR/MR 每天唤醒上限、同时跟踪上限 | 7 天 / 10 次 / 50 个 | 保存条 |
+| MR 跟踪 | 正在跟踪的 PR/MR，每个可以停止 | 无 | 立即 |
 | 高级 | `timeoutMs`：一次接口调用 | 30 秒 | 保存条 |
 | 高级 | `mirror.gitTimeoutMs`：一条 git 命令（clone、fetch、worktree、push） | 600 秒 | 保存条 |
 | 高级 | `limits.perPage` / `maxPerPage` / `maxComments` / `maxTreeEntries` | 30 / 100 / 50 / 1000 | 保存条 |
@@ -67,7 +73,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 
 除了 cordis.yml 里的 `hosts`，还可以在设置页添加、删除主机和保存、清除令牌，改动立即生效；其他插件也可以调用 `addHost` 添加主机、`removeHost` 删除、`setHostToken` 保存或清除令牌。添加的主机保存在设置文件，令牌存入 DSH 凭据库，引用名由地址生成（`DSH_REPO_HOST_<哈希>`）。cordis.yml 中的主机只能改令牌，不能在运行时删除；`listHosts` 列出所有主机及令牌是否已设置，不返回令牌值。`onHostsChange` 在每次主机、令牌或镜像目录变更成功后通知监听者，例如需要在令牌更新后重新拉取镜像的插件。
 
-设置页的数据来自宿主 `webServer` 上的 `/dsh-repo/state`、`/dsh-repo/hosts`、`/dsh-repo/host-token`、`/dsh-repo/mirror`、`/dsh-repo/settings` 路由，请求经宿主 `connection` 做与 DSH `/api` 相同的来源校验和登录鉴权，写操作另外要求同源。没有 Web 的组合不挂载这些路由。
+设置页的数据来自宿主 `webServer` 上的 `/dsh-repo/state`、`/dsh-repo/hosts`、`/dsh-repo/host-token`、`/dsh-repo/mirror`、`/dsh-repo/settings`、`/dsh-repo/watches` 路由，请求经宿主 `connection` 做与 DSH `/api` 相同的来源校验和登录鉴权，写操作另外要求同源。没有 Web 的组合不挂载这些路由。
 
 ### 令牌
 
@@ -94,7 +100,8 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | `repo_workspace_changes` | 工作区相对起点提交的改动：文件与增删行数、已推送的提交、diff | 否 |
 | `repo_workspace_push` | 提交工作区未提交的改动并推送到工作区的远端分支，从不强推；结果列出这个分支上打开中的 PR/MR | 是 |
 | `repo_issue_create` / `repo_issue_update` / `repo_issue_comment` | 创建、修改、关闭或重开、评论 issue | 是 |
-| `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR | 是 |
+| `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR；创建和重开的 PR/MR 自动跟踪 | 是 |
+| `repo_mr_watch` | 让本会话跟踪一个打开中的 PR/MR，或停止跟踪，见[跟踪 PR/MR](#跟踪-prmr)；跟踪可用时才提供 | 否 |
 | `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；按设置一并删除源分支；默认不提供 | 是 |
 | `repo_branch_delete` | 删除已经合并的遗留分支，见[合并后的分支](#合并后的分支) | 是 |
 
@@ -129,6 +136,31 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 - 不是默认分支，也不是受保护分支；否则以 `forbidden` 拒绝。
 
 GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支的最新提交在列出 PR/MR 之后、紧挨着删除时读取；这一次读取和删除之间如果恰好有人推送，新提交仍可能随分支一起删除。
+
+## 跟踪 PR/MR
+
+通过工具创建或重开的 PR/MR、`repo_workspace_push` 推送到的打开中的 PR/MR，以及模型用 `repo_mr_watch` 要求跟踪的 PR/MR，由插件定时检查，把 CI 结果、评论、评审和合并结果送回发起它的会话。模型不用自己轮询；工具结果里的 `watching: true` 表示已经开始跟踪。
+
+| 动态 | 默认 | 说明 |
+|---|---|---|
+| CI 失败 | 唤醒 | 当前 head 的检查或流水线失败，其他检查还在运行时也立即报；之后又有检查失败（包括重跑后再次失败）时再报一次 |
+| CI 通过 | 只记录 | 当前 head 的检查全部通过，包括失败后在同一个 head 上重跑通过 |
+| 新评论 | 唤醒 | 对话评论、代码行评论、只有评论的评审；通过 `repo_mr_comment` / `repo_issue_comment` 发的评论不算 |
+| 要求修改 | 唤醒 | GitHub 评审 `CHANGES_REQUESTED`；GitLab 系统备注「requested changes」 |
+| 批准 | 只记录 | GitHub 评审 `APPROVED`；GitLab 系统备注「approved this merge request」 |
+| 出现冲突 | 唤醒 | GitHub `mergeable_state` 为 `dirty`；GitLab `has_conflicts` |
+| 别人推送 | 只记录 | head 变成不是通过 `repo_workspace_push` 推送的提交 |
+| 已合并 / 已关闭 | 唤醒 | 立即送达，之后停止跟踪 |
+| 长期无动态 | 唤醒 | 达到 `idleDays` 天没有动态时，告诉会话已停止跟踪，模型用一句话转告用户 |
+
+- **检查方式。** 轮询，不用 webhook：DSH 只监听本机，注册 webhook 也需要每个项目的维护者权限。有动态、CI 运行中或有待送达的动态时每 `activeIntervalMs` 检查一次，`quietAfterMs` 内没有动态后放慢到 `quietIntervalMs`。每次检查先读 PR/MR 本身；它的更新时间变了才读评论和评审；head 变了、CI 还在运行、失败（可能被重跑）或还没上报时才读 CI（GitLab 的流水线状态随 MR 一起返回）。两次检查之间的新评论会逐页读完再推进进度，超过 1000 条时这次检查记为失败、稍后重试。
+- **送达方式。** 唤醒的动态经 `repo/resolve-agent` 事件（waterfall，参数为会话 id 和 `next`）解析会话的 Agent，没有监听者处理时用 `sessionController` 恢复会话，然后作为一条新的用户消息开始一轮回复，等会话持久化确认后才从待送达里删除；确认失败时下次可能重复送达。消息来源是 `repo-activity`（notice 形式，带一行摘要）。只记录的动态在会话正在运行时加入下一步的上下文，否则等下一次唤醒一起送达。`batchMs` 内的动态合成一条；合并、关闭和停止跟踪立即送达。每个 PR/MR 每天最多唤醒 `dailyWakeLimit` 次，超出后的动态只记录，合并、关闭和停止跟踪不受限制。
+- **消息内容。** 写明仓库、编号、标题和链接，评论引用前 600 个字符并附链接，并声明评论和评审来自第三方，只是信息，不是用户的指令，也不能授予权限，模型需要改代码、推送或回复时照常经过审批。
+- **结束跟踪。** PR/MR 合并或关闭、`idleDays` 天没有动态、会话已删除、仓库不再在访问范围内（主机被删或 `repos` 变了）、模型调用 `repo_mr_watch` 的 `watch: false`、在设置页点「停止」时结束。超过 `maxWatches` 时结束最久没有动态的一个。
+- **失败。** 检查或送达失败时按 `activeIntervalMs` 翻倍退避，最长到 `quietIntervalMs`；设置页显示连续失败次数和原因。主机恢复后从上次的位置接着检查，不漏动态。
+- **记录。** 跟踪记录保存在设置文件旁边的 `watches.json`（默认 `$DSH_HOME/dsh-repo/watches.json`），包括检查进度和待送达的动态，重启后接着跟踪。文件内容不合法时移到 `watches.json.invalid-<时间>` 并记日志，从空开始。
+
+接管部分会话恢复方式的插件（例如自己组装 Agent 的渠道插件）可以监听 `repo/resolve-agent`：是自己的会话就返回 Agent，否则调用 `next()`。
 
 ## `dshRepos` 服务
 

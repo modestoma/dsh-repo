@@ -8,15 +8,15 @@
  * @module dsh-repo/hosts
  */
 
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdir, rename, writeFile } from 'node:fs/promises'
-import { dirname, isAbsolute } from 'node:path'
+import { isAbsolute } from 'node:path'
 import { z } from 'zod'
 import type { HostCreate } from './contract.ts'
 import { DEFAULT_SETTINGS, hostSpecSchema, normalizeHostUrl, repoSettingsSchema, settingsOverrides } from './config.ts'
 import type { HostSpec, RepoSettings } from './config.ts'
 import { RepoError } from './errors.ts'
+import { writeJsonAtomic } from './files.ts'
 
 /** Longest accepted token; personal access tokens are far shorter. */
 export const MAX_TOKEN_LENGTH = 4096
@@ -211,10 +211,7 @@ export class HostStore {
       ...Object.keys(overrides).length === 0 ? {} : { settings: overrides },
     }
     try {
-      await mkdir(dirname(this.file), { recursive: true })
-      const temporary = `${this.file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
-      await writeFile(temporary, `${JSON.stringify(content, undefined, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-      await rename(temporary, this.file)
+      await writeJsonAtomic(this.file, content)
     } catch (error) {
       throw new RepoError('unavailable', `无法写入设置文件 ${this.file}：${(error as Error).message}`)
     }

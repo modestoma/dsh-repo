@@ -202,4 +202,58 @@ describe('GitHub token account', () => {
     fakeHttp([{ method: 'GET', path: '/user', reply: { body: { login: 'bot', id: 7, name: 'Shared Bot', email: 'bot@example.com' } } }])
     expect(await new GithubProvider('https://api.github.com', async () => 't').currentUser(call())).toEqual({ name: 'Shared Bot', email: 'bot@example.com' })
   })
+  it('polls a pull request for a watch: comments and reviews only after an update, CI only when asked', async () => {
+    const pullBody = (updated: string) => ({
+      number: 5, title: 'Fix', body: null, state: 'open', merged_at: null, mergeable_state: 'dirty', head: { ref: 'fix', sha: SHA }, base: { ref: 'main' },
+      user: author, labels: [], assignees: [], created_at: '2026-11-01T00:00:00Z', updated_at: updated, html_url: `${REPO}/pull/5`,
+    })
+    let updated = '2026-11-01T01:00:00Z'
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/pulls/5`, reply: () => ({ body: pullBody(updated) }) },
+      { method: 'GET', path: `${API}/issues/5/comments`, reply: { body: [
+        { id: 1, user: author, body: 'old', created_at: '2026-11-01T00:10:00Z', html_url: 'c1' },
+        { id: 2, user: { login: 'alice' }, body: 'please fix', created_at: '2026-11-01T00:40:00Z', html_url: 'c2' },
+      ] } },
+      { method: 'GET', path: `${API}/pulls/5/comments`, reply: { body: [{ id: 9, user: { login: 'bob' }, body: 'nit', created_at: '2026-11-01T00:50:00Z', html_url: 'l9', path: 'src/a.ts' }] } },
+      { method: 'GET', path: `${API}/pulls/5/reviews`, reply: { body: [
+        { id: 3, user: { login: 'carol' }, body: '', state: 'APPROVED', submitted_at: '2026-11-01T00:45:00Z', html_url: 'r3' },
+        { id: 4, user: { login: 'dave' }, body: '', state: 'COMMENTED', submitted_at: '2026-11-01T00:46:00Z', html_url: 'r4' },
+        { id: 5, user: { login: 'erin' }, body: 'redo', state: 'CHANGES_REQUESTED', submitted_at: '2026-11-01T00:20:00Z', html_url: 'r5' },
+      ] } },
+      { method: 'GET', path: `${API}/commits/${SHA}/check-runs`, reply: { body: { check_runs: [{ name: 'build', status: 'completed', conclusion: 'failure', html_url: 'b' }] } } },
+      { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [] } } },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    const first = await service.changeActivity(REPO, 5, { withStatus: true, since: '2026-11-01T00:30:00Z' })
+    expect(first.conflict).toBe(true)
+    expect(first.status).toMatchObject({ headSha: SHA, overall: 'failure' })
+    expect(first.items?.map(item => [item.id, item.kind, item.author.username])).toEqual([
+      ['2', 'comment', 'alice'], ['review-3', 'approved', 'carol'], ['line-9', 'comment', 'bob'],
+    ])
+    expect(first.items?.[2]?.path).toBe('src/a.ts')
+    expect(requests.find(request => request.url.pathname.endsWith('/issues/5/comments'))?.url.searchParams.get('since')).toBe('2026-11-01T00:30:00Z')
+    requests.length = 0
+    const second = await service.changeActivity(REPO, 5, { updatedAt: updated, withStatus: false, since: '2026-11-01T00:50:00Z' })
+    expect(second.items).toBeUndefined()
+    expect(second.status).toBeUndefined()
+    expect(requests.map(request => request.url.pathname)).toEqual([`${API}/pulls/5`])
+    updated = '2026-11-01T02:00:00Z'
+    expect((await service.changeActivity(REPO, 5, { updatedAt: '2026-11-01T01:00:00Z', withStatus: false, since: '2026-11-01T00:50:00Z' })).items?.map(item => item.id)).toEqual(['line-9'])
+  })
+  it('reads every page of new comments before reporting them', async () => {
+    const page = (start: number, count: number) => Array.from({ length: count }, (_, index) => ({
+      id: start + index, user: { login: 'alice' }, body: `c${start + index}`, created_at: '2026-11-01T00:40:00Z', html_url: `c${start + index}`,
+    }))
+    fakeHttp([
+      { method: 'GET', path: `${API}/pulls/5`, reply: { body: {
+        number: 5, title: 'Fix', body: null, state: 'open', merged_at: null, mergeable_state: 'clean', head: { ref: 'fix', sha: SHA }, base: { ref: 'main' },
+        user: author, labels: [], assignees: [], created_at: '2026-11-01T00:00:00Z', updated_at: '2026-11-01T01:00:00Z', html_url: `${REPO}/pull/5`,
+      } } },
+      { method: 'GET', path: `${API}/issues/5/comments`, reply: request => ({ body: request.url.searchParams.get('page') === '2' ? page(101, 20) : page(1, 100) }) },
+      { method: 'GET', path: `${API}/pulls/5/comments`, reply: { body: [] } },
+      { method: 'GET', path: `${API}/pulls/5/reviews`, reply: { body: [] } },
+    ])
+    const polled = await createService(testConfig(), TOKENS).changeActivity(REPO, 5, { withStatus: false, since: '2026-11-01T00:30:00Z' })
+    expect(polled.items).toHaveLength(120)
+  })
 })

@@ -14,8 +14,8 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { RepoService } from '../service.ts'
 import type { DirectoryPicker } from './directory-picker.ts'
 import { hostDirectoryPicker } from './directory-picker.ts'
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE } from './contract.ts'
-import type { SettingsState } from './contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE } from './contract.ts'
+import type { SettingsState, WatchInfo } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -32,6 +32,18 @@ const hostAddSchema = z.object({
 const hostUrlSchema = z.object({ url: z.string() }).strict()
 const hostTokenSchema = z.object({ url: z.string(), value: z.string() }).strict()
 const mirrorSchema = z.object({ dir: z.string() }).strict()
+const watchIdSchema = z.object({ id: z.string() }).strict()
+
+/** The PR/MR watcher as the settings page uses it. */
+export interface WatchList {
+  /** @returns whether watching is on and this composition can start a turn of a Session. */
+  readonly active: boolean
+  list(): WatchInfo[]
+  remove(id: string): Promise<boolean>
+}
+
+/** No watcher: nothing is watched. */
+const NO_WATCHES: WatchList = { active: false, list: () => [], remove: async () => false }
 /** The service validates the settings fields and reports every bad one. */
 const settingsBodySchema = z.record(z.string(), z.unknown())
 
@@ -142,9 +154,10 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
  * The settings page's view of the service.
  * @param service - the `dshRepos` implementation.
  * @param picker - the Host's directory dialog.
- * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, and whether a directory dialog is available.
+ * @param watches - the PR/MR watcher.
+ * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, whether a directory dialog is available, and the watched PRs/MRs.
  */
-export async function settingsState(service: RepoService, picker: DirectoryPicker): Promise<SettingsState> {
+export async function settingsState(service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES): Promise<SettingsState> {
   return {
     hosts: await service.listHosts(),
     mirror: service.mirrorSettings(),
@@ -152,6 +165,8 @@ export async function settingsState(service: RepoService, picker: DirectoryPicke
     defaults: service.defaultSettings,
     file: service.settingsFile,
     pickerAvailable: picker.available,
+    watches: watches.list(),
+    watchAvailable: watches.active,
   }
 }
 
@@ -161,15 +176,17 @@ export async function settingsState(service: RepoService, picker: DirectoryPicke
  * @param gate - host request gate.
  * @param service - the `dshRepos` implementation.
  * @param picker - the Host's directory dialog.
+ * @param watches - the PR/MR watcher.
  * @returns disposer removing every route.
  */
-export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService, picker: DirectoryPicker): () => void {
-  const reply = async (res: ServerResponse): Promise<void> => { sendJson(res, 200, { ok: true, state: await settingsState(service, picker) }) }
+export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES): () => void {
+  const state = (): Promise<SettingsState> => settingsState(service, picker, watches)
+  const reply = async (res: ServerResponse): Promise<void> => { sendJson(res, 200, { ok: true, state: await state() }) }
   const disposers = [
     server.register({
       kind: 'exact',
       path: STATE_ROUTE,
-      handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await settingsState(service, picker)) }),
+      handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await state()) }),
     }),
     server.register({
       kind: 'exact',
@@ -215,6 +232,14 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
     }),
     server.register({
       kind: 'exact',
+      path: WATCHES_ROUTE,
+      handler: guarded(gate, ['DELETE'], async (req, res) => {
+        if (!await watches.remove((await readJsonBody(req, watchIdSchema)).id)) throw new HttpError(404, '没有这个跟踪，可能已经结束')
+        await reply(res)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
       path: PICK_DIRECTORY_ROUTE,
       handler: guarded(gate, ['POST'], async (req, res) => {
         const abort = new AbortController()
@@ -237,13 +262,14 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
  * Mount the routes while both `webServer` and `connection` are available.
  * @param ctx - plugin context.
  * @param service - the `dshRepos` implementation.
+ * @param watches - the PR/MR watcher.
  */
-export function mountSettingsRoutes(ctx: HostContext, service: RepoService): void {
+export function mountSettingsRoutes(ctx: HostContext, service: RepoService, watches: WatchList = NO_WATCHES): void {
   const attach = (webCtx: HostContext): void => {
     const server = webCtx.get?.('webServer') as HostWebServer | undefined
     const gate = webCtx.get?.('connection') as HostRequestGate | undefined
     if (server === undefined || gate === undefined) return
-    webCtx.effect(() => registerSettingsRoutes(server, gate, service, hostDirectoryPicker(webCtx)), 'dsh-repo: settings routes')
+    webCtx.effect(() => registerSettingsRoutes(server, gate, service, hostDirectoryPicker(webCtx), watches), 'dsh-repo: settings routes')
   }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer', 'connection'], attach)

@@ -4,7 +4,7 @@
  * @module dsh-repo/client/api
  */
 
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE } from '../settings/contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE } from '../settings/contract.ts'
 import type { HostAddRequest, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState } from '../settings/contract.ts'
 
 /**
@@ -120,6 +120,15 @@ export function saveSettings(settings: RepoSettingsWire): Promise<SettingsState>
 /** @returns the state after returning every run-time setting to its default. */
 export function resetSettings(): Promise<SettingsState> {
   return mutate(SETTINGS_ROUTE, 'DELETE')
+}
+
+/**
+ * Stop watching a PR/MR.
+ * @param id - watch id.
+ * @returns the new state.
+ */
+export function stopWatch(id: string): Promise<SettingsState> {
+  return mutate(WATCHES_ROUTE, 'DELETE', { id })
 }
 
 /** @returns the directory chosen in the Host's system dialog, or null when cancelled. */

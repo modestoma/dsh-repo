@@ -29,7 +29,7 @@ import type { MirrorStore } from './mirror/store.ts'
 import type { WorkspaceStore } from './mirror/workspace.ts'
 import { GithubProvider } from './providers/github.ts'
 import { GitlabProvider } from './providers/gitlab.ts'
-import type { Call, Paging, Provider } from './providers/types.ts'
+import type { ActivityRequest, Call, ChangeActivity, Paging, Provider } from './providers/types.ts'
 import { hostOf, resolveTarget } from './target.ts'
 import type { ResolvedTarget } from './target.ts'
 
@@ -284,6 +284,20 @@ export class RepoService implements DshRepoService {
   async changeStatus(repo: RepoTarget, number: number, options: CallOptions = {}) {
     requireNumber(number)
     return await this.run(repo, options, `读取 PR/MR #${number} 的状态`, (provider, ref, call) => provider.changeStatus(ref, number, call))
+  }
+
+  /**
+   * One poll of a change request for a watch; not part of the `dshRepos` service.
+   * @param repo - repository target.
+   * @param number - change request number.
+   * @param request - what the watch already knows.
+   * @param options - cancellation.
+   * @returns the change request, with CI and comments when they were read.
+   * @throws {RepoError} classified as every other call.
+   */
+  async changeActivity(repo: RepoTarget, number: number, request: ActivityRequest, options: CallOptions = {}): Promise<ChangeActivity> {
+    requireNumber(number)
+    return await this.run(repo, options, `检查 PR/MR #${number} 的动态`, (provider, ref, call) => provider.changeActivity(ref, number, request, call))
   }
 
   async createChange(repo: RepoTarget, change: ChangeCreate) {

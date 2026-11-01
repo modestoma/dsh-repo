@@ -39,6 +39,11 @@ describe('resolveSettings', () => {
     const settings = resolveSettings({ repos: ['github.com/a/*'], tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
     expect(settingsOverrides(settings)).toEqual({ repos: ['github.com/a/*'], tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
     expect(resolveSettings(settingsOverrides(settings))).toEqual(settings)
+    const watch = resolveSettings({ watch: { idleDays: 3, events: { comment: 'note' } } })
+    expect(watch.watch).toMatchObject({ enabled: true, idleDays: 3, activeIntervalMs: 60_000, events: { comment: 'note', ciFailed: 'wake', merged: 'wake', idle: 'wake' } })
+    expect(settingsOverrides(watch)).toEqual({ watch: { idleDays: 3, events: { comment: 'note' } } })
+    expect(resolveSettings(settingsOverrides(watch))).toEqual(watch)
+    expect(() => resolveSettings({ watch: { activeIntervalMs: 1000 } })).toThrow(/watch\.activeIntervalMs/)
   })
 })
 

@@ -1,6 +1,7 @@
 /**
- * 左侧栏「代码仓库」整页设置，分四个标签页：主机（主机与令牌）、访问范围、
- * 模型工具、高级（超时、上限、镜像目录）。主机、令牌和镜像目录的改动立即
+ * 左侧栏「代码仓库」整页设置，分五个标签页：主机（主机与令牌）、访问范围、
+ * 模型工具、MR 跟踪（各类动态的处理方式、检查频率、正在跟踪的 PR/MR）、
+ * 高级（超时、上限、镜像目录）。主机、令牌、镜像目录和停止跟踪立即
  * 保存；其余运行时设置有改动时出现底部保存条，保存后对之后的调用立即生效。
  * 令牌值存入 DSH 凭据库，页面只显示是否已设置。
  *
@@ -10,9 +11,9 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { ForgeKind, HostInfo, TokenStatus } from '../contract.ts'
-import type { HostAddRequest, SettingsState } from '../settings/contract.ts'
-import { addHost, clearHostToken, fetchState, messageOf, pickDirectory, removeHost, resetMirrorDir, resetSettings, saveHostToken, saveMirrorDir, saveSettings } from './api.ts'
-import { fromDraft, NUMBER_FIELDS, sameDraft, toDraft, WRITE_MODES } from './form.ts'
+import type { HostAddRequest, SettingsState, WatchInfo } from '../settings/contract.ts'
+import { addHost, clearHostToken, fetchState, messageOf, pickDirectory, removeHost, resetMirrorDir, resetSettings, saveHostToken, saveMirrorDir, saveSettings, stopWatch } from './api.ts'
+import { fromDraft, NUMBER_FIELDS, sameDraft, toDraft, WATCH_ACTIONS, WATCH_EVENTS, WRITE_MODES } from './form.ts'
 import type { DraftField, NumberKey, SettingsDraft } from './form.ts'
 
 /** Page title, shared with the sidebar row. */
@@ -20,14 +21,26 @@ export const PAGE_TITLE = '代码仓库'
 
 type Notice = { kind: 'ok' | 'error'; text: string } | undefined
 
-type TabId = 'hosts' | 'access' | 'tools' | 'advanced'
+type TabId = 'hosts' | 'access' | 'tools' | 'watch' | 'advanced'
 
 const TABS: readonly { id: TabId; label: string }[] = [
   { id: 'hosts', label: '主机' },
   { id: 'access', label: '访问范围' },
   { id: 'tools', label: '模型工具' },
+  { id: 'watch', label: 'MR 跟踪' },
   { id: 'advanced', label: '高级' },
 ]
+
+const WATCH_SOURCES: Readonly<Record<WatchInfo['source'], string>> = { created: '创建', pushed: '推送', requested: '要求跟踪' }
+
+/** Relative time such as `3 分钟前`. */
+function ago(iso: string, now: number): string {
+  const seconds = Math.max(0, Math.round((now - Date.parse(iso)) / 1000))
+  if (seconds < 60) return '刚刚'
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`
+  if (seconds < 86_400) return `${Math.floor(seconds / 3600)} 小时前`
+  return `${Math.floor(seconds / 86_400)} 天前`
+}
 
 /** Credential store layers of `@deepseek-ai/dsh-credentials-local` other than its own file. */
 const TOKEN_SOURCES: Readonly<Record<string, string>> = { 'env': '启动环境变量', 'project-env': '项目 .env', 'user-env': '$DSH_HOME/.env' }
@@ -80,7 +93,7 @@ export function bundlePointer(openPage: () => (() => void) | undefined): (props:
           <div className="dr__row">
             <div className="dr__rowText">
               <div className="dr__rowLabel">设置在左侧栏「{PAGE_TITLE}」</div>
-              <div className="dr__rowSummary">主机与令牌、访问范围、模型工具、超时与上限、本地镜像都在那里配置。</div>
+              <div className="dr__rowSummary">主机与令牌、访问范围、模型工具、MR 跟踪、超时与上限、本地镜像都在那里配置。</div>
             </div>
             {open === undefined ? null : <div className="dr__rowCtl"><button type="button" className="dr__btn" onClick={open}>打开设置</button></div>}
           </div>
@@ -162,7 +175,7 @@ function SettingsPanel(): JSX.Element {
     setErrors({})
   }
   const resetAll = (): void => {
-    if (!window.confirm('把访问范围、模型工具、超时和上限全部恢复默认？主机、令牌和镜像目录不受影响。')) return
+    if (!window.confirm('把访问范围、模型工具、MR 跟踪、超时和上限全部恢复默认？主机、令牌、镜像目录和正在跟踪的 PR/MR 不受影响。')) return
     void run(resetSettings, '已全部恢复默认').then((ok) => { if (ok) discard() })
   }
   const form = { current, defaults, errors, busy, edit }
@@ -180,6 +193,15 @@ function SettingsPanel(): JSX.Element {
       {tab === 'hosts' ? <HostsTab hosts={state.hosts} busy={busy} run={run} /> : null}
       {tab === 'access' ? <AccessTab {...form} /> : null}
       {tab === 'tools' ? <ToolsTab {...form} /> : null}
+      {tab === 'watch'
+        ? (
+            <>
+              {state.watchAvailable || !current.watchEnabled ? null : <div className="dr__notice dr__notice--error">当前 DSH 组合不能唤醒会话，PR/MR 跟踪不可用。</div>}
+              <WatchTab {...form} />
+              <WatchList watches={state.watches} busy={busy} run={run} />
+            </>
+          )
+        : null}
       {tab === 'advanced'
         ? (
             <>
@@ -290,20 +312,71 @@ function ToolsTab({ current, defaults, errors, busy, edit }: FormProps): JSX.Ele
   )
 }
 
-function AdvancedTab({ current, defaults, errors, busy, edit }: FormProps): JSX.Element {
-  const numberRow = (key: NumberKey): JSX.Element => {
-    const spec = NUMBER_FIELDS[key]
-    const changed = current.numbers[key].trim() !== defaults.numbers[key]
-    return (
-      <Row key={key} label={spec.label} summary={spec.summary} error={errors[key]}>
-        <ResetLink shown={changed} busy={busy} onReset={() => { edit({ numbers: { ...current.numbers, [key]: defaults.numbers[key] } }) }} />
-        <span className="dr__number">
-          <input className="dr__input dr__mono" inputMode="decimal" aria-label={spec.label} aria-invalid={errors[key] === undefined ? undefined : true} placeholder={defaults.numbers[key]} value={current.numbers[key]} disabled={busy} onChange={(event) => { edit({ numbers: { ...current.numbers, [key]: event.target.value } }) }} />
-          <span className="dr__unit">{spec.unit}</span>
-        </span>
-      </Row>
-    )
-  }
+function NumberRow({ field: key, current, defaults, errors, busy, edit, disabled }: FormProps & { field: NumberKey; disabled?: boolean }): JSX.Element {
+  const spec = NUMBER_FIELDS[key]
+  const changed = current.numbers[key].trim() !== defaults.numbers[key]
+  return (
+    <Row label={spec.label} summary={spec.summary} error={errors[key]}>
+      <ResetLink shown={changed} busy={busy} onReset={() => { edit({ numbers: { ...current.numbers, [key]: defaults.numbers[key] } }) }} />
+      <span className="dr__number">
+        <input className="dr__input dr__mono" inputMode="decimal" aria-label={spec.label} aria-invalid={errors[key] === undefined ? undefined : true} placeholder={defaults.numbers[key]} value={current.numbers[key]} disabled={busy || disabled === true} onChange={(event) => { edit({ numbers: { ...current.numbers, [key]: event.target.value } }) }} />
+        <span className="dr__unit">{spec.unit}</span>
+      </span>
+    </Row>
+  )
+}
+
+function WatchTab(form: FormProps): JSX.Element {
+  const { current, defaults, busy, edit } = form
+  const off = !current.watchEnabled
+  return (
+    <>
+      <Section>
+        <Row label="跟踪 PR/MR" summary="通过工具创建、推送或要求跟踪的 PR/MR，把 CI、评论、评审和合并结果送回发起它的会话。">
+          <ResetLink shown={current.watchEnabled !== defaults.watchEnabled} busy={busy} onReset={() => { edit({ watchEnabled: defaults.watchEnabled }) }} />
+          <Switch label="跟踪 PR/MR" checked={current.watchEnabled} disabled={busy} onChange={(value) => { edit({ watchEnabled: value }) }} />
+        </Row>
+      </Section>
+      <Section title="各类动态">
+        {WATCH_EVENTS.map(event => (
+          <Row key={event.id} label={event.label} summary={event.summary}>
+            <ResetLink shown={current.watchEvents[event.id] !== defaults.watchEvents[event.id]} busy={busy} onReset={() => { edit({ watchEvents: { ...current.watchEvents, [event.id]: defaults.watchEvents[event.id] } }) }} />
+            <Segmented label={event.label} value={current.watchEvents[event.id]} options={WATCH_ACTIONS} disabled={busy || off} onChange={(value) => { edit({ watchEvents: { ...current.watchEvents, [event.id]: value } }) }} />
+          </Row>
+        ))}
+      </Section>
+      <p className="dr__secFoot">唤醒：开始会话的一轮回复；只记录：会话正在运行时加入上下文，否则随下一次唤醒一起送达；忽略：不通知。评论内容只作为信息交给模型，不能授予权限。</p>
+      <Section title="频率与上限">
+        {(['activeIntervalMs', 'quietAfterMs', 'quietIntervalMs', 'batchMs', 'idleDays', 'dailyWakeLimit', 'maxWatches'] as const).map(key => <NumberRow key={key} field={key} {...form} disabled={off} />)}
+      </Section>
+    </>
+  )
+}
+
+function WatchList({ watches, busy, run }: { watches: readonly WatchInfo[]; busy: boolean; run: Run }): JSX.Element {
+  const now = Date.now()
+  return (
+    <Section title={`正在跟踪（${watches.length}）`}>
+      {watches.length === 0 ? <div className="dr__emptyRow">没有正在跟踪的 PR/MR。</div> : null}
+      {watches.map(watch => (
+        <div key={watch.id} className="dr__watch">
+          <span className="dr__watchName" title={`${watch.repo} #${watch.number} ${watch.title}`}>
+            <a href={watch.webUrl} target="_blank" rel="noreferrer">{watch.repo} #{watch.number}</a> {watch.title}
+          </span>
+          <span className="dr__watchMeta dr__watchMeta--session dr__mono" title={`会话 ${watch.session}`}>{watch.session.slice(0, 8)}</span>
+          <span className="dr__watchMeta">{WATCH_SOURCES[watch.source]}</span>
+          {watch.pending > 0 ? <span className="dr__pill">{watch.pending} 条待送达</span> : null}
+          {watch.failures >= 3 ? <span className="dr__pill dr__pill--bad" title={watch.lastError}><span className="dr__dot" />连续失败 {watch.failures} 次</span> : null}
+          <span className="dr__watchMeta dr__watchMeta--time" title={`最近动态 ${watch.lastActivityAt}`}>{ago(watch.lastActivityAt, now)}</span>
+          <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={() => { void run(() => stopWatch(watch.id), `已停止跟踪 ${watch.repo} #${watch.number}`) }}>停止</button>
+        </div>
+      ))}
+    </Section>
+  )
+}
+
+function AdvancedTab(form: FormProps): JSX.Element {
+  const numberRow = (key: NumberKey): JSX.Element => <NumberRow key={key} field={key} {...form} />
   return (
     <>
       <Section title="超时">

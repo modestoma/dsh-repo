@@ -167,4 +167,43 @@ describe('GitLab token account', () => {
     fakeHttp([{ method: 'GET', path: '/gitlab/api/v4/user', reply: { body: account } }])
     expect(await provider().currentUser(call())).toEqual({ name: 'Shared Bot', email: '9-bot@users.noreply.code.example.com' })
   })
+  it('polls a merge request for a watch: pipeline every time, notes after an update, approvals and change requests from system notes', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/merge_requests/7`, reply: { body: mr({ updated_at: '2026-11-01T01:00:00.000Z', has_conflicts: true, head_pipeline: { id: 40, status: 'running', web_url: 'p' } }) } },
+      { method: 'GET', path: `${API}/merge_requests/7/notes`, reply: { body: [
+        { id: 14, body: 'requested changes', author: { username: 'erin' }, created_at: '2026-11-01T00:55:00.000Z', system: true },
+        { id: 13, body: 'added 1 commit', author, created_at: '2026-11-01T00:52:00.000Z', system: true },
+        { id: 12, body: 'approved this merge request', author: { username: 'carol' }, created_at: '2026-11-01T00:50:00.000Z', system: true },
+        { id: 11, body: 'why?', author: { username: 'alice' }, created_at: '2026-11-01T00:40:00.000Z', position: { new_path: 'src/b.ts' } },
+        { id: 10, body: 'old', author, created_at: '2026-11-01T00:10:00.000Z' },
+      ] } },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    const polled = await service.changeActivity(REPO, 7, { withStatus: false, since: '2026-11-01T00:30:00.000Z' })
+    expect(polled.conflict).toBe(true)
+    expect(polled.status).toMatchObject({ overall: 'pending', checks: [{ name: 'pipeline #40' }] })
+    expect(polled.items?.map(item => [item.id, item.kind, item.author.username, item.path])).toEqual([
+      ['11', 'comment', 'alice', 'src/b.ts'], ['12', 'approved', 'carol', undefined], ['14', 'changes-requested', 'erin', undefined],
+    ])
+    expect(polled.items?.[0]?.webUrl).toBe(`${REPO}/-/merge_requests/7#note_11`)
+    expect(Object.fromEntries(requests[1]!.url.searchParams)).toMatchObject({ sort: 'desc', order_by: 'created_at', per_page: '100' })
+    requests.length = 0
+    expect((await service.changeActivity(REPO, 7, { updatedAt: '2026-11-01T01:00:00.000Z', withStatus: false, since: '2026-11-01T00:55:00.000Z' })).items).toBeUndefined()
+    expect(requests).toHaveLength(1)
+  })
+  it('reads older pages of notes until one predates the cursor', async () => {
+    const notes = (start: number, count: number, createdAt: string) => Array.from({ length: count }, (_, index) => ({
+      id: start - index, body: `n${start - index}`, author: { username: 'alice' }, created_at: createdAt,
+    }))
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/merge_requests/7`, reply: { body: mr({ updated_at: '2026-11-01T01:00:00.000Z' }) } },
+      { method: 'GET', path: `${API}/merge_requests/7/notes`, reply: request => ({ body: request.url.searchParams.get('page') === '2'
+        ? [...notes(400, 10, '2026-11-01T00:40:00.000Z'), ...notes(300, 5, '2026-11-01T00:10:00.000Z')]
+        : notes(500, 100, '2026-11-01T00:50:00.000Z') }) },
+    ])
+    const polled = await createService(testConfig(), TOKENS).changeActivity(REPO, 7, { withStatus: false, since: '2026-11-01T00:30:00.000Z' })
+    expect(polled.items).toHaveLength(110)
+    expect(polled.items?.[0]?.id).toBe('391')
+    expect(requests.filter(request => request.url.pathname.endsWith('/notes'))).toHaveLength(2)
+  })
 })

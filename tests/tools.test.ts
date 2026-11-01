@@ -7,6 +7,7 @@ import type { HostApproval, ToolDefinition, WorkingDirectoryService } from '../s
 import { RepoError } from '../src/errors.ts'
 import { createTools, toolOffered } from '../src/tools.ts'
 import type { ToolDeps } from '../src/tools.ts'
+import type { WatchInfo } from '../src/settings/contract.ts'
 import { testSettings } from './helpers.ts'
 
 const agent = { id: 'agent-1' }
@@ -51,7 +52,7 @@ describe('createTools', () => {
     expect([...tools().keys()]).toEqual([
       'repo_info', 'repo_list_branches', 'repo_list_commits', 'repo_list_tree', 'repo_read_file',
       'repo_issue_list', 'repo_issue_get', 'repo_mr_list', 'repo_mr_get', 'repo_mr_diff', 'repo_mr_status',
-      'repo_workspace_open', 'repo_workspace_changes',
+      'repo_workspace_open', 'repo_workspace_changes', 'repo_mr_watch',
       'repo_workspace_push', 'repo_issue_create', 'repo_issue_update', 'repo_issue_comment', 'repo_mr_create', 'repo_mr_update', 'repo_mr_comment', 'repo_branch_delete',
     ])
     expect(tools(testSettings({ tools: { writes: 'off', merge: true } })).has('repo_issue_create')).toBe(false)
@@ -324,5 +325,55 @@ describe('createTools', () => {
     commitDetails.mockResolvedValueOnce({ trailers: [] })
     await push.execute({ branch: 'fix/a', message: 'fix: c' }, run)
     expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: c', session: 'session-1', signal: run.signal })
+  })
+  it('watches PRs/MRs opened, reopened, or pushed to for the calling Session, and remembers comments it posts', async () => {
+    const { root, workingDirectory, exec: run } = session('ws')
+    checkout(join(root, 'ws'))
+    const change = { number: 7, title: 'Fix a', targetBranch: 'main', webUrl: 'https://github.com/a/b/pull/7', body: '', state: 'open' }
+    const changes = { workspace: { url: 'https://github.com/a/b.git', dir: join(root, 'ws'), baseBranch: 'main', baseCommit: 'c'.repeat(40), branch: 'fix/a' }, commits: [], uncommitted: false, diff: '', truncated: false, files: [] }
+    const pushed = { url: 'https://github.com/a/b.git', branch: 'fix/a', baseBranch: 'main', commit: 'd'.repeat(40), committed: false, created: false }
+    const service = fakeService({
+      createChange: async () => change, updateChange: async () => change, commentChange: async () => ({ id: '55' }), commentIssue: async () => ({ id: '56' }),
+      workspaceChanges: async () => changes, pushWorkspace: async () => pushed, listChanges: async () => ({ items: [change] }),
+    })
+    const track = vi.fn(async () => ({}) as WatchInfo)
+    const ownComment = vi.fn(async () => {})
+    const watch = { active: true, track, untrack: vi.fn(async () => true), ownComment }
+    const settings = testSettings({ tools: { writes: 'allow' } })
+    const built = new Map(createTools({ service, settings: () => settings.tools, approval: () => undefined, workingDirectory: () => workingDirectory, watch } as ToolDeps).map(tool => [tool.definition.name, tool.definition]))
+    expect(await built.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'Fix a', sourceBranch: 'fix/a' }, run)).toMatchObject({ number: 7, watching: true })
+    expect(track).toHaveBeenLastCalledWith({ repo: 'github.com/a/b', change, session: 'session-1', source: 'created' })
+    expect(await built.get('repo_mr_update')!.execute({ repo: 'github.com/a/b', number: 7, state: 'open' }, run)).toMatchObject({ watching: true })
+    expect(track).toHaveBeenLastCalledWith(expect.objectContaining({ source: 'requested' }))
+    expect(await built.get('repo_mr_update')!.execute({ repo: 'github.com/a/b', number: 7, title: 'T' }, run)).not.toHaveProperty('watching')
+    expect(await built.get('repo_workspace_push')!.execute({}, run)).toMatchObject({ watching: true })
+    expect(track).toHaveBeenLastCalledWith({ repo: 'https://github.com/a/b.git', change, session: 'session-1', source: 'pushed', pushed: 'd'.repeat(40) })
+    await built.get('repo_mr_comment')!.execute({ repo: 'github.com/a/b', number: 7, body: 'done' }, run)
+    await built.get('repo_issue_comment')!.execute({ repo: 'github.com/a/b', number: 7, body: 'done' }, run)
+    expect(ownComment.mock.calls).toEqual([['github.com/a/b', 7, '55'], ['github.com/a/b', 7, '56']])
+    track.mockRejectedValueOnce(new Error('disk full'))
+    expect(await built.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'Fix a', sourceBranch: 'fix/a' }, run)).toMatchObject({ number: 7, watching: false, watchError: 'disk full' })
+    watch.active = false
+    expect(await built.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'Fix a', sourceBranch: 'fix/a' }, run)).toMatchObject({ watching: false })
+  })
+
+  it('starts and stops a watch on request, only for open PRs/MRs while watching is active', async () => {
+    const { exec: run } = session()
+    const getChange = vi.fn(async () => ({ number: 7, title: 'Fix a', state: 'open', webUrl: 'https://github.com/a/b/pull/7', comments: [{ id: '1' }] }))
+    const track = vi.fn(async () => ({ number: 7, title: 'Fix a', webUrl: 'https://github.com/a/b/pull/7' }) as WatchInfo)
+    const watch = { active: true, track, untrack: vi.fn(async () => true), ownComment: vi.fn() }
+    const settings = testSettings()
+    const tool = createTools({ service: fakeService({ getChange }), settings: () => settings.tools, approval: () => undefined, workingDirectory: () => undefined, watch } as ToolDeps)
+      .find(entry => entry.definition.name === 'repo_mr_watch')!
+    expect(tool.access).toBe('watch')
+    expect(await tool.definition.execute({ repo: 'github.com/a/b', number: 7 }, run)).toEqual({ watching: true, number: 7, title: 'Fix a', webUrl: 'https://github.com/a/b/pull/7', next: 'Activity on this PR/MR will arrive in this session as messages; nothing to poll.' })
+    expect(track).toHaveBeenCalledWith({ repo: 'github.com/a/b', change: { number: 7, title: 'Fix a', state: 'open', webUrl: 'https://github.com/a/b/pull/7' }, session: 'session-1', source: 'requested' })
+    expect(await tool.definition.execute({ repo: 'github.com/a/b', number: 7, watch: false }, run)).toEqual({ watching: false, stopped: true })
+    expect(watch.untrack).toHaveBeenCalledWith('github.com/a/b', 7, 'session-1')
+    getChange.mockResolvedValueOnce({ number: 7, title: 'Fix a', state: 'merged', webUrl: '', comments: [] })
+    await expect(tool.definition.execute({ repo: 'github.com/a/b', number: 7 }, run)).rejects.toThrow(/\[invalid\].*已合并/)
+    watch.active = false
+    await expect(tool.definition.execute({ repo: 'github.com/a/b', number: 7 }, run)).rejects.toThrow(/\[unavailable\]/)
+    expect(toolOffered('watch', testSettings({ tools: { enabled: false } }).tools)).toBe(false)
   })
 })

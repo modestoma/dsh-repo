@@ -130,6 +130,18 @@ describe('plugin', () => {
     expect(await offered('repo_info')).toBe(false)
   })
 
+  it('offers repo_mr_watch only while watching is on and a session controller can wake Sessions', async () => {
+    const services: Record<string, unknown> = {}
+    const { ctx, registered, provided, env } = context()
+    plugin.apply({ ...ctx, get: name => services[name] }, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
+    const offered = async () => await registered.find(entry => entry.definition.name === 'repo_mr_watch')!.when!()
+    expect(await offered()).toBe(false)
+    services.sessionController = { resolveAgent: async () => ({ error: new Error('unused') }) }
+    expect(await offered()).toBe(true)
+    await (provided.get('dshRepos') as RepoService).updateSettings({ watch: { enabled: false } })
+    expect(await offered()).toBe(false)
+  })
+
   it('reads added hosts at load and refuses an invalid hosts file', async () => {
     const first = context()
     plugin.apply(first.ctx, undefined, { env: first.env })

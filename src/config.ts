@@ -6,7 +6,7 @@
  */
 
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { ForgeKind } from './contract.ts'
 import { RepoError } from './errors.ts'
@@ -96,6 +96,51 @@ const toolsSchema = z.object({
   signature: z.string().max(MAX_SIGNATURE_LENGTH).default(''),
 }).strict()
 
+const action = z.enum(['wake', 'note', 'off'])
+
+const watchEventsSchema = z.object({
+  /** CI of the current head failed. */
+  ciFailed: action.default('wake'),
+  /** CI of the current head passed. */
+  ciPassed: action.default('note'),
+  /** A comment, review comment, or commented review that the tools did not post. */
+  comment: action.default('wake'),
+  /** A review requested changes. */
+  changesRequested: action.default('wake'),
+  /** A review approved. */
+  approved: action.default('note'),
+  /** The PR/MR now conflicts with its target branch. */
+  conflict: action.default('wake'),
+  /** Someone else moved the head, i.e. pushed commits the tools did not push. */
+  pushed: action.default('note'),
+  /** Merged; the watch ends. */
+  merged: action.default('wake'),
+  /** Closed without merging; the watch ends. */
+  closed: action.default('wake'),
+  /** No activity for `idleDays`; the watch ends. */
+  idle: action.default('wake'),
+}).strict()
+
+const watchSchema = z.object({
+  /** Whether PRs/MRs opened or pushed to through the tools are watched, and `repo_mr_watch` is offered. */
+  enabled: z.boolean().default(true),
+  /** Poll interval while the PR/MR is active. */
+  activeIntervalMs: bounded('activeIntervalMs').default(60_000),
+  /** Poll interval after `quietAfterMs` without activity, unless CI is running. */
+  quietIntervalMs: bounded('quietIntervalMs').default(600_000),
+  /** Time without activity after which polling slows to `quietIntervalMs`. */
+  quietAfterMs: bounded('quietAfterMs').default(3_600_000),
+  /** How long activity is collected before one delivery; merge, close, and idle are delivered at once. */
+  batchMs: bounded('batchMs').default(120_000),
+  /** Days without activity after which the watch ends. */
+  idleDays: bounded('idleDays').default(7),
+  /** Turns one watch may start per day; later activity is handed over without starting a turn. Merge, close, and idle always start one. */
+  dailyWakeLimit: bounded('dailyWakeLimit').default(10),
+  /** Most PRs/MRs watched at once; starting another ends the one quiet longest. */
+  maxWatches: bounded('maxWatches').default(50),
+  events: watchEventsSchema.prefault({}),
+}).strict()
+
 /**
  * Standard Schema of the run-time settings kept in the settings file and
  * edited on the settings page. Every field has a default, so a partial
@@ -109,6 +154,7 @@ export const repoSettingsSchema = z.object({
   limits: limitsSchema.prefault({}),
   tools: toolsSchema.prefault({}),
   mirror: mirrorSchema.prefault({}),
+  watch: watchSchema.prefault({}),
 }).strict()
 
 /** Complete run-time settings. */
@@ -155,12 +201,18 @@ export function settingsOverrides(settings: RepoSettings): SettingsOverrides {
   const limits = changedFields(settings.limits, DEFAULT_SETTINGS.limits)
   const tools = changedFields(settings.tools, DEFAULT_SETTINGS.tools)
   const mirror = changedFields(settings.mirror, DEFAULT_SETTINGS.mirror)
+  const events = changedFields(settings.watch.events, DEFAULT_SETTINGS.watch.events)
+  const { events: _events, ...watchFields } = settings.watch
+  const { events: _defaultEvents, ...defaultWatchFields } = DEFAULT_SETTINGS.watch
+  const changedWatch = changedFields(watchFields, defaultWatchFields)
+  const watch = changedWatch === undefined && events === undefined ? undefined : { ...changedWatch, ...events === undefined ? {} : { events } }
   return {
     ...settings.repos.length === 0 ? {} : { repos: settings.repos },
     ...settings.timeoutMs === DEFAULT_SETTINGS.timeoutMs ? {} : { timeoutMs: settings.timeoutMs },
     ...limits === undefined ? {} : { limits },
     ...tools === undefined ? {} : { tools },
     ...mirror === undefined ? {} : { mirror },
+    ...watch === undefined ? {} : { watch },
   }
 }
 
@@ -192,6 +244,9 @@ export const hostSpecSchema = hostSchema
 
 /** Size and paging limits. */
 export type RepoLimits = RepoSettings['limits']
+
+/** PR/MR watch settings. */
+export type WatchSettings = RepoSettings['watch']
 
 /**
  * Validate a raw `config` block.
@@ -244,6 +299,15 @@ export function expandHome(path: string): string {
  */
 export function defaultMirrorDir(env: NodeJS.ProcessEnv = process.env): string {
   return join(resolveDshHome(env), 'dsh-repo', 'mirrors')
+}
+
+/**
+ * The file watched PRs/MRs are kept in: `watches.json` next to the settings file.
+ * @param settingsFile - absolute path of the settings file.
+ * @returns absolute path.
+ */
+export function watchesFile(settingsFile: string): string {
+  return join(dirname(settingsFile), 'watches.json')
 }
 
 /**
