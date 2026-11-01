@@ -154,7 +154,7 @@ export function createTools(deps: ToolDeps): RepoTool[] {
     define(deps, {
       name: 'repo_mr_list',
       description: 'List pull requests (GitHub) or merge requests (GitLab).',
-      schema: z.object({ repo, state: z.enum(['open', 'closed', 'merged', 'all']).optional(), sourceBranch: z.string().optional(), targetBranch: z.string().optional(), page, perPage }).strict(),
+      schema: z.object({ repo, state: z.enum(['open', 'closed', 'merged', 'all']).optional(), sourceBranch: z.string().optional().describe('Branch of this repository the PRs/MRs come from; ones from forks are left out'), targetBranch: z.string().optional(), page, perPage }).strict(),
       run: (args, signal) => service.listChanges(args.repo, { ...args, signal }),
     }),
     define(deps, {

@@ -66,6 +66,8 @@ interface GitlabMergeRequest extends GitlabIssue {
   readonly source_branch: string
   readonly target_branch: string
   readonly sha: string
+  readonly source_project_id?: number
+  readonly target_project_id?: number
 }
 
 function mergeRequest(value: GitlabMergeRequest): ChangeInfo {
@@ -261,7 +263,9 @@ export class GitlabProvider implements Provider {
       ...query.sourceBranch === undefined ? {} : { sourceBranch: query.sourceBranch },
       ...query.targetBranch === undefined ? {} : { targetBranch: query.targetBranch },
     })
-    return { items: data.map(entry => mergeRequest(entry)), ...nextPage(query, data.length) }
+    // A source branch names a branch of this project, as GitHub's `head=owner:branch` does; MRs from forks with the same branch name are left out.
+    const items = query.sourceBranch === undefined ? data : data.filter(entry => entry.source_project_id === entry.target_project_id)
+    return { items: items.map(entry => mergeRequest(entry)), ...nextPage(query, data.length) }
   }
 
   async getChange(ref: RepoRef, number: number, call: Call) {

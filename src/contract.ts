@@ -301,6 +301,7 @@ export interface ChangeDetail extends ChangeInfo {
 export interface ChangeListOptions extends PageOptions {
   /** Default `open`. */
   readonly state?: ChangeState | 'all'
+  /** Branch of this repository the change requests come from; requests from forks are left out. */
   readonly sourceBranch?: string
   readonly targetBranch?: string
 }

@@ -75,6 +75,15 @@ describe('GitLab provider', () => {
     expect(requests.at(-1)?.url.searchParams.get('state')).toBe('merged')
   })
 
+  it('lists merge requests from a source branch of this project only, leaving out forks with the same branch name', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/merge_requests`, reply: { body: [mr({ iid: 7, source_project_id: 1, target_project_id: 1 }), mr({ iid: 8, source_project_id: 2, target_project_id: 1 })] } },
+    ])
+    const page = await createService(testConfig(), TOKENS).listChanges(REPO, { state: 'open', sourceBranch: 'f' })
+    expect(page.items.map(item => item.number)).toEqual([7])
+    expect(requests[0]?.url.searchParams.get('source_branch')).toBe('f')
+  })
+
   it('reads the head pipeline and mergeability, and merges at the expected SHA', async () => {
     const { requests } = fakeHttp([
       { method: 'GET', path: `${API}/merge_requests/7`, reply: { body: mr({ head_pipeline: { id: 9, status: 'failed', web_url: 'p' }, detailed_merge_status: 'mergeable' }) } },
