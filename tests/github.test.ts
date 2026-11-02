@@ -302,6 +302,21 @@ describe('GitHub Actions CI', () => {
     expect(requests.find(request => request.url.pathname.endsWith('/jobs'))?.url.searchParams.get('filter')).toBe('latest')
   })
 
+  it('reads further annotation pages when warnings fill the first one', async () => {
+    const warnings = Array.from({ length: 100 }, (_, index) => ({ annotation_level: 'warning', title: `w${index}`, message: 'w', path: '.github', start_line: 1 }))
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/actions/runs/77`, reply: { body: runBody() } },
+      { method: 'GET', path: `${API}/actions/runs/77/jobs`, reply: { body: { total_count: 1, jobs: [jobBody(2, 'failure')] } } },
+      { method: 'GET', path: `${API}/check-runs/2/annotations`, reply: request => request.url.searchParams.get('page') === '1'
+        ? { body: warnings }
+        : { body: [{ annotation_level: 'failure', title: 'TS2322', message: 'Type mismatch', path: 'src/a.ts', start_line: 4 }] } },
+    ])
+    const run = await createService(testConfig(), TOKENS).getCiRun(REPO, 77)
+    expect(run.failures).toEqual([{ job: 'job-2', name: 'TS2322', message: 'Type mismatch', path: 'src/a.ts', line: 4 }])
+    expect(run.failuresTruncated).toBe(false)
+    expect(requests.filter(request => request.url.pathname.endsWith('/annotations'))).toHaveLength(2)
+  })
+
   it('downloads a job log by following the redirect without sending the token to storage', async () => {
     const storage = 'https://results-receiver.actions.githubusercontent.com/logs/2.txt'
     const { requests } = fakeHttp([

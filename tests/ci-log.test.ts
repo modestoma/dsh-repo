@@ -96,6 +96,14 @@ describe('readLog', () => {
     expect(tight).toMatchObject({ text: '3: error one', matches: 2, more: true })
   })
 
+  it('drops leading context rather than the matching line when both do not fit', async () => {
+    const excerpt = await read(`${'x'.repeat(1024)}\nerror: build failed`, { search: ['error'], maxBytes: 1024 })
+    expect(excerpt).toMatchObject({ text: '2: error: build failed', matches: 1, fromLine: 2, more: false })
+    const first = await read(`error ${'x'.repeat(2000)}`, { search: ['error'], maxBytes: 100 })
+    expect(Buffer.byteLength(first.text) + 1).toBeLessThanOrEqual(100)
+    expect(first.text.startsWith('1: error x')).toBe(true)
+  })
+
   it('selects lines of matching sections only, keeping the whole log\'s numbering', async () => {
     const excerpt = await read(GITHUB, { section: 'npm test' })
     expect(excerpt).toMatchObject({ fromLine: 3, toLine: 4, text: '▶ Run npm test\n> vitest run', totalLines: 5 })

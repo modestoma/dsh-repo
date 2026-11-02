@@ -237,6 +237,11 @@ class TailWindow {
   }
 }
 
+/** Bytes that emitting these numbered lines takes, with room for one separator. */
+function cost(lines: readonly { readonly number: number; readonly text: string }[]): number {
+  return lines.reduce((sum, line) => sum + byteLength(`${line.number}: ${line.text}`) + 1, 0) + 3
+}
+
 /** Matching lines with context, in log order, until the byte budget is spent. */
 class SearchWindow {
   private readonly before: { readonly number: number; readonly text: string }[] = []
@@ -256,7 +261,10 @@ class SearchWindow {
     if (hit) this.matches += 1
     if (this.full) return
     if (hit) {
-      for (const line of this.before) this.emit(line.number, line.text)
+      // Leading context gives way first, so the matching line itself fits whenever it can.
+      const context = this.before.filter(line => line.number > this.last)
+      while (context.length > 0 && this.bytes + cost([...context, { number, text }]) > this.maxBytes) context.shift()
+      for (const line of context) this.emit(line.number, line.text)
       this.before.length = 0
       this.emit(number, text)
       this.after = this.context
@@ -274,11 +282,16 @@ class SearchWindow {
   private emit(number: number, text: string): void {
     if (this.full || number <= this.last) return
     const separator = this.last !== 0 && number > this.last + 1 ? '--' : undefined
-    const line = `${number}: ${text}`
-    const bytes = byteLength(line) + 1 + (separator === undefined ? 0 : 3)
-    if (this.bytes + bytes > this.maxBytes && this.out.length > 0) {
-      this.full = true
-      return
+    let line = `${number}: ${text}`
+    let bytes = byteLength(line) + 1 + (separator === undefined ? 0 : 3)
+    if (this.bytes + bytes > this.maxBytes) {
+      if (this.out.length > 0) {
+        this.full = true
+        return
+      }
+      // The first line is always returned, cut so the excerpt stays within the limit.
+      line = capLine(line, this.maxBytes - 1)
+      bytes = byteLength(line) + 1
     }
     if (separator !== undefined) this.out.push(separator)
     this.out.push(line)

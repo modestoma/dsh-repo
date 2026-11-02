@@ -595,24 +595,21 @@ export class GithubProvider implements Provider {
     const run = workflowRun(data)
     const mapped = jobs.items.map(actionsJob)
     let failures: CiFailure[] = []
+    let unread = false
     let failuresError: string | undefined
     if (run.state === 'failure') {
       try {
         const failed = mapped.filter(entry => entry.state === 'failure')
-        const annotations = await Promise.all(failed.map(entry => this.octokit.rest.checks.listAnnotations({ ...repo, check_run_id: entry.id, per_page: PAGE, request: { signal: call.signal } })
-          .then(response => response.data.filter(note => note.annotation_level === 'failure').map((note): CiFailure => ({
-            job: entry.name,
-            name: note.title === null || note.title === undefined || note.title === '' ? entry.name : note.title,
-            ...note.message === null ? {} : { message: note.message },
-            // Annotations about the run itself ("Process completed with exit code 1") point at `.github`.
-            ...note.path === '' || note.path === '.github' ? {} : { path: note.path, line: note.start_line },
-          })))))
-        failures = annotations.flat()
+        // One more than the limit, so a cut list is reported as truncated.
+        const found = await Promise.all(failed.map(entry => this.failureAnnotations(repo, entry, call.limits.maxCiFailures + 1, call.signal)))
+        failures = found.flatMap(entry => entry.failures)
+        unread = found.some(entry => entry.unread)
       } catch (error) {
         if (call.signal.aborted) throw error
         failuresError = `读取错误注解失败：${errorText(error)}`
       }
     }
+    const capped = capFailures(failures, call.limits)
     const started = data.run_started_at
     const finished = run.state === 'running' || run.state === 'pending' ? undefined : data.updated_at
     const duration = seconds(started, finished)
@@ -623,7 +620,8 @@ export class GithubProvider implements Provider {
       ...duration === undefined ? {} : { durationSeconds: duration },
       jobs: mapped,
       jobsTruncated: jobs.truncated,
-      ...capFailures(failures, call.limits),
+      ...capped,
+      failuresTruncated: capped.failuresTruncated || unread,
       ...failuresError === undefined ? {} : { failuresError },
     }
   }
@@ -670,6 +668,30 @@ export class GithubProvider implements Provider {
 
   async cancelJob(_ref: RepoRef, _jobId: number, _call: Call): Promise<CiActionResult> {
     throw new RepoError('invalid', 'GitHub Actions 不能单独取消一个作业，只能取消整个运行（传 runId）')
+  }
+
+  /**
+   * Failure-level annotations of a job, page by page until `want` are found
+   * or the annotations end; warnings and notices can fill whole pages first.
+   * `unread` is true when {@link MAX_STATUS_PAGES} pages did not reach the end.
+   */
+  private async failureAnnotations(repo: { owner: string; repo: string }, job: CiJob, want: number, signal: AbortSignal): Promise<{ failures: CiFailure[]; unread: boolean }> {
+    const failures: CiFailure[] = []
+    for (let page = 1; page <= MAX_STATUS_PAGES; page += 1) {
+      const { data } = await this.octokit.rest.checks.listAnnotations({ ...repo, check_run_id: job.id, per_page: PAGE, page, request: { signal } })
+      for (const note of data) {
+        if (note.annotation_level !== 'failure') continue
+        failures.push({
+          job: job.name,
+          name: note.title === null || note.title === undefined || note.title === '' ? job.name : note.title,
+          ...note.message === null ? {} : { message: note.message },
+          // Annotations about the run itself ("Process completed with exit code 1") point at `.github`.
+          ...note.path === '' || note.path === '.github' ? {} : { path: note.path, line: note.start_line },
+        })
+      }
+      if (failures.length >= want || data.length < PAGE) return { failures, unread: false }
+    }
+    return { failures, unread: true }
   }
 
   /** Jobs of a run's latest attempt, at most {@link MAX_STATUS_PAGES} pages. */
