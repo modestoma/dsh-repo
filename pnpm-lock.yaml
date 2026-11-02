@@ -166,9 +166,6 @@ importers:
 
   .:
     dependencies:
-      '@gitbeaker/rest':
-        specifier: ^43.8.0
-        version: 43.8.0
       '@octokit/rest':
         specifier: ^22.0.1
         version: 22.0.1
@@ -179,6 +176,9 @@ importers:
       '@deepseek-ai/cordis':
         specifier: ^4.0.5
         version: 4.0.5
+      '@gitbeaker/rest':
+        specifier: ^43.8.0
+        version: 43.8.0
       '@semantic-release/commit-analyzer':
         specifier: ^13.0.1
         version: 13.0.1(semantic-release@25.0.9(supports-color@7.2.0)(typescript@7.0.2))(supports-color@7.2.0)

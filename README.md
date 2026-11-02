@@ -252,6 +252,8 @@ pnpm install
 pnpm check    # 类型检查、测试、构建、Host 与 client 加载校验
 ```
 
+Host 端打包成 `lib/index.js`：ESM 依赖 `@octokit/rest`、`zod` 保持外部引用；GitBeaker 及其 CommonJS 依赖（`picomatch-browser`、`qs` 等）打进包内，`@gitbeaker/rest` 因此只是 devDependency。原因是插件升级后 DSH 热替换会重新导入改动过的模块，而 Node 对重新导入的 CommonJS 转导出链给出空导出，GitLab 请求会报 `isGlobMatch is not a function`；Host 加载校验要求导入 `lib/index.js` 时不加载任何 CommonJS 模块。
+
 `src/client` 是浏览器端代码，单独用 `tsconfig.client.json` 检查，打包成 `lib/client.js` 经 DSH 的 `__ModuleLoader__` 加载，react 来自 Web 外壳的模块表。
 
 测试用替换全局 `fetch` 的方式驱动真实的 Octokit 和 GitBeaker，不访问网络。
