@@ -7,8 +7,15 @@
  */
 
 import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
 
 const plugin = await import('../lib/index.js')
+
+// DSH HMR re-imports an upgraded package from evicted caches, and Node gives a
+// re-imported CommonJS re-export chain empty exports; the build bundles every
+// CommonJS dependency so none is loaded here (see tsdown.config.ts).
+const commonJs = Object.keys(createRequire(import.meta.url).cache)
+assert.deepEqual(commonJs, [], `host bundle must load no CommonJS module, loaded:\n${commonJs.join('\n')}`)
 
 assert.equal(plugin.name, 'dsh-repo', 'host bundle must export the Cordis plugin name')
 assert.equal(typeof plugin.apply, 'function', 'host bundle must export apply()')
