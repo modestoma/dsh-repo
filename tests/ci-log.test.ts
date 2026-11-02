@@ -118,4 +118,15 @@ describe('readLog', () => {
     const kept = await read('x'.repeat(500), { maxBytes: 200 })
     expect(kept.text).toBe(`${'x'.repeat(197)}…`)
   })
+
+  it('keeps the last carriage-return redraw of an overlong line wherever the chunks split', async () => {
+    const head = 'x'.repeat(1100)
+    const whole = await read(`${head}\rerror: build failed\nnext`, { search: ['error'], context: 0, maxBytes: 1024 })
+    const split = await read(stream(head.slice(0, 1050), `${head.slice(1050)}\rerror: build failed\nnext`), { search: ['error'], context: 0, maxBytes: 1024 })
+    for (const excerpt of [whole, split]) expect(excerpt).toMatchObject({ text: '1: error: build failed', matches: 1 })
+    const blankLast = await read(stream(head, '\rDownloading 100%', '\r\x1b[0K\nnext'), { maxBytes: 1024 })
+    expect(blankLast.text).toBe('Downloading 100%\nnext')
+    const noRedraw = await read(stream(head, 'y'.repeat(100)), { maxBytes: 1024 })
+    expect(noRedraw.text).toBe(`${'x'.repeat(1021)}…`)
+  })
 })

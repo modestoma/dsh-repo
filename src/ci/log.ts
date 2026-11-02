@@ -128,15 +128,74 @@ function capLine(text: string, maxBytes: number): string {
   return `${truncateBytes(text, Math.max(0, maxBytes - byteLength(ELLIPSIS))).text}${ELLIPSIS}`
 }
 
+function blank(text: string): boolean {
+  return text.replace(ANSI, '').trim() === ''
+}
+
 /**
- * Split a byte stream into raw lines, decoding UTF-8 across chunks. A line
- * longer than `maxChars` is cut one character past it and the rest of it skipped.
+ * Collects one raw line while bounding its length. The first `maxChars + 1`
+ * characters are kept, so a cut line is still seen as longer than the limit.
+ * Past that, only carriage-return redraws are followed: the line ends as its
+ * kept head plus the last redrawn segment with content, so the cleaner shows
+ * what a terminal would.
  */
+class LineBuffer {
+  private head = ''
+  private cut = false
+  private redrawn = false
+  private current = ''
+  private shown = ''
+
+  constructor(private readonly maxChars: number) {}
+
+  append(text: string): void {
+    let rest = text
+    if (!this.cut) {
+      this.head += rest
+      if (this.head.length <= this.maxChars) return
+      rest = this.head.slice(this.maxChars + 1)
+      this.head = this.head.slice(0, this.maxChars + 1)
+      this.cut = true
+    }
+    let at = rest.indexOf('\r')
+    if (!this.redrawn) {
+      // Text before the first redraw continues the cut head and stays hidden.
+      if (at < 0) return
+      this.redrawn = true
+      rest = rest.slice(at + 1)
+      at = rest.indexOf('\r')
+    }
+    while (at >= 0) {
+      this.current = (this.current + rest.slice(0, at)).slice(0, this.maxChars + 1)
+      if (!blank(this.current)) this.shown = this.current
+      this.current = ''
+      rest = rest.slice(at + 1)
+      at = rest.indexOf('\r')
+    }
+    this.current = (this.current + rest).slice(0, this.maxChars + 1)
+  }
+
+  /** The collected line; the buffer starts over. */
+  take(): string {
+    const line = this.redrawn ? `${this.head}\r${blank(this.current) ? this.shown : this.current}` : this.head
+    this.head = ''
+    this.cut = false
+    this.redrawn = false
+    this.current = ''
+    this.shown = ''
+    return line
+  }
+
+  get empty(): boolean {
+    return this.head === ''
+  }
+}
+
+/** Split a byte stream into raw lines, decoding UTF-8 across chunks and bounding each line as {@link LineBuffer} does. */
 async function* rawLines(body: ReadableStream<Uint8Array>, maxChars: number, signal: AbortSignal): AsyncGenerator<string> {
   const decoder = new TextDecoder('utf-8')
   const reader = body.getReader()
-  let pending = ''
-  let skipping = false
+  const line = new LineBuffer(maxChars)
   try {
     for (;;) {
       signal.throwIfAborted()
@@ -144,27 +203,14 @@ async function* rawLines(body: ReadableStream<Uint8Array>, maxChars: number, sig
       const chunk = done ? decoder.decode() : decoder.decode(value, { stream: true })
       let start = 0
       for (let newline = chunk.indexOf('\n'); newline >= 0; newline = chunk.indexOf('\n', start)) {
-        const piece = chunk.slice(start, newline)
+        line.append(chunk.slice(start, newline))
         start = newline + 1
-        if (skipping) {
-          skipping = false
-          yield pending
-        } else {
-          yield pending + piece
-        }
-        pending = ''
+        yield line.take()
       }
-      if (!skipping) {
-        pending += chunk.slice(start)
-        if (pending.length > maxChars) {
-          // One character past the limit, so the line is still seen as cut.
-          pending = pending.slice(0, maxChars + 1)
-          skipping = true
-        }
-      }
+      line.append(chunk.slice(start))
       if (done) break
     }
-    if (pending !== '') yield pending
+    if (!line.empty) yield line.take()
   } finally {
     await reader.cancel().catch((error: unknown) => {
       // The stream already ended or failed; the excerpt is complete either way.
