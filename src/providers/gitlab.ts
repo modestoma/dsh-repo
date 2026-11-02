@@ -9,16 +9,19 @@
 
 import { Gitlab } from '@gitbeaker/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiRunListOptions, CiState, CiTestCounts, CommentInfo, CommitAuthor, CommitInfo,
+  IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
-import { nextPage, titleOf, truncateBytes } from './types.ts'
+import { capFailures, errorText, nextPage, okBody, titleOf, truncateBytes } from './types.ts'
 import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitLab's maximum page size. */
 const MAX_PAGE = 100
 /** Pages of notes read for one watch poll. */
 const MAX_NOTE_PAGES = 10
+/** Pages of jobs read for one pipeline. */
+const MAX_JOB_PAGES = 10
 
 /** Prefix GitLab uses to mark a draft merge request in its title. */
 const DRAFT_PREFIX = 'Draft: '
@@ -122,7 +125,7 @@ function statusOf(data: GitlabMergeStatus): ChangeStatus {
   const pipeline = data.head_pipeline
   const checks: CheckInfo[] = pipeline === undefined || pipeline === null
     ? []
-    : [{ name: `pipeline #${pipeline.id}`, state: pipelineState(pipeline.status), ...pipeline.web_url === undefined ? {} : { webUrl: pipeline.web_url } }]
+    : [{ name: `pipeline #${pipeline.id}`, state: pipelineState(pipeline.status), ...pipeline.web_url === undefined ? {} : { webUrl: pipeline.web_url }, runId: pipeline.id }]
   const detailed = data.detailed_merge_status
   return {
     headSha: data.sha,
@@ -140,6 +143,166 @@ function pipelineState(status: string): CheckInfo['state'] {
   if (status === 'success' || status === 'skipped') return 'success'
   if (status === 'failed' || status === 'canceled') return 'failure'
   return 'pending'
+}
+
+/** Pipeline and job statuses as {@link CiState}. */
+function ciState(status: string): CiState {
+  switch (status) {
+    case 'running': return 'running'
+    case 'success': return 'success'
+    case 'failed': return 'failure'
+    case 'canceled':
+    case 'canceling': return 'canceled'
+    case 'skipped': return 'skipped'
+    case 'manual': return 'manual'
+    default: return 'pending'
+  }
+}
+
+/** {@link CiRunListOptions.state} as a GitLab pipeline status. */
+const PIPELINE_STATUS = { pending: 'pending', running: 'running', success: 'success', failure: 'failed', canceled: 'canceled' } as const
+
+interface GitlabPipeline {
+  readonly id: number
+  readonly project_id: number
+  readonly sha: string
+  readonly ref: string
+  readonly status: string
+  readonly source?: string
+  readonly name?: unknown
+  readonly created_at: string
+  readonly updated_at?: string
+  readonly web_url: string
+}
+
+interface GitlabPipelineDetail extends GitlabPipeline {
+  readonly started_at?: string | null
+  readonly finished_at?: string | null
+  readonly duration?: number | null
+  readonly yaml_errors?: unknown
+}
+
+function pipeline(value: GitlabPipeline): CiRun {
+  return {
+    id: value.id,
+    ...typeof value.name === 'string' && value.name !== '' ? { name: value.name } : {},
+    state: ciState(value.status),
+    status: value.status,
+    ref: value.ref,
+    sha: value.sha,
+    ...value.source === undefined ? {} : { event: value.source },
+    createdAt: value.created_at,
+    ...value.updated_at === undefined ? {} : { updatedAt: value.updated_at },
+    webUrl: value.web_url,
+  }
+}
+
+interface GitlabJob {
+  readonly id: number
+  readonly name: string
+  readonly stage?: string
+  readonly status: string
+  readonly allow_failure?: boolean
+  readonly failure_reason?: string | null
+  readonly started_at?: string | null
+  readonly finished_at?: string | null
+  readonly duration?: number | null
+  readonly web_url?: string
+}
+
+interface GitlabBridge extends GitlabJob {
+  readonly downstream_pipeline?: { readonly id: number; readonly project_id?: number; readonly status: string; readonly web_url: string } | null
+}
+
+function job(value: GitlabJob): CiJob {
+  return {
+    id: value.id,
+    name: value.name,
+    ...value.stage === undefined ? {} : { stage: value.stage },
+    state: ciState(value.status),
+    status: value.status,
+    allowFailure: value.allow_failure === true,
+    ...typeof value.failure_reason === 'string' && value.failure_reason !== '' ? { failureReason: value.failure_reason } : {},
+    ...typeof value.started_at === 'string' ? { startedAt: value.started_at } : {},
+    ...typeof value.finished_at === 'string' ? { finishedAt: value.finished_at } : {},
+    ...typeof value.duration === 'number' ? { durationSeconds: Math.round(value.duration) } : {},
+    ...value.web_url === undefined ? {} : { webUrl: value.web_url },
+  }
+}
+
+function bridge(value: GitlabBridge, projectId: number): CiJob {
+  const downstream = value.downstream_pipeline
+  if (downstream === undefined || downstream === null) return job(value)
+  return {
+    ...job(value),
+    downstream: {
+      id: downstream.id,
+      state: ciState(downstream.status),
+      status: downstream.status,
+      webUrl: downstream.web_url,
+      // Child pipelines run in the parent's project; without `project_id` (older GitLab) the project part of the URLs decides.
+      sameRepo: downstream.project_id === undefined ? sameProjectUrl(value.web_url, downstream.web_url) : downstream.project_id === projectId,
+    },
+  }
+}
+
+/** Whether two GitLab web URLs belong to the same project (the part before `/-/`). */
+function sameProjectUrl(a: string | undefined, b: string): boolean {
+  return a !== undefined && a.split('/-/')[0] === b.split('/-/')[0]
+}
+
+interface GitlabTestCase {
+  readonly status: string
+  readonly name: string
+  readonly classname?: string
+  readonly file?: string | null
+  readonly system_output?: unknown
+  readonly stack_trace?: unknown
+}
+
+interface GitlabTestReport {
+  readonly total_count: number
+  readonly success_count: number
+  readonly failed_count: number
+  readonly skipped_count: number
+  readonly error_count: number
+  readonly test_suites?: readonly { readonly name: string; readonly test_cases?: readonly GitlabTestCase[] }[]
+}
+
+/** A test case's failure output: GitLab sends `system_output` as text, as a list of lines, or not at all. */
+function testOutput(value: GitlabTestCase): string | undefined {
+  for (const field of [value.system_output, value.stack_trace]) {
+    if (typeof field === 'string' && field !== '') return field
+    if (Array.isArray(field) && field.length > 0) return field.map(String).join('\n')
+  }
+  return undefined
+}
+
+function testFailures(report: GitlabTestReport): CiFailure[] {
+  return (report.test_suites ?? []).flatMap(suite => (suite.test_cases ?? [])
+    .filter(test => test.status === 'failed' || test.status === 'error')
+    .map((test) => {
+      const message = testOutput(test)
+      return {
+        suite: suite.name,
+        name: test.classname === undefined || test.classname === '' ? test.name : `${test.classname} ${test.name}`,
+        ...message === undefined ? {} : { message },
+        ...typeof test.file === 'string' && test.file !== '' ? { path: test.file } : {},
+      }
+    }))
+}
+
+function testCounts(report: GitlabTestReport): CiTestCounts {
+  return { total: report.total_count, success: report.success_count, failed: report.failed_count, skipped: report.skipped_count, error: report.error_count }
+}
+
+function jobAction(value: GitlabJob & { readonly pipeline?: { readonly id: number } }): CiActionResult {
+  return {
+    ...value.pipeline === undefined ? {} : { runId: value.pipeline.id },
+    jobId: value.id,
+    state: ciState(value.status),
+    ...value.web_url === undefined ? {} : { webUrl: value.web_url },
+  }
 }
 
 /** What GitLab does with the source branch of a merged merge request; GitLab itself never deletes the default or a protected branch. */
@@ -164,7 +327,7 @@ export class GitlabProvider implements Provider {
    * @param token - resolves the host's token for every request.
    * @param timeoutMs - per-request timeout; GitBeaker takes no per-call signal.
    */
-  constructor(private readonly host: string, token: TokenSource, timeoutMs: number) {
+  constructor(private readonly host: string, private readonly token: TokenSource, timeoutMs: number) {
     this.api = new Gitlab({ host, token, queryTimeout: timeoutMs })
   }
 
@@ -432,6 +595,119 @@ export class GitlabProvider implements Provider {
     const merged = typeof sha === 'string' ? { sha } : {}
     if (!request.deleteSourceBranch) return merged
     return { ...merged, sourceBranch: fork ? { name: data.source_branch, deleted: false, reason: '源分支在 fork 项目里，不删除' } : mergedSource(data) }
+  }
+
+  /** Merge request pipelines come from their own endpoint, which filters nothing, so `state` is applied to the page read. */
+  async listRuns(ref: RepoRef, query: Paging & Pick<CiRunListOptions, 'ref' | 'sha' | 'change' | 'state'>, call: Call) {
+    call.signal.throwIfAborted()
+    const data: readonly GitlabPipeline[] = query.change === undefined
+      ? await this.api.Pipelines.all(ref.path, {
+        ...paging(query),
+        orderBy: 'id',
+        sort: 'desc',
+        ...query.ref === undefined ? {} : { ref: query.ref },
+        ...query.sha === undefined ? {} : { sha: query.sha },
+        ...query.state === undefined ? {} : { status: PIPELINE_STATUS[query.state] },
+      })
+      : await this.api.MergeRequests.allPipelines(ref.path, query.change, paging(query))
+    const runs = data.map(pipeline)
+    return { items: query.change === undefined || query.state === undefined ? runs : runs.filter(run => run.state === query.state), ...nextPage(query, data.length) }
+  }
+
+  /** Trigger jobs come from the bridges endpoint and follow the other jobs; the test report is read only for a failed pipeline. */
+  async getRun(ref: RepoRef, id: number, call: Call): Promise<CiRunDetail> {
+    call.signal.throwIfAborted()
+    const [detail, jobs, bridges] = await Promise.all([
+      this.api.Pipelines.show(ref.path, id),
+      this.allJobs(ref.path, id, undefined, call.signal),
+      this.api.Jobs.allPipelineBridges(ref.path, id),
+    ])
+    const data: GitlabPipelineDetail = detail
+    const run = pipeline(data)
+    let tests: CiTestCounts | undefined
+    let failures: CiFailure[] = []
+    let failuresError: string | undefined
+    if (run.state === 'failure') {
+      try {
+        call.signal.throwIfAborted()
+        const report: GitlabTestReport = await this.api.Pipelines.showTestReport(ref.path, id)
+        if (report.total_count > 0) {
+          tests = testCounts(report)
+          failures = testFailures(report)
+        }
+      } catch (error) {
+        if (call.signal.aborted) throw error
+        failuresError = `读取测试报告失败：${errorText(error)}`
+      }
+    }
+    return {
+      ...run,
+      ...typeof data.started_at === 'string' ? { startedAt: data.started_at } : {},
+      ...typeof data.finished_at === 'string' ? { finishedAt: data.finished_at } : {},
+      ...typeof data.duration === 'number' ? { durationSeconds: Math.round(data.duration) } : {},
+      ...typeof data.yaml_errors === 'string' && data.yaml_errors !== '' ? { yamlErrors: data.yaml_errors } : {},
+      jobs: [...jobs.items.map(job), ...bridges.map(entry => bridge(entry, data.project_id))],
+      jobsTruncated: jobs.truncated,
+      ...tests === undefined ? {} : { tests },
+      ...capFailures(failures, call.limits),
+      ...failuresError === undefined ? {} : { failuresError },
+    }
+  }
+
+  async failedJobs(ref: RepoRef, runId: number, call: Call) {
+    call.signal.throwIfAborted()
+    const [jobs, bridges] = await Promise.all([
+      this.allJobs(ref.path, runId, 'failed', call.signal),
+      this.api.Jobs.allPipelineBridges(ref.path, runId, { scope: 'failed' }),
+    ])
+    return [...jobs.items.map(job), ...bridges.map(entry => job(entry))]
+  }
+
+  /** GitBeaker returns a job log as one string, so the trace is requested directly and streamed. */
+  async jobLog(ref: RepoRef, jobId: number, call: Call) {
+    call.signal.throwIfAborted()
+    const data: GitlabJob = await this.api.Jobs.show(ref.path, jobId)
+    call.signal.throwIfAborted()
+    const response = await fetch(`${this.host}/api/v4/projects/${encodeURIComponent(ref.path)}/jobs/${jobId}/trace`, {
+      headers: { 'PRIVATE-TOKEN': await this.token() },
+      signal: call.signal,
+    })
+    return { job: job(data), body: await okBody(response) }
+  }
+
+  async retryRun(ref: RepoRef, runId: number, call: Call): Promise<CiActionResult> {
+    call.signal.throwIfAborted()
+    const data: GitlabPipeline = await this.api.Pipelines.retry(ref.path, runId)
+    return { runId: data.id, state: ciState(data.status), webUrl: data.web_url }
+  }
+
+  /** GitLab retries a job as a new job in the same pipeline. */
+  async retryJob(ref: RepoRef, jobId: number, call: Call): Promise<CiActionResult> {
+    call.signal.throwIfAborted()
+    return jobAction(await this.api.Jobs.retry(ref.path, jobId))
+  }
+
+  async cancelRun(ref: RepoRef, runId: number, call: Call): Promise<CiActionResult> {
+    call.signal.throwIfAborted()
+    const data: GitlabPipeline = await this.api.Pipelines.cancel(ref.path, runId)
+    return { runId: data.id, state: ciState(data.status), webUrl: data.web_url }
+  }
+
+  async cancelJob(ref: RepoRef, jobId: number, call: Call): Promise<CiActionResult> {
+    call.signal.throwIfAborted()
+    return jobAction(await this.api.Jobs.cancel(ref.path, jobId))
+  }
+
+  /** Every job of a pipeline (latest attempts), at most {@link MAX_JOB_PAGES} pages. */
+  private async allJobs(project: string, pipelineId: number, scope: 'failed' | undefined, signal: AbortSignal): Promise<{ items: GitlabJob[]; truncated: boolean }> {
+    const items: GitlabJob[] = []
+    for (let page = 1; page <= MAX_JOB_PAGES; page += 1) {
+      signal.throwIfAborted()
+      const batch: readonly GitlabJob[] = await this.api.Jobs.all(project, { pipelineId, ...scope === undefined ? {} : { scope }, perPage: MAX_PAGE, page, maxPages: 1 })
+      items.push(...batch)
+      if (batch.length < MAX_PAGE) return { items, truncated: false }
+    }
+    return { items, truncated: true }
   }
 
   /** User ids for usernames; GitLab assigns by id. */

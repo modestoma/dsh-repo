@@ -415,6 +415,8 @@ function AdvancedTab(form: FormProps): JSX.Element {
         {numberRow('maxTreeEntries')}
         {numberRow('maxFileBytes')}
         {numberRow('maxDiffBytes')}
+        {numberRow('maxLogBytes')}
+        {numberRow('maxCiFailures')}
       </Section>
     </>
   )

@@ -23,11 +23,28 @@ const itemSchema = z.object({
   path: z.string().optional(),
 }).strict()
 
+const failedJobSchema = z.object({
+  id: z.number().int(),
+  name: z.string(),
+  stage: z.string().optional(),
+  failureReason: z.string().optional(),
+}).strict()
+
+const ciFailureSchema = z.object({
+  name: z.string(),
+  runId: z.number().int().optional(),
+  jobId: z.number().int().optional(),
+  webUrl: z.string().optional(),
+  jobs: z.array(failedJobSchema).optional(),
+  jobsError: z.string().optional(),
+}).strict()
+
 const eventSchema = z.object({
   kind: z.enum(WATCH_EVENT_KINDS),
   at: z.string(),
   sha: z.string().optional(),
   checks: z.array(z.string()).optional(),
+  failures: z.array(ciFailureSchema).optional(),
   item: itemSchema.optional(),
 }).strict()
 

@@ -1,6 +1,6 @@
 /**
  * Types of the `dshRepos` service: provider-neutral access to code, issues,
- * and pull/merge requests on GitHub (github.com and GitHub Enterprise Server)
+ * pull/merge requests, and CI (GitLab pipelines, GitHub Actions) on GitHub (github.com and GitHub Enterprise Server)
  * and GitLab (gitlab.com and self-managed instances).
  *
  * This module has no runtime exports, and the package subpath
@@ -339,6 +339,10 @@ export interface CheckInfo {
   readonly name: string
   readonly state: Exclude<CheckState, 'none'>
   readonly webUrl?: string
+  /** The CI run behind the check, for {@link DshRepoService.getCiRun}: a GitLab pipeline or a GitHub Actions workflow run. */
+  readonly runId?: number
+  /** The GitHub Actions job behind a check run, for {@link DshRepoService.ciJobLog}. */
+  readonly jobId?: number
 }
 
 /** CI and merge readiness of a change request. */
@@ -348,6 +352,179 @@ export interface ChangeStatus {
   readonly overall: CheckState
   /** Whether the host reports the change request as mergeable now; absent while the host is still computing it. */
   readonly mergeable?: boolean
+}
+
+/**
+ * State of a CI run, job, or step: `pending` covers created, queued, waiting,
+ * and scheduled; `manual` waits for someone to start it (GitLab manual jobs,
+ * GitHub runs that need approval).
+ */
+export type CiState = 'pending' | 'running' | 'success' | 'failure' | 'canceled' | 'skipped' | 'manual'
+
+/** One CI run: a GitLab pipeline or a GitHub Actions workflow run. */
+export interface CiRun {
+  readonly id: number
+  /** GitHub: the workflow's name; GitLab: the pipeline's name when it has one. */
+  readonly name?: string
+  readonly state: CiState
+  /** The host's own status word, e.g. `failed`, `waiting_for_resource`, `timed_out`. */
+  readonly status: string
+  /** Branch or tag. */
+  readonly ref: string
+  readonly sha: string
+  /** What started it: GitLab `source` (`push`, `merge_request_event`, `schedule`, …), GitHub `event`. */
+  readonly event?: string
+  readonly createdAt: string
+  readonly updatedAt?: string
+  /** GitHub: attempt number, above 1 after a rerun. */
+  readonly attempt?: number
+  readonly webUrl: string
+}
+
+/** Filters of a CI run listing; newest first. */
+export interface CiRunListOptions extends PageOptions {
+  /** Branch or tag. */
+  readonly ref?: string
+  /** Full commit id. */
+  readonly sha?: string
+  /** Change request: on GitLab its pipelines, on GitHub the runs of its current head commit. Not with {@link ref} or {@link sha}. */
+  readonly change?: number
+  readonly state?: 'pending' | 'running' | 'success' | 'failure' | 'canceled'
+}
+
+/** One step of a GitHub Actions job. */
+export interface CiStep {
+  readonly number: number
+  readonly name: string
+  readonly state: CiState
+  readonly status: string
+}
+
+/** The pipeline a GitLab trigger job started. */
+export interface CiDownstream {
+  readonly id: number
+  readonly state: CiState
+  readonly status: string
+  readonly webUrl: string
+  /** Whether it belongs to the same repository, so its id works with that repository (child pipelines). */
+  readonly sameRepo: boolean
+}
+
+/** One CI job. */
+export interface CiJob {
+  readonly id: number
+  readonly name: string
+  /** GitLab stage. */
+  readonly stage?: string
+  readonly state: CiState
+  readonly status: string
+  /** GitLab: a failure of this job does not fail its pipeline. GitHub does not report it and gives false. */
+  readonly allowFailure: boolean
+  /** GitLab `failure_reason`, e.g. `script_failure`, `runner_system_failure`, `job_execution_timeout`. */
+  readonly failureReason?: string
+  readonly startedAt?: string
+  readonly finishedAt?: string
+  readonly durationSeconds?: number
+  readonly webUrl?: string
+  /** GitHub: the job's steps. */
+  readonly steps?: readonly CiStep[]
+  /** GitLab trigger job: the pipeline it started, once started. */
+  readonly downstream?: CiDownstream
+}
+
+/** One failed test case (GitLab test report) or failure annotation (GitHub). */
+export interface CiFailure {
+  /** GitHub: the job that reported it. */
+  readonly job?: string
+  /** GitLab: the test suite. */
+  readonly suite?: string
+  /** Test case name or annotation title. */
+  readonly name: string
+  /** Failure output or annotation message, cut to an equal share of the log limit per failure. */
+  readonly message?: string
+  readonly path?: string
+  readonly line?: number
+}
+
+/** Test counts of a GitLab pipeline's test report. */
+export interface CiTestCounts {
+  readonly total: number
+  readonly success: number
+  readonly failed: number
+  readonly skipped: number
+  readonly error: number
+}
+
+/** A CI run with its jobs and, for a failed run, what failed. */
+export interface CiRunDetail extends CiRun {
+  readonly startedAt?: string
+  readonly finishedAt?: string
+  readonly durationSeconds?: number
+  /** GitLab: why the CI configuration was rejected. */
+  readonly yamlErrors?: string
+  /** Jobs in the host's order (GitLab: trigger jobs last); only failed ones with `onlyFailed`. */
+  readonly jobs: readonly CiJob[]
+  /** Whether jobs past the read limit were left out. */
+  readonly jobsTruncated: boolean
+  /** GitLab: counts of the test report, read for failed pipelines that have one. */
+  readonly tests?: CiTestCounts
+  /** Failed test cases (GitLab) or failure annotations of failed jobs (GitHub), read for failed runs. */
+  readonly failures: readonly CiFailure[]
+  /** Whether failures past the configured limit were left out. */
+  readonly failuresTruncated: boolean
+  /** Why the test report or annotations could not be read; the jobs are still complete. */
+  readonly failuresError?: string
+}
+
+/** Options of {@link DshRepoService.ciJobLog}. */
+export interface CiLogOptions extends CallOptions {
+  /** Return the lines containing any of these texts (ignoring case), with context, instead of the end of the log. */
+  readonly search?: readonly string[]
+  /** Lines kept before and after each matching line; default 3, at most 50. */
+  readonly context?: number
+  /** Only lines inside a section whose title contains this text, ignoring case: a GitLab section (`step_script`, `after_script`, …) or a GitHub group (`Run npm test`). */
+  readonly section?: string
+  /** Without {@link search}: end before this line number, to read the part before an earlier excerpt. */
+  readonly beforeLine?: number
+}
+
+/** An excerpt of a job log; every excerpt is at most the configured log limit. */
+export interface CiJobLog {
+  readonly job: CiJob
+  /** Cleaned lines in the whole log; a running job's log is incomplete. */
+  readonly totalLines: number
+  /** Number of the first line in {@link text}; absent when nothing was selected. */
+  readonly fromLine?: number
+  /** Number of the last line in {@link text}. */
+  readonly toLine?: number
+  /**
+   * Without search: the selected lines at the end of the log. With search:
+   * matching lines and their context as `<number>: <text>`, separate
+   * excerpts divided by `--`. ANSI colors, redrawn progress lines, and
+   * timestamps are removed; section starts read `▶ <title>`.
+   */
+  readonly text: string
+  /** Without search: earlier lines were left out (pass `beforeLine: fromLine`); with search: later matches did not fit. */
+  readonly more: boolean
+  /** With search: the number of matching lines in the whole log. */
+  readonly matches?: number
+  /** Section titles in order of appearance, for {@link CiLogOptions.section}. */
+  readonly sections: readonly string[]
+  readonly sectionsTruncated: boolean
+}
+
+/** A run (`runId`) or a job (`jobId`) to retry or cancel. */
+export type CiTarget = { readonly runId: number; readonly jobId?: undefined } | { readonly jobId: number; readonly runId?: undefined }
+
+/** Outcome of {@link DshRepoService.retryCi} and {@link DshRepoService.cancelCi}. */
+export interface CiActionResult {
+  /** The run acted on; on GitHub a retried run keeps its id with a new attempt. */
+  readonly runId?: number
+  /** The job acted on, or the new job a GitLab job retry created. */
+  readonly jobId?: number
+  /** State after the request, when the host returned it. */
+  readonly state?: CiState
+  readonly webUrl?: string
 }
 
 /** Fields of a new change request. */
@@ -695,6 +872,35 @@ export interface DshRepoService {
    * @throws `not-found` when the branch does not exist, `forbidden` for the default or a protected branch, `conflict` when its head is not merged or a change request from it is open.
    */
   deleteMergedBranch(repo: RepoTarget, branch: string, options?: CallOptions): Promise<MergedBranchDeletion>
+
+  /** @returns one page of CI runs, newest first. */
+  listCiRuns(repo: RepoTarget, options?: CiRunListOptions): Promise<Page<CiRun>>
+  /**
+   * Read a CI run with its jobs; for a failed run also the failed tests (GitLab) or failure annotations (GitHub).
+   * @param runId - GitLab pipeline id or GitHub workflow run id.
+   * @param options - `onlyFailed` keeps only failed jobs.
+   * @returns the run.
+   */
+  getCiRun(repo: RepoTarget, runId: number, options?: CallOptions & { readonly onlyFailed?: boolean }): Promise<CiRunDetail>
+  /**
+   * Read an excerpt of a job's log: its end, or the lines matching a search.
+   * The log is streamed, so its size is bounded only by the call deadline.
+   * @param jobId - job id.
+   * @returns the job and the excerpt.
+   * @throws `invalid` for bad options, `not-found` for a missing job or log (GitHub serves a log only once the job finished).
+   */
+  ciJobLog(repo: RepoTarget, jobId: number, options?: CiLogOptions): Promise<CiJobLog>
+  /**
+   * Retry the failed jobs of a run, or one job.
+   * @returns what was retried.
+   */
+  retryCi(repo: RepoTarget, target: CiTarget, options?: CallOptions): Promise<CiActionResult>
+  /**
+   * Cancel a run, or one job (GitLab only).
+   * @returns what was canceled.
+   * @throws `invalid` for a job on GitHub, which cancels whole runs only.
+   */
+  cancelCi(repo: RepoTarget, target: CiTarget, options?: CallOptions): Promise<CiActionResult>
 
   /** @returns every host, configured ones first, with the status of its token. */
   listHosts(): Promise<readonly HostInfo[]>

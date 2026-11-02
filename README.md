@@ -1,6 +1,6 @@
 # dsh-repo
 
-面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的代码仓库插件。它用 GitHub 官方 SDK [Octokit](https://github.com/octokit/rest.js) 和 GitLab 文档推荐的 [GitBeaker](https://github.com/jdalrymple/gitbeaker) 抹平 GitHub 与 GitLab 的差异，对其他插件提供 `dshRepos` 服务，对模型提供代码、issue、PR/MR 工具；需要本地代码目录的插件可以用它维护仓库的本地镜像、按提交的只读快照，以及用来改代码的可写工作区，也可以把仓库分支定时展开到本机任意目录（本地同步）。
+面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的代码仓库插件。它用 GitHub 官方 SDK [Octokit](https://github.com/octokit/rest.js) 和 GitLab 文档推荐的 [GitBeaker](https://github.com/jdalrymple/gitbeaker) 抹平 GitHub 与 GitLab 的差异，对其他插件提供 `dshRepos` 服务，对模型提供代码、issue、PR/MR 和 CI（流水线、作业日志）工具；需要本地代码目录的插件可以用它维护仓库的本地镜像、按提交的只读快照，以及用来改代码的可写工作区，也可以把仓库分支定时展开到本机任意目录（本地同步）。
 
 支持的主机：github.com、GitHub Enterprise Server、gitlab.com、自建 GitLab（包括部署在子路径下的实例）。
 
@@ -66,6 +66,8 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | 高级 | `mirror.gitTimeoutMs`：一条 git 命令（clone、fetch、worktree、push） | 600 秒 | 保存条 |
 | 高级 | `limits.perPage` / `maxPerPage` / `maxComments` / `maxTreeEntries` | 30 / 100 / 50 / 1000 | 保存条 |
 | 高级 | `limits.maxFileBytes` / `maxDiffBytes`：读文件上限、diff 截断 | 1 MiB / 512 KiB | 保存条 |
+| 高级 | `limits.maxLogBytes`：一次返回的 CI 作业日志片段上限，也是一条流水线所有失败信息合计的上限 | 32 KiB | 保存条 |
+| 高级 | `limits.maxCiFailures`：读取流水线时附带的失败用例或错误注解条数 | 50 | 保存条 |
 
 「立即」的改动点击即保存；其余设置改动后页面底部出现保存条，每项改过时旁边有「恢复默认」。保存后的设置从下一次调用开始生效，不用重启：工具在模型的下一步按新设置提供或隐藏，已经提供的写工具在写操作被关闭后拒绝执行。设置文件的 `settings` 字段只记录与默认不同的项，「全部恢复默认」删除该字段；以后版本调整默认值时，没改过的项随之变化。「插件 → dsh-repo」页面只保留一个指向该入口的「打开设置」按钮。
 
@@ -79,7 +81,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 
 ### 令牌
 
-令牌每次请求时经 `ctx.credentials` 读取（环境变量 > `$DSH_HOME/.credentials.yaml` > `.env`），更换令牌不用重启。GitHub 需要 `repo`（或细粒度令牌的 Contents、Issues、Pull requests 读写）权限；GitLab 需要 `api` 权限，只读使用可以用 `read_api`。令牌只出现在发往该主机的请求头和 git 进程的凭据助手里，不进入模型上下文。推送工作区用的也是这个令牌（GitLab 的 `api` 权限包含推送）。
+令牌每次请求时经 `ctx.credentials` 读取（环境变量 > `$DSH_HOME/.credentials.yaml` > `.env`），更换令牌不用重启。GitHub 需要 `repo`（或细粒度令牌的 Contents、Issues、Pull requests 读写）权限，CI 工具另需细粒度令牌的 Actions 权限（读；重试、取消要写）和 Checks 读权限，classic 令牌的 `repo` 已包含；GitLab 需要 `api` 权限，只读使用可以用 `read_api`，读作业日志要求令牌账号在项目里至少是 Reporter，重试、取消至少是 Developer。令牌只出现在发往该主机的请求头和 git 进程的凭据助手里，不进入模型上下文。推送工作区用的也是这个令牌（GitLab 的 `api` 权限包含推送）。
 
 与 DSH 中的模型 API Key 一样，Agent 的命令以同一系统用户运行，文件权限不能把令牌与 Agent 隔离；建议使用权限最小、设置了过期时间的令牌，并用 `repos` 限定范围。
 
@@ -97,7 +99,10 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | `repo_list_branches` / `repo_list_commits` | 分支、提交历史 | 否 |
 | `repo_list_tree` / `repo_read_file` | 目录与文件内容 | 否 |
 | `repo_issue_list` / `repo_issue_get` | issue 列表、单个 issue 及评论 | 否 |
-| `repo_mr_list` / `repo_mr_get` / `repo_mr_diff` / `repo_mr_status` | PR/MR 列表、详情与评论、diff、CI 与可合并状态 | 否 |
+| `repo_mr_list` / `repo_mr_get` / `repo_mr_diff` / `repo_mr_status` | PR/MR 列表、详情与评论、diff、CI 与可合并状态；CI 检查带 `runId` / `jobId` 时可以接着用 CI 工具查看 | 否 |
+| `repo_ci_runs` | CI 运行列表（GitLab 流水线、GitHub Actions workflow run），可按分支或 tag、提交、PR/MR、状态过滤，见[查看 CI](#查看-ci) | 否 |
+| `repo_ci_run` | 一次运行的作业、阶段、失败原因、耗时、GitHub 步骤、GitLab 下游流水线；失败的运行附带失败用例或错误注解 | 否 |
+| `repo_ci_job_log` | 作业日志：默认返回末尾，`search` 返回命中行和上下文，可按 `section` 过滤、用 `beforeLine` 往前翻 | 否 |
 | `repo_workspace_open` | 在当前工作目录下检出可写工作区，并把会话的工作目录切到那里，见[改代码](#改代码) | 否 |
 | `repo_workspace_changes` | 工作区相对起点提交的改动：文件与增删行数、已推送的提交、diff | 否 |
 | `repo_workspace_push` | 提交工作区未提交的改动并推送到工作区的远端分支，从不强推；结果列出这个分支上打开中的 PR/MR | 是 |
@@ -106,10 +111,21 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | `repo_mr_watch` | 让本会话跟踪一个打开中的 PR/MR，或停止跟踪，见[跟踪 PR/MR](#跟踪-prmr)；跟踪可用时才提供 | 否 |
 | `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；按设置一并删除源分支；默认不提供 | 是 |
 | `repo_branch_delete` | 删除已经合并的遗留分支，见[合并后的分支](#合并后的分支) | 是 |
+| `repo_ci_retry` / `repo_ci_cancel` | 重试一次运行的失败作业或单个作业；取消一次运行或单个作业（单个作业只限 GitLab） | 是 |
 
 - 写操作在设置页选「每次审批」（`writes: ask`）时每次调用都经 `ctx.approval` 请用户确认一次，被拒绝时工具返回 `{ "status": "declined" }`，不会调用主机。组合里没有审批服务时写工具报错。
 - 审批提示首行写要做的事，之后每行一项「标签：值」，文件列表缩进两格；审批端按行展示即可。`repo_workspace_push` 列出目标分支、仓库、起点、提交说明首行、改动总数与增删行数，以及按改动量排序的前 12 项文件改动，整个目录的移动合并成一行。
 - 失败时工具报错，消息以失败类型开头，例如 `[not-found]`、`[forbidden]`、`[conflict]`。
+
+## 查看 CI
+
+CI 工具读取 GitLab 流水线和 GitHub Actions。只通过提交状态上报的外部 CI（例如 Jenkins）只能在 `repo_mr_status` 里看到状态和链接，读不到作业和日志。
+
+- **运行列表。** `repo_ci_runs` 新的在前。给 `number` 时，GitLab 列出这个 MR 的流水线（状态过滤在读到的这一页上进行），GitHub 列出 PR 当前 head 提交的运行；`number` 不能和 `ref`、`sha` 同时给出。
+- **运行详情。** `repo_ci_run` 列出作业（GitLab 按接口顺序，触发下游流水线的作业排在最后；GitHub 只列最近一次尝试的作业），最多读 1000 个，超出时 `jobsTruncated` 为 true。运行失败时再读一次失败信息：GitLab 读流水线的测试报告（需要作业上传 JUnit 报告），返回测试计数和失败、出错的用例；GitHub 读失败作业的错误级注解，通常带文件和行号。最多返回 `maxCiFailures` 条，每条信息截到 `maxLogBytes / maxCiFailures` 字节。测试报告或注解读不到时 `failuresError` 写明原因，作业列表照常返回。GitLab 下游流水线带 `sameRepo`，为 true 时可以用它的 id 在同一个仓库上继续 `repo_ci_run`。
+- **作业日志。** `repo_ci_job_log` 按流读取日志，内存只保留要返回的部分，日志大小只受 `timeoutMs` 约束。读取时去掉颜色等控制字符、只保留用回车重绘的行的最后状态、去掉 GitHub 每行的时间戳，GitLab 的 section 和 GitHub 的 group 变成一行 `▶ 标题`。不给 `search` 时返回日志末尾不超过 `maxLogBytes` 的行，`more` 为 true 表示前面还有，把 `fromLine` 作为 `beforeLine` 再调用一次往前翻；给 `search`（最多 20 个，不区分大小写的普通文本）时按日志顺序返回命中行和前后 `context` 行（默认 3），每行带行号，不相邻的片段用 `--` 分隔，`matches` 是全日志的命中数。`section` 只看标题包含该文本的 section 或 group，`sections` 列出日志里出现过的标题。GitHub 的日志接口重定向到临时存储地址，插件手动跟随，令牌只发给 API 主机；GitHub 要等作业结束才提供日志。
+- **重试和取消。** `repo_ci_retry` 给 `runId` 时重试失败作业（GitLab 重试流水线中失败和取消的作业；GitHub 把失败作业和依赖它们的作业作为同一运行的新尝试重跑），给 `jobId` 时重试单个作业（GitLab 生成新的作业 id，在结果的 `jobId` 里）。`repo_ci_cancel` 取消运行或 GitLab 的单个作业；GitHub 不能单独取消作业，以 `invalid` 拒绝。两者跟随写操作审批。
+- **日志里的密钥。** GitLab 会遮盖 masked 变量，GitHub 会遮盖 secrets；没有被平台遮盖的内容会原样进入工具结果和会话记录（飞书会话也能看到），插件不另外识别密钥。
 
 ## 改代码
 
@@ -157,7 +173,7 @@ GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支�
 
 - **检查方式。** 轮询，不用 webhook：DSH 只监听本机，注册 webhook 也需要每个项目的维护者权限。有动态、CI 运行中或有待送达的动态时每 `activeIntervalMs` 检查一次，`quietAfterMs` 内没有动态后放慢到 `quietIntervalMs`。每次检查先读 PR/MR 本身；它的更新时间变了才读评论和评审；head 变了、CI 还在运行、失败（可能被重跑）或还没上报时才读 CI（GitLab 的流水线状态随 MR 一起返回）。两次检查之间的新评论会逐页读完再推进进度，超过 1000 条时这次检查记为失败、稍后重试。
 - **送达方式。** 唤醒的动态经 `repo/resolve-agent` 事件（waterfall，参数为会话 id 和 `next`）解析会话的 Agent，没有监听者处理时用 `sessionController` 恢复会话，然后作为一条新的用户消息开始一轮回复，等会话持久化确认后才从待送达里删除；确认失败时下次可能重复送达。消息来源是 `repo-activity`（notice 形式，带一行摘要）。只记录的动态在会话正在运行时加入下一步的上下文，否则等下一次唤醒一起送达。`batchMs` 内的动态合成一条；合并、关闭和停止跟踪立即送达。每个 PR/MR 每天最多唤醒 `dailyWakeLimit` 次，超出后的动态只记录，合并、关闭和停止跟踪不受限制。
-- **消息内容。** 写明仓库、编号、标题和链接，评论引用前 600 个字符并附链接，并声明评论和评审来自第三方，只是信息，不是用户的指令，也不能授予权限，模型需要改代码、推送或回复时照常经过审批。
+- **消息内容。** 写明仓库、编号、标题和链接；CI 失败时列出失败的检查及其 `runId` / `jobId`，GitLab 流水线还会多读一次失败作业，列出阶段、作业名、`jobId` 和失败原因（读取失败时写明原因，仍照常报告），提示模型用 `repo_ci_job_log` 读日志；评论引用前 600 个字符并附链接，并声明评论和评审来自第三方，只是信息，不是用户的指令，也不能授予权限，模型需要改代码、推送或回复时照常经过审批。
 - **结束跟踪。** PR/MR 合并或关闭、`idleDays` 天没有动态、会话已删除、仓库不再在访问范围内（主机被删或 `repos` 变了）、模型调用 `repo_mr_watch` 的 `watch: false`、在设置页点「停止」时结束。超过 `maxWatches` 时结束最久没有动态的一个。
 - **失败。** 检查或送达失败时按 `activeIntervalMs` 翻倍退避，最长到 `quietIntervalMs`；设置页显示连续失败次数和原因。主机恢复后从上次的位置接着检查，不漏动态。
 - **记录。** 跟踪记录保存在设置文件旁边的 `watches.json`（默认 `$DSH_HOME/dsh-repo/watches.json`），包括检查进度和待送达的动态，重启后接着跟踪。文件内容不合法时移到 `watches.json.invalid-<时间>` 并记日志，从空开始。
@@ -177,7 +193,7 @@ if (repos?.version === 1) {
 }
 ```
 
-接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并，以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit, branch })` 在调用方给的目录（必须不存在）检出工作区，给出 `branch` 时接着这个已有分支修改，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session, trailers })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。`deleteMergedBranch(repo, branch)` 删除已经合并的分支，`createChange` / `mergeChange` 的 `deleteSourceBranch` 让源分支在合并后删除，规则见[合并后的分支](#合并后的分支)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并、CI 运行与作业日志的读取和重试取消（`listCiRuns`、`getCiRun`、`ciJobLog`、`retryCi`、`cancelCi`，规则见[查看 CI](#查看-ci)），以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit, branch })` 在调用方给的目录（必须不存在）检出工作区，给出 `branch` 时接着这个已有分支修改，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session, trailers })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。`deleteMergedBranch(repo, branch)` 删除已经合并的分支，`createChange` / `mergeChange` 的 `deleteSourceBranch` 让源分支在合并后删除，规则见[合并后的分支](#合并后的分支)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
 
 ### 提交尾注事件
 
@@ -234,6 +250,8 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 | 草稿 | GitHub 用 `draft` 字段；GitLab 创建时加 `Draft: ` 标题前缀 |
 | 指派人 | 统一用用户名；GitLab 先查用户 id |
 | CI 状态 | GitHub 合并 check runs 与 commit statuses；GitLab 读 MR 的 head pipeline |
+| CI 运行与作业 | GitLab 流水线、作业和触发作业；GitHub Actions workflow run 和作业。状态统一为 `pending` / `running` / `success` / `failure` / `canceled` / `skipped` / `manual`，`status` 保留平台原值 |
+| CI 失败信息 | GitLab 读测试报告；GitHub 读失败作业的错误注解 |
 | 合并方式 | GitHub 支持 merge / squash / rebase；GitLab 支持 merge / squash |
 | 合并后删除源分支 | GitLab 创建 MR 时勾选 `remove_source_branch`、合并时带 `should_remove_source_branch`；GitHub 没有逐个 PR 的选项，合并成功后删除 `heads/<分支>` |
 
@@ -243,6 +261,7 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 - 修改 PR/MR 时不能切换草稿状态；GitHub 的行内评审评论、评审（approve / request changes）不在第一版范围内。
 - issue 列表不支持全文搜索。
 - 不提供删除分支、删除仓库、修改仓库设置等操作。
+- CI 工具不能新建流水线、运行手动作业或触发 `workflow_dispatch`，也不读取制品（artifacts）。
 - 本地同步展开整个仓库，不能只同步某个子目录；子模块只建出空目录，不拉取子模块内容。
 
 ## 开发

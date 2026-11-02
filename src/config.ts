@@ -72,6 +72,10 @@ const limitsSchema = z.object({
   maxTreeEntries: bounded('maxTreeEntries').default(1000),
   /** Comments returned with one issue or PR/MR. */
   maxComments: bounded('maxComments').default(50),
+  /** Text of one CI job log excerpt, and of all failure messages of one CI run together. */
+  maxLogBytes: bounded('maxLogBytes').default(32 * 1024),
+  /** Failed test cases or failure annotations returned with one CI run. */
+  maxCiFailures: bounded('maxCiFailures').default(50),
 }).strict().superRefine((limits, issues) => {
   if (limits.perPage > limits.maxPerPage) issues.addIssue({ code: 'custom', path: ['perPage'], message: '默认每页条数不能大于每页上限' })
 })

@@ -52,8 +52,10 @@ describe('createTools', () => {
     expect([...tools().keys()]).toEqual([
       'repo_info', 'repo_list_branches', 'repo_list_commits', 'repo_list_tree', 'repo_read_file',
       'repo_issue_list', 'repo_issue_get', 'repo_mr_list', 'repo_mr_get', 'repo_mr_diff', 'repo_mr_status',
+      'repo_ci_runs', 'repo_ci_run', 'repo_ci_job_log',
       'repo_workspace_open', 'repo_workspace_changes', 'repo_mr_watch',
       'repo_workspace_push', 'repo_issue_create', 'repo_issue_update', 'repo_issue_comment', 'repo_mr_create', 'repo_mr_update', 'repo_mr_comment', 'repo_branch_delete',
+      'repo_ci_retry', 'repo_ci_cancel',
     ])
     expect(tools(testSettings({ tools: { writes: 'off', merge: true } })).has('repo_issue_create')).toBe(false)
     expect(tools(testSettings({ tools: { writes: 'off' } })).has('repo_workspace_push')).toBe(false)
@@ -100,6 +102,29 @@ describe('createTools', () => {
     expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ toolName: 'repo_branch_delete', reason: '删除已合并的分支\n仓库：github.com/a/b\n分支：f' }))
     await asked.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)
     expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ reason: expect.stringContaining('合并后删除源分支') }))
+  })
+
+  it('reads CI without approval and asks before retrying or canceling, naming the run or job', async () => {
+    const getCiRun = vi.fn(async () => ({ id: 42 }))
+    const ciJobLog = vi.fn(async () => ({ text: 'x' }))
+    const retryCi = vi.fn(async () => ({ runId: 42 }))
+    const cancelCi = vi.fn(async () => ({ jobId: 2 }))
+    const request = vi.fn(async () => 'allowed-once' as const)
+    const offered = tools(testSettings(), fakeService({ getCiRun, ciJobLog, retryCi, cancelCi }), { request })
+    await offered.get('repo_ci_run')!.execute({ repo: 'gitlab.example.com/g/p', runId: 42, onlyFailed: true }, exec)
+    expect(getCiRun).toHaveBeenCalledWith('gitlab.example.com/g/p', 42, { onlyFailed: true, signal: exec.signal })
+    await offered.get('repo_ci_job_log')!.execute({ repo: 'gitlab.example.com/g/p', jobId: 2, search: ['error'], section: 'step_script' }, exec)
+    expect(ciJobLog).toHaveBeenCalledWith('gitlab.example.com/g/p', 2, { search: ['error'], section: 'step_script', signal: exec.signal })
+    expect(request).not.toHaveBeenCalled()
+    expect(await offered.get('repo_ci_retry')!.execute({ repo: 'gitlab.example.com/g/p', runId: 42 }, exec)).toEqual({ runId: 42 })
+    expect(retryCi).toHaveBeenCalledWith('gitlab.example.com/g/p', { runId: 42 }, { signal: exec.signal })
+    expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ toolName: 'repo_ci_retry', reason: '重试 CI 流水线的失败作业\n仓库：gitlab.example.com/g/p\n流水线：42' }))
+    await offered.get('repo_ci_cancel')!.execute({ repo: 'gitlab.example.com/g/p', jobId: 2 }, exec)
+    expect(cancelCi).toHaveBeenCalledWith('gitlab.example.com/g/p', { jobId: 2 }, { signal: exec.signal })
+    expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ toolName: 'repo_ci_cancel', reason: '取消 CI 作业\n仓库：gitlab.example.com/g/p\n作业：2' }))
+    await expect(offered.get('repo_ci_retry')!.execute({ repo: 'gitlab.example.com/g/p', runId: 42, jobId: 2 }, exec)).rejects.toThrow(/\[invalid\].*runId and jobId/)
+    await expect(offered.get('repo_ci_cancel')!.execute({ repo: 'gitlab.example.com/g/p' }, exec)).rejects.toThrow(/\[invalid\]/)
+    expect(retryCi).toHaveBeenCalledTimes(1)
   })
 
   it('exposes JSON Schema parameters', () => {

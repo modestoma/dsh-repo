@@ -8,11 +8,12 @@
 
 import { Octokit } from '@octokit/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CheckState, CommentInfo, CommitAuthor, CommitInfo, IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
+  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CheckState, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiRunListOptions, CiState, CommentInfo, CommitAuthor, CommitInfo,
+  IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
-import { errorText, nextPage, titleOf, truncateBytes } from './types.ts'
-import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Provider, TokenSource } from './types.ts'
+import { capFailures, errorText, nextPage, okBody, titleOf, truncateBytes } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitHub's largest page. */
 const PAGE = 100
@@ -127,6 +128,98 @@ function checkRunState(status: string, conclusion: string | null): CheckInfo['st
     : 'success'
 }
 
+/** Run, job, and step status with conclusion as {@link CiState}. */
+function ciState(status: string | null, conclusion: string | null | undefined): CiState {
+  if (status === 'in_progress') return 'running'
+  if (status !== 'completed') return 'pending'
+  switch (conclusion) {
+    case 'success':
+    case 'neutral': return 'success'
+    case 'cancelled': return 'canceled'
+    case 'skipped':
+    case 'stale': return 'skipped'
+    case 'action_required': return 'manual'
+    case null:
+    case undefined: return 'pending'
+    default: return 'failure'
+  }
+}
+
+/** {@link CiRunListOptions.state} as a workflow run status filter. */
+const RUN_STATUS = { pending: 'queued', running: 'in_progress', success: 'success', failure: 'failure', canceled: 'cancelled' } as const
+
+/** The workflow run and job of a GitHub Actions check run, read off its URL. */
+const ACTIONS_JOB_URL = /\/actions\/runs\/(\d+)\/jobs?\/(\d+)/
+
+function actionsIds(url: string | null): { runId?: number; jobId?: number } {
+  const match = url === null ? null : ACTIONS_JOB_URL.exec(url)
+  return match === null ? {} : { runId: Number(match[1]), jobId: Number(match[2]) }
+}
+
+interface GithubRun {
+  readonly id: number
+  readonly name?: string | null
+  readonly status: string | null
+  readonly conclusion: string | null
+  readonly head_branch: string | null
+  readonly head_sha: string
+  readonly event: string
+  readonly created_at: string
+  readonly updated_at: string
+  readonly run_started_at?: string
+  readonly run_attempt?: number
+  readonly html_url: string
+}
+
+function workflowRun(value: GithubRun): CiRun {
+  return {
+    id: value.id,
+    ...value.name === undefined || value.name === null ? {} : { name: value.name },
+    state: ciState(value.status, value.conclusion),
+    status: value.conclusion ?? value.status ?? 'unknown',
+    ref: value.head_branch ?? '',
+    sha: value.head_sha,
+    event: value.event,
+    createdAt: value.created_at,
+    updatedAt: value.updated_at,
+    ...value.run_attempt === undefined ? {} : { attempt: value.run_attempt },
+    webUrl: value.html_url,
+  }
+}
+
+interface GithubJob {
+  readonly id: number
+  readonly name: string
+  readonly status: string
+  readonly conclusion: string | null
+  readonly started_at: string
+  readonly completed_at: string | null
+  readonly html_url: string | null
+  readonly steps?: readonly { readonly name: string; readonly status: string; readonly conclusion: string | null; readonly number: number }[]
+}
+
+function seconds(from: string | undefined, to: string | null | undefined): number | undefined {
+  if (from === undefined || to === undefined || to === null) return undefined
+  const span = Date.parse(to) - Date.parse(from)
+  return Number.isFinite(span) && span >= 0 ? Math.round(span / 1000) : undefined
+}
+
+function actionsJob(value: GithubJob): CiJob {
+  const duration = seconds(value.started_at, value.completed_at)
+  return {
+    id: value.id,
+    name: value.name,
+    state: ciState(value.status, value.conclusion),
+    status: value.conclusion ?? value.status,
+    allowFailure: false,
+    startedAt: value.started_at,
+    ...value.completed_at === null ? {} : { finishedAt: value.completed_at },
+    ...duration === undefined ? {} : { durationSeconds: duration },
+    ...value.html_url === null ? {} : { webUrl: value.html_url },
+    ...value.steps === undefined ? {} : { steps: value.steps.map(step => ({ number: step.number, name: step.name, state: ciState(step.status, step.conclusion), status: step.conclusion ?? step.status })) },
+  }
+}
+
 /** GitHub provider bound to one host. */
 export class GithubProvider implements Provider {
   private readonly octokit: Octokit
@@ -135,7 +228,7 @@ export class GithubProvider implements Provider {
    * @param baseUrl - REST base URL (`https://api.github.com` or `<url>/api/v3`).
    * @param token - resolves the host's token for every request.
    */
-  constructor(private readonly baseUrl: string, token: TokenSource) {
+  constructor(private readonly baseUrl: string, private readonly token: TokenSource) {
     this.octokit = new Octokit({
       baseUrl,
       userAgent: 'dsh-repo',
@@ -378,7 +471,7 @@ export class GithubProvider implements Provider {
       this.allPages(page => this.octokit.rest.repos.getCombinedStatusForRef({ ...repo, ref: sha, per_page: PAGE, page, request: { signal } }).then(response => response.data.statuses), 'CI 检查'),
     ])
     const checks: CheckInfo[] = [
-      ...runs.map(run => ({ name: run.name, state: checkRunState(run.status, run.conclusion), ...run.html_url === null ? {} : { webUrl: run.html_url } })),
+      ...runs.map(run => ({ name: run.name, state: checkRunState(run.status, run.conclusion), ...run.html_url === null ? {} : { webUrl: run.html_url }, ...actionsIds(run.html_url) })),
       ...statuses.map(status => ({
         name: status.context,
         state: status.state === 'success' ? 'success' as const : status.state === 'pending' ? 'pending' as const : 'failure' as const,
@@ -472,6 +565,122 @@ export class GithubProvider implements Provider {
       if ((error as { status?: number }).status === 422 && /Reference does not exist/i.test(errorText(error))) return { name, deleted: true }
       return { name, deleted: false, reason: `删除源分支失败：${errorText(error)}` }
     }
+  }
+
+  /** A change request selects the runs of its current head commit. */
+  async listRuns(ref: RepoRef, query: Paging & Pick<CiRunListOptions, 'ref' | 'sha' | 'change' | 'state'>, call: Call) {
+    const repo = split(ref.path)
+    const sha = query.change === undefined
+      ? query.sha
+      : (await this.octokit.rest.pulls.get({ ...repo, pull_number: query.change, request: { signal: call.signal } })).data.head.sha
+    const { data } = await this.octokit.rest.actions.listWorkflowRunsForRepo({
+      ...repo,
+      per_page: query.perPage,
+      page: query.page,
+      ...query.ref === undefined ? {} : { branch: query.ref },
+      ...sha === undefined ? {} : { head_sha: sha },
+      ...query.state === undefined ? {} : { status: RUN_STATUS[query.state] },
+      request: { signal: call.signal },
+    })
+    return { items: data.workflow_runs.map(workflowRun), ...nextPage(query, data.workflow_runs.length) }
+  }
+
+  /** Failure annotations are read only for a failed run, one request per failed job. */
+  async getRun(ref: RepoRef, id: number, call: Call): Promise<CiRunDetail> {
+    const repo = split(ref.path)
+    const [{ data }, jobs] = await Promise.all([
+      this.octokit.rest.actions.getWorkflowRun({ ...repo, run_id: id, request: { signal: call.signal } }),
+      this.runJobs(repo, id, call.signal),
+    ])
+    const run = workflowRun(data)
+    const mapped = jobs.items.map(actionsJob)
+    let failures: CiFailure[] = []
+    let failuresError: string | undefined
+    if (run.state === 'failure') {
+      try {
+        const failed = mapped.filter(entry => entry.state === 'failure')
+        const annotations = await Promise.all(failed.map(entry => this.octokit.rest.checks.listAnnotations({ ...repo, check_run_id: entry.id, per_page: PAGE, request: { signal: call.signal } })
+          .then(response => response.data.filter(note => note.annotation_level === 'failure').map((note): CiFailure => ({
+            job: entry.name,
+            name: note.title === null || note.title === undefined || note.title === '' ? entry.name : note.title,
+            ...note.message === null ? {} : { message: note.message },
+            // Annotations about the run itself ("Process completed with exit code 1") point at `.github`.
+            ...note.path === '' || note.path === '.github' ? {} : { path: note.path, line: note.start_line },
+          })))))
+        failures = annotations.flat()
+      } catch (error) {
+        if (call.signal.aborted) throw error
+        failuresError = `读取错误注解失败：${errorText(error)}`
+      }
+    }
+    const started = data.run_started_at
+    const finished = run.state === 'running' || run.state === 'pending' ? undefined : data.updated_at
+    const duration = seconds(started, finished)
+    return {
+      ...run,
+      ...started === undefined ? {} : { startedAt: started },
+      ...finished === undefined ? {} : { finishedAt: finished },
+      ...duration === undefined ? {} : { durationSeconds: duration },
+      jobs: mapped,
+      jobsTruncated: jobs.truncated,
+      ...capFailures(failures, call.limits),
+      ...failuresError === undefined ? {} : { failuresError },
+    }
+  }
+
+  async failedJobs(ref: RepoRef, runId: number, call: Call) {
+    const jobs = await this.runJobs(split(ref.path), runId, call.signal)
+    return jobs.items.map(actionsJob).filter(entry => entry.state === 'failure')
+  }
+
+  /**
+   * The log endpoint redirects to a short-lived storage URL; the redirect is
+   * followed by hand so the token is sent only to the API host.
+   */
+  async jobLog(ref: RepoRef, jobId: number, call: Call) {
+    const repo = split(ref.path)
+    const { data } = await this.octokit.rest.actions.getJobForWorkflowRun({ ...repo, job_id: jobId, request: { signal: call.signal } })
+    const response = await fetch(`${this.baseUrl}/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/actions/jobs/${jobId}/logs`, {
+      headers: { authorization: `token ${await this.token()}`, accept: 'application/vnd.github+json', 'user-agent': 'dsh-repo' },
+      redirect: 'manual',
+      signal: call.signal,
+    })
+    const location = response.headers.get('location')
+    const body = response.status >= 300 && response.status < 400 && location !== null
+      ? await okBody(await fetch(location, { signal: call.signal }))
+      : await okBody(response)
+    return { job: actionsJob(data), body }
+  }
+
+  /** Reruns the failed jobs (and the jobs depending on them) as a new attempt of the same run. */
+  async retryRun(ref: RepoRef, runId: number, call: Call): Promise<CiActionResult> {
+    await this.octokit.rest.actions.reRunWorkflowFailedJobs({ ...split(ref.path), run_id: runId, request: { signal: call.signal } })
+    return { runId }
+  }
+
+  async retryJob(ref: RepoRef, jobId: number, call: Call): Promise<CiActionResult> {
+    await this.octokit.rest.actions.reRunJobForWorkflowRun({ ...split(ref.path), job_id: jobId, request: { signal: call.signal } })
+    return { jobId }
+  }
+
+  async cancelRun(ref: RepoRef, runId: number, call: Call): Promise<CiActionResult> {
+    await this.octokit.rest.actions.cancelWorkflowRun({ ...split(ref.path), run_id: runId, request: { signal: call.signal } })
+    return { runId }
+  }
+
+  async cancelJob(_ref: RepoRef, _jobId: number, _call: Call): Promise<CiActionResult> {
+    throw new RepoError('invalid', 'GitHub Actions 不能单独取消一个作业，只能取消整个运行（传 runId）')
+  }
+
+  /** Jobs of a run's latest attempt, at most {@link MAX_STATUS_PAGES} pages. */
+  private async runJobs(repo: { owner: string; repo: string }, runId: number, signal: AbortSignal): Promise<{ items: GithubJob[]; truncated: boolean }> {
+    const items: GithubJob[] = []
+    for (let page = 1; page <= MAX_STATUS_PAGES; page += 1) {
+      const { data } = await this.octokit.rest.actions.listJobsForWorkflowRun({ ...repo, run_id: runId, filter: 'latest', per_page: PAGE, page, request: { signal } })
+      items.push(...data.jobs)
+      if (data.jobs.length < PAGE) return { items, truncated: false }
+    }
+    return { items, truncated: true }
   }
 
   /** Every page of a list endpoint, so an aggregate never rests on a partial list. */

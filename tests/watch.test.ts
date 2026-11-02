@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } fro
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ChangeInfo, ChangeStatus } from '../src/contract.ts'
+import type { ChangeInfo, ChangeStatus, CiJob } from '../src/contract.ts'
 import type { ActivityItem, ChangeActivity } from '../src/providers/types.ts'
 import type { HostContext, LiveAgent, UserMessage } from '../src/host.ts'
 import { detect, freshCursor, renderMessage, watchId } from '../src/watch/activity.ts'
@@ -58,7 +58,7 @@ describe('detect', () => {
 
   it('reports a CI failure once per set of failed checks, and a pass after waiting', () => {
     const first = detect(record(), activity({ status: status('failure', ['build']) }), now)
-    expect(first.events).toEqual([{ kind: 'ciFailed', at: now, sha: SHA, checks: ['build'] }])
+    expect(first.events).toEqual([{ kind: 'ciFailed', at: now, sha: SHA, checks: ['build'], failures: [{ name: 'build' }] }])
     const again = detect(record({ cursor: first.cursor }), activity({ status: status('failure', ['build']) }), now)
     expect(again.events).toEqual([])
     expect(detect(record({ cursor: first.cursor }), activity({ status: status('failure', ['build', 'lint']) }), now).events.map(event => event.checks)).toEqual([['build', 'lint']])
@@ -76,7 +76,7 @@ describe('detect', () => {
       ],
     })
     const first = detect(record(), activity({ status: running(['build'], ['lint']) }), now)
-    expect(first.events).toEqual([{ kind: 'ciFailed', at: now, sha: SHA, checks: ['build'] }])
+    expect(first.events).toEqual([{ kind: 'ciFailed', at: now, sha: SHA, checks: ['build'], failures: [{ name: 'build' }] }])
     expect(first.cursor).toMatchObject({ checks: 'pending', failing: ['build'] })
     const second = detect(record({ cursor: first.cursor }), activity({ status: running(['build', 'lint'], []) }), now)
     expect(second.events.map(event => event.checks)).toEqual([['build', 'lint']])
@@ -159,7 +159,8 @@ function harness(settings: Record<string, unknown> = {}, outcomes: DeliveryOutco
     }),
   }
   const store = new WatchStore(file)
-  const service = { resolve: () => ({ kind: 'github' as const, host: 'github.com', path: 'a/b', webUrl: 'https://github.com/a/b' }), changeActivity }
+  const failedCiJobs = vi.fn(async (): Promise<CiJob[]> => [])
+  const service = { resolve: () => ({ kind: 'github' as const, host: 'github.com', path: 'a/b', webUrl: 'https://github.com/a/b' }), changeActivity, failedCiJobs }
   const watcher = new ChangeWatcher({ service, store, settings: () => current, delivery })
   /** Let `ms` pass a second at a time, letting each poll's file writes finish before the next timer. */
   const advance = async (ms: number): Promise<void> => {
@@ -169,7 +170,7 @@ function harness(settings: Record<string, unknown> = {}, outcomes: DeliveryOutco
     }
   }
   return {
-    file, store, watcher, changeActivity, delivery, deliveries, advance,
+    file, store, watcher, changeActivity, failedCiJobs, delivery, deliveries, advance,
     setPoll: (next: ChangeActivity | Error) => { poll = next },
     setSettings: (next: Record<string, unknown>) => { current = testSettings({ watch: next }).watch },
   }
@@ -360,6 +361,44 @@ describe('ChangeWatcher', () => {
   })
 })
 
+describe('ChangeWatcher CI failures', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(START)
+  })
+  afterEach(() => { vi.useRealTimers() })
+
+  it('lists the failed jobs of a failed pipeline with the ids the CI tools take', async () => {
+    const h = harness({ batchMs: 0 })
+    h.failedCiJobs.mockResolvedValueOnce([
+      { id: 901, name: 'build:linux', stage: 'build', state: 'failure', status: 'failed', allowFailure: false, failureReason: 'script_failure' },
+      { id: 902, name: 'unit', state: 'failure', status: 'failed', allowFailure: false },
+    ])
+    h.watcher.start()
+    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    h.setPoll(activity({ status: { headSha: SHA, overall: 'failure', checks: [{ name: 'pipeline #42', state: 'failure', runId: 42 }, { name: 'lint', state: 'failure', runId: 7, jobId: 8 }] } }))
+    await h.advance(60_000)
+    expect(h.failedCiJobs).toHaveBeenCalledTimes(1)
+    expect(h.failedCiJobs).toHaveBeenCalledWith('github.com/a/b', 42, expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    const text = h.deliveries[0]!.text
+    expect(text).toContain('  - pipeline #42（runId 42）\n    - build / build:linux（jobId 901，script_failure）\n    - unit（jobId 902）')
+    expect(text).toContain('  - lint（runId 7，jobId 8）')
+    expect(text).toContain('repo_ci_job_log')
+    await h.watcher.stop()
+  })
+
+  it('still reports the failure when its jobs cannot be read', async () => {
+    const h = harness({ batchMs: 0 })
+    h.failedCiJobs.mockRejectedValueOnce(new Error('[forbidden] 令牌没有权限'))
+    h.watcher.start()
+    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    h.setPoll(activity({ status: { headSha: SHA, overall: 'failure', checks: [{ name: 'pipeline #42', state: 'failure', runId: 42 }] } }))
+    await h.advance(60_000)
+    expect(h.deliveries[0]!.text).toContain('    - 没能读取失败作业：[forbidden] 令牌没有权限')
+    await h.watcher.stop()
+  })
+})
+
 describe('WatchStore', () => {
   it('sets an invalid file aside and starts empty', () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-repo-watch-store-'))
@@ -370,6 +409,13 @@ describe('WatchStore', () => {
     expect(existsSync(file)).toBe(false)
     expect(readdirSync(dir).some(name => name.startsWith('watches.json.invalid-'))).toBe(true)
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('内容不合法'))
+  })
+
+  it('keeps undelivered CI failures with their jobs across a restart', async () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'dsh-repo-watch-store-')), 'watches.json')
+    const failures = [{ name: 'pipeline #42', runId: 42, jobs: [{ id: 901, name: 'build', stage: 'build', failureReason: 'script_failure' }] }, { name: 'p', runId: 43, jobsError: 'x' }]
+    await new WatchStore(file).update(() => [record({ pending: [{ kind: 'ciFailed', at: 'x', sha: SHA, checks: ['pipeline #42', 'p'], failures }] })])
+    expect(new WatchStore(file).all()[0]?.pending[0]?.failures).toEqual(failures)
   })
 })
 
