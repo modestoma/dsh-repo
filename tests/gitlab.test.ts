@@ -90,7 +90,7 @@ describe('GitLab provider', () => {
       { method: 'PUT', path: `${API}/merge_requests/7/merge`, reply: { body: mr({ state: 'merged', merge_commit_sha: 'm1' }) } },
     ])
     const service = createService(testConfig(), TOKENS)
-    expect(await service.changeStatus(REPO, 7)).toEqual({ headSha: SHA, checks: [{ name: 'pipeline #9', state: 'failure', webUrl: 'p' }], overall: 'failure', mergeable: true })
+    expect(await service.changeStatus(REPO, 7)).toEqual({ headSha: SHA, checks: [{ name: 'pipeline #9', state: 'failure', webUrl: 'p', runId: 9 }], overall: 'failure', mergeable: true })
     expect(await service.mergeChange(REPO, 7, { headSha: SHA, method: 'squash' })).toEqual({ sha: 'm1' })
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, squash: true })
     await expect(service.mergeChange(REPO, 7, { headSha: SHA, method: 'rebase' })).rejects.toMatchObject({ code: 'invalid' })
@@ -205,5 +205,114 @@ describe('GitLab token account', () => {
     expect(polled.items).toHaveLength(110)
     expect(polled.items?.[0]?.id).toBe('391')
     expect(requests.filter(request => request.url.pathname.endsWith('/notes'))).toHaveLength(2)
+  })
+})
+
+describe('GitLab CI', () => {
+  const pipelineBody = (overrides: Record<string, unknown> = {}) => ({
+    id: 42, iid: 3, project_id: 11, sha: SHA, ref: 'main', status: 'failed', source: 'push', created_at: 'c', updated_at: 'u', web_url: `${REPO}/-/pipelines/42`, ...overrides,
+  })
+  const jobBody = (id: number, overrides: Record<string, unknown> = {}) => ({
+    id, name: `job-${id}`, stage: 'test', status: 'success', allow_failure: false, started_at: 's', finished_at: 'f', duration: 12.4, web_url: `${REPO}/-/jobs/${id}`, pipeline: { id: 42 }, ...overrides,
+  })
+
+  it('lists pipelines newest first with filters, and an MR\'s pipelines filtered by state', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/pipelines`, reply: { body: [pipelineBody()] } },
+      { method: 'GET', path: `${API}/merge_requests/7/pipelines`, reply: { body: [pipelineBody({ id: 43, status: 'running' }), pipelineBody()] } },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    expect(await service.listCiRuns(REPO, { ref: 'main', state: 'failure', perPage: 1 })).toEqual({
+      items: [{ id: 42, state: 'failure', status: 'failed', ref: 'main', sha: SHA, event: 'push', createdAt: 'c', updatedAt: 'u', webUrl: `${REPO}/-/pipelines/42` }],
+      nextPage: 2,
+    })
+    expect(Object.fromEntries(requests[0]!.url.searchParams)).toMatchObject({ ref: 'main', status: 'failed', order_by: 'id', sort: 'desc', per_page: '1', page: '1' })
+    expect((await service.listCiRuns(REPO, { change: 7, state: 'running' })).items.map(run => run.id)).toEqual([43])
+    await expect(service.listCiRuns(REPO, { change: 7, ref: 'main' })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(service.listCiRuns(REPO, { sha: 'abc' })).rejects.toMatchObject({ code: 'invalid' })
+  })
+
+  it('reads a failed pipeline with its jobs, trigger jobs, and failed tests cut to the limits', async () => {
+    const report = {
+      total_count: 3, success_count: 1, failed_count: 1, skipped_count: 0, error_count: 1,
+      test_suites: [{ name: 'unit', test_cases: [
+        { status: 'success', name: 'ok', classname: 'A' },
+        { status: 'failed', name: 'adds', classname: 'Math', file: 'src/math.ts', system_output: 'x'.repeat(100) },
+        { status: 'error', name: 'boots', classname: '', stack_trace: ['line 1', 'line 2'] },
+      ] }],
+    }
+    fakeHttp([
+      { method: 'GET', path: `${API}/pipelines/42`, reply: { body: pipelineBody({ started_at: 's', finished_at: 'f', duration: 61, yaml_errors: null }) } },
+      { method: 'GET', path: `${API}/pipelines/42/jobs`, reply: { body: [jobBody(1), jobBody(2, { status: 'failed', failure_reason: 'script_failure' })] } },
+      { method: 'GET', path: `${API}/pipelines/42/bridges`, reply: { body: [jobBody(3, { name: 'deploy', stage: 'deploy', status: 'failed', downstream_pipeline: { id: 50, project_id: 11, status: 'failed', web_url: `${REPO}/-/pipelines/50` } })] } },
+      { method: 'GET', path: `${API}/pipelines/42/test_report`, reply: { body: report } },
+    ])
+    const service = createService(testConfig(), TOKENS, testSettings({ limits: { maxLogBytes: 1024, maxCiFailures: 2 } }))
+    const run = await service.getCiRun(REPO, 42)
+    expect(run).toMatchObject({ id: 42, state: 'failure', startedAt: 's', finishedAt: 'f', durationSeconds: 61, jobsTruncated: false, tests: { total: 3, failed: 1, error: 1 }, failuresTruncated: false })
+    expect(run.yamlErrors).toBeUndefined()
+    expect(run.jobs.map(job => [job.id, job.state, job.failureReason])).toEqual([[1, 'success', undefined], [2, 'failure', 'script_failure'], [3, 'failure', undefined]])
+    expect(run.jobs[0]).toMatchObject({ stage: 'test', durationSeconds: 12, allowFailure: false })
+    expect(run.jobs[2]?.downstream).toEqual({ id: 50, state: 'failure', status: 'failed', webUrl: `${REPO}/-/pipelines/50`, sameRepo: true })
+    expect(run.failures).toEqual([
+      { suite: 'unit', name: 'Math adds', path: 'src/math.ts', message: 'x'.repeat(100) },
+      { suite: 'unit', name: 'boots', message: 'line 1\nline 2' },
+    ])
+    expect((await createService(testConfig(), TOKENS, testSettings({ limits: { maxLogBytes: 1024, maxCiFailures: 1 } })).getCiRun(REPO, 42, { onlyFailed: true })).failuresTruncated).toBe(true)
+    const only = await service.getCiRun(REPO, 42, { onlyFailed: true })
+    expect(only.jobs.map(job => job.id)).toEqual([2, 3])
+  })
+
+  it('still returns the jobs when the test report cannot be read', async () => {
+    fakeHttp([
+      { method: 'GET', path: `${API}/pipelines/42`, reply: { body: pipelineBody() } },
+      { method: 'GET', path: `${API}/pipelines/42/jobs`, reply: { body: [jobBody(2, { status: 'failed' })] } },
+      { method: 'GET', path: `${API}/pipelines/42/bridges`, reply: { body: [] } },
+      { method: 'GET', path: `${API}/pipelines/42/test_report`, reply: { status: 403, body: { message: '403 Forbidden' } } },
+    ])
+    const run = await createService(testConfig(), TOKENS).getCiRun(REPO, 42)
+    expect(run.jobs).toHaveLength(1)
+    expect(run.failures).toEqual([])
+    expect(run.failuresError).toMatch(/读取测试报告失败/)
+  })
+
+  it('streams a job trace with the host token and cleans it', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/jobs/2`, reply: { body: jobBody(2, { status: 'failed' }) } },
+      { method: 'GET', path: `${API}/jobs/2/trace`, reply: { body: 'section_start:1:step_script\r\x1b[0K$ make\n\x1b[31merror: boom\x1b[0m\nsection_end:2:step_script\r\x1b[0K\n' } },
+    ])
+    const log = await createService(testConfig(), TOKENS).ciJobLog(REPO, 2, { search: ['ERROR'] })
+    expect(log).toMatchObject({ job: { id: 2, state: 'failure' }, totalLines: 2, matches: 1, text: '1: ▶ step_script: $ make\n2: error: boom', sections: ['step_script'] })
+    expect(requests.at(-1)?.url.href).toBe('https://code.example.com/gitlab/api/v4/projects/team%2Fbackend%2Forders/jobs/2/trace')
+    expect(requests.at(-1)?.headers.get('private-token')).toBe('gl-token')
+  })
+
+  it('classifies a refused trace and rejects bad log options before calling the host', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/jobs/2`, reply: { body: jobBody(2) } },
+      { method: 'GET', path: `${API}/jobs/2/trace`, reply: { status: 403, body: 'forbidden' } },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    await expect(service.ciJobLog(REPO, 2)).rejects.toMatchObject({ code: 'forbidden' })
+    const sent = requests.length
+    await expect(service.ciJobLog(REPO, 2, { search: ['x'], beforeLine: 3 })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(service.ciJobLog(REPO, 2, { context: 51 })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(service.ciJobLog(REPO, 0)).rejects.toMatchObject({ code: 'invalid' })
+    expect(requests).toHaveLength(sent)
+  })
+
+  it('retries and cancels pipelines and jobs', async () => {
+    const { requests } = fakeHttp([
+      { method: 'POST', path: `${API}/pipelines/42/retry`, reply: { status: 201, body: pipelineBody({ status: 'running' }) } },
+      { method: 'POST', path: `${API}/pipelines/42/cancel`, reply: { body: pipelineBody({ status: 'canceled' }) } },
+      { method: 'POST', path: `${API}/jobs/2/retry`, reply: { status: 201, body: jobBody(9, { status: 'pending' }) } },
+      { method: 'POST', path: `${API}/jobs/2/cancel`, reply: { body: jobBody(2, { status: 'canceled' }) } },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    expect(await service.retryCi(REPO, { runId: 42 })).toEqual({ runId: 42, state: 'running', webUrl: `${REPO}/-/pipelines/42` })
+    expect(await service.cancelCi(REPO, { runId: 42 })).toMatchObject({ runId: 42, state: 'canceled' })
+    expect(await service.retryCi(REPO, { jobId: 2 })).toEqual({ runId: 42, jobId: 9, state: 'pending', webUrl: `${REPO}/-/jobs/9` })
+    expect(await service.cancelCi(REPO, { jobId: 2 })).toMatchObject({ jobId: 2, state: 'canceled' })
+    expect(requests.map(request => request.url.pathname.split('/').slice(-3).join('/'))).toEqual(['pipelines/42/retry', 'pipelines/42/cancel', 'jobs/2/retry', 'jobs/2/cancel'])
   })
 })

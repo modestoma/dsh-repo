@@ -1,6 +1,7 @@
 /**
- * Model tools over the `dshRepos` service: read code, history, issues, and
- * pull/merge requests, and, after the user approves each call, write them.
+ * Model tools over the `dshRepos` service: read code, history, issues,
+ * pull/merge requests, and CI runs and job logs, and, after the user approves
+ * each call, write them or retry and cancel CI.
  *
  * - Every tool takes `repo` (URL or `host/path`); only configured hosts and
  *   repositories are reachable.
@@ -22,7 +23,7 @@ import type { RepoSettings } from './config.ts'
 import { RepoError } from './errors.ts'
 import { lstat, readFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import type { ChangeInfo, CommitDetails, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
+import type { ChangeInfo, CiTarget, CommitDetails, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
 import type { Agent, ContentBlock, HostApproval, ToolDefinition, ToolRunContext, WorkingDirectoryService } from './host.ts'
 import type { WatchInfo } from './settings/contract.ts'
 import type { TrackRequest } from './watch/watcher.ts'
@@ -67,6 +68,10 @@ const page = z.number().int().min(1).optional().describe('1-based page, default 
 const perPage = z.number().int().min(1).max(100).optional().describe('Items per page')
 const labels = z.array(z.string().min(1)).optional()
 const assignees = z.array(z.string().min(1)).optional().describe('Usernames')
+const runId = z.number().int().min(1).describe('CI run id: GitLab pipeline id or GitHub Actions workflow run id (from repo_ci_runs, or runId in repo_mr_status checks)')
+const jobId = z.number().int().min(1).describe('CI job id (from repo_ci_run, or jobId in repo_mr_status checks)')
+const ciTarget = z.object({ repo, runId: runId.optional(), jobId: jobId.optional() }).strict()
+  .refine(args => (args.runId === undefined) !== (args.jobId === undefined), { message: 'Give exactly one of runId and jobId' })
 const changeBody = z.string().optional().describe('Description for reviewers: what changed and why, how it was verified, and anything risky or left undone. Keep it short; link issues instead of restating them; never paste conversation transcripts')
 
 /** Approval prompt text. */
@@ -188,6 +193,53 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       description: 'Read CI checks/pipeline and mergeability of a pull/merge request, with its head SHA.',
       schema: z.object({ repo, number }).strict(),
       run: (args, signal) => service.changeStatus(args.repo, args.number, { signal }),
+    }),
+    define(deps, {
+      name: 'repo_ci_runs',
+      description: 'List CI runs newest first: GitLab pipelines or GitHub Actions workflow runs, optionally on a branch/tag, a commit, or a PR/MR (GitLab: the MR\'s pipelines; GitHub: runs of the PR\'s current head commit). External CI that only reports commit statuses (e.g. Jenkins) is not listed; repo_mr_status shows its status and link.',
+      schema: z.object({
+        repo,
+        ref: z.string().min(1).optional().describe('Branch or tag'),
+        sha: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/).optional().describe('Full commit id'),
+        number: number.optional().describe('PR/MR number; not with ref or sha'),
+        state: z.enum(['pending', 'running', 'success', 'failure', 'canceled']).optional(),
+        page,
+        perPage,
+      }).strict(),
+      run: (args, signal) => service.listCiRuns(args.repo, {
+        ...args.ref === undefined ? {} : { ref: args.ref },
+        ...args.sha === undefined ? {} : { sha: args.sha },
+        ...args.number === undefined ? {} : { change: args.number },
+        ...args.state === undefined ? {} : { state: args.state },
+        ...args.page === undefined ? {} : { page: args.page },
+        ...args.perPage === undefined ? {} : { perPage: args.perPage },
+        signal,
+      }),
+    }),
+    define(deps, {
+      name: 'repo_ci_run',
+      description: 'Read one CI run with its jobs (stage, state, GitLab failure reason, duration, GitHub steps, GitLab child/downstream pipelines). For a failed run it also returns the failed test cases of the GitLab test report or the error annotations of the failed GitHub jobs, which often name the failing file and line. Then read a failed job\'s log with repo_ci_job_log.',
+      schema: z.object({ repo, runId, onlyFailed: z.boolean().optional().describe('Return only failed jobs') }).strict(),
+      run: (args, signal) => service.getCiRun(args.repo, args.runId, { ...args.onlyFailed === undefined ? {} : { onlyFailed: args.onlyFailed }, signal }),
+    }),
+    define(deps, {
+      name: 'repo_ci_job_log',
+      description: 'Read a CI job\'s log, cleaned of colors, progress redraws, and timestamps. By default returns the end of the log, where build and test errors usually are; with `search`, returns the matching lines with numbered context instead. Each call returns at most the configured log limit: page back with beforeLine = fromLine, narrow with `section` (titles are listed in `sections`), or search for error text such as "error", "FAILED", or a test name. GitHub serves a log only after the job finished.',
+      schema: z.object({
+        repo,
+        jobId,
+        search: z.array(z.string().min(1).max(200)).max(20).optional().describe('Return lines containing any of these texts (case-insensitive)'),
+        context: z.number().int().min(0).max(50).optional().describe('Lines around each match, default 3'),
+        section: z.string().min(1).max(200).optional().describe('Only lines in sections whose title contains this text, e.g. step_script (GitLab) or "Run npm test" (GitHub)'),
+        beforeLine: z.number().int().min(1).optional().describe('Without search: end before this line number, to read earlier lines'),
+      }).strict(),
+      run: (args, signal) => service.ciJobLog(args.repo, args.jobId, {
+        ...args.search === undefined ? {} : { search: args.search },
+        ...args.context === undefined ? {} : { context: args.context },
+        ...args.section === undefined ? {} : { section: args.section },
+        ...args.beforeLine === undefined ? {} : { beforeLine: args.beforeLine },
+        signal,
+      }),
     }),
     define(deps, {
       name: 'repo_workspace_open',
@@ -341,6 +393,24 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       describe: args => ({ zh: `删除已合并的分支\n仓库：${args.repo}\n分支：${args.branch}`, en: `Delete a merged branch\nRepository: ${args.repo}\nBranch: ${args.branch}` }),
       run: (args, signal) => service.deleteMergedBranch(args.repo, args.branch, { signal }),
     }),
+    define(deps, {
+      name: 'repo_ci_retry',
+      description: 'Retry CI: with runId, the failed jobs of a run (GitLab: retries failed and canceled jobs of the pipeline; GitHub: reruns failed jobs and the jobs depending on them as a new attempt); with jobId, one job. Retry only failures that look flaky or environmental; fix code failures instead. Requires user approval.',
+      schema: ciTarget,
+      describe: args => args.runId === undefined
+        ? { zh: `重试 CI 作业\n仓库：${args.repo}\n作业：${args.jobId}`, en: `Retry a CI job\nRepository: ${args.repo}\nJob: ${args.jobId}` }
+        : { zh: `重试 CI 流水线的失败作业\n仓库：${args.repo}\n流水线：${args.runId}`, en: `Retry the failed jobs of a CI run\nRepository: ${args.repo}\nRun: ${args.runId}` },
+      run: (args, signal) => service.retryCi(args.repo, ciTargetOf(args), { signal }),
+    }),
+    define(deps, {
+      name: 'repo_ci_cancel',
+      description: 'Cancel a running CI run (runId) or, on GitLab only, one job (jobId). Requires user approval.',
+      schema: ciTarget,
+      describe: args => args.runId === undefined
+        ? { zh: `取消 CI 作业\n仓库：${args.repo}\n作业：${args.jobId}`, en: `Cancel a CI job\nRepository: ${args.repo}\nJob: ${args.jobId}` }
+        : { zh: `取消 CI 流水线\n仓库：${args.repo}\n流水线：${args.runId}`, en: `Cancel a CI run\nRepository: ${args.repo}\nRun: ${args.runId}` },
+      run: (args, signal) => service.cancelCi(args.repo, ciTargetOf(args), { signal }),
+    }),
   ]
   const watch = define(deps, {
     name: 'repo_mr_watch',
@@ -386,6 +456,13 @@ export function createTools(deps: ToolDeps): RepoTool[] {
     ...writes.map(definition => ({ definition, access: 'write' as const })),
     { definition: merge, access: 'merge' },
   ]
+}
+
+/** The run or job of a validated retry or cancel call. */
+function ciTargetOf(args: { readonly runId?: number | undefined; readonly jobId?: number | undefined }): CiTarget {
+  if (args.runId !== undefined) return { runId: args.runId }
+  if (args.jobId !== undefined) return { jobId: args.jobId }
+  throw new RepoError('invalid', 'runId 和 jobId 必须给且只给一个')
 }
 
 /** Guidance after opening or reusing a workspace that continues an existing branch. */

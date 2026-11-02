@@ -33,6 +33,8 @@ export const NUMBER_FIELDS: Readonly<Record<NumberKey, NumberField>> = {
   maxTreeEntries: { key: 'maxTreeEntries', label: '目录条目上限', summary: '列一个目录最多返回', unit: '个', scale: 1 },
   maxFileBytes: { key: 'maxFileBytes', label: '单文件上限', summary: '超出截断（镜像读取时拒绝）', unit: 'KiB', scale: 1024 },
   maxDiffBytes: { key: 'maxDiffBytes', label: 'diff 上限', summary: 'PR/MR 与工作区 diff，超出截断', unit: 'KiB', scale: 1024 },
+  maxLogBytes: { key: 'maxLogBytes', label: 'CI 日志上限', summary: '一次返回的作业日志片段；一条流水线的失败信息合计', unit: 'KiB', scale: 1024 },
+  maxCiFailures: { key: 'maxCiFailures', label: 'CI 失败条数', summary: '读取流水线时附带的失败用例或错误注解', unit: '条', scale: 1 },
   activeIntervalMs: { key: 'activeIntervalMs', label: '检查间隔', summary: 'PR/MR 有动态或 CI 运行中时', unit: '秒', scale: 1000 },
   quietIntervalMs: { key: 'quietIntervalMs', label: '安静时检查间隔', summary: '一段时间没有动态后放慢', unit: '分钟', scale: 60_000 },
   quietAfterMs: { key: 'quietAfterMs', label: '多久没动态算安静', summary: '之后按安静时的间隔检查', unit: '分钟', scale: 60_000 },
@@ -108,6 +110,8 @@ export function storedNumber(settings: RepoSettingsWire, key: NumberKey): number
     case 'maxTreeEntries':
     case 'maxFileBytes':
     case 'maxDiffBytes':
+    case 'maxLogBytes':
+    case 'maxCiFailures':
       return settings.limits[key]
     case 'activeIntervalMs':
     case 'quietIntervalMs':
@@ -205,6 +209,8 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
         maxDiffBytes: numbers.maxDiffBytes,
         maxTreeEntries: numbers.maxTreeEntries,
         maxComments: numbers.maxComments,
+        maxLogBytes: numbers.maxLogBytes,
+        maxCiFailures: numbers.maxCiFailures,
       },
       tools: { enabled: draft.enabled, writes: draft.writes, merge: draft.merge, deleteSourceBranch: draft.deleteSourceBranch, signature: draft.signature },
       mirror: { gitTimeoutMs: numbers.gitTimeoutMs, otherHosts: draft.otherHosts },

@@ -20,13 +20,13 @@
  * @module dsh-repo/watch/watcher
  */
 
-import type { ChangeInfo, RepoRef } from '../contract.ts'
+import type { ChangeInfo, CiJob, RepoRef } from '../contract.ts'
 import type { WatchSettings } from '../config.ts'
 import type { HostLogger } from '../host.ts'
 import type { ActivityRequest, ChangeActivity } from '../providers/types.ts'
 import type { WatchAction, WatchEventKind, WatchInfo } from '../settings/contract.ts'
 import { detect, freshCursor, MAX_OWN_COMMENTS, MAX_OWN_HEADS, MAX_PENDING, renderMessage, watchId } from './activity.ts'
-import type { WatchEvent, WatchRecord, WatchSource } from './activity.ts'
+import type { WatchCiFailure, WatchEvent, WatchRecord, WatchSource } from './activity.ts'
 import type { WatchDelivery } from './delivery.ts'
 import type { WatchStore } from './store.ts'
 
@@ -42,6 +42,8 @@ const DAY_MS = 86_400_000
 export interface WatchService {
   resolve(repo: string): RepoRef
   changeActivity(repo: string, number: number, request: ActivityRequest, options: { readonly signal?: AbortSignal }): Promise<ChangeActivity>
+  /** Failed jobs of a CI run, listed in a CI failure message. */
+  failedCiJobs(repo: string, runId: number, options: { readonly signal?: AbortSignal }): Promise<readonly CiJob[]>
 }
 
 /** Collaborators of the watcher. */
@@ -336,7 +338,8 @@ export class ChangeWatcher {
     // From the stored state, not only this poll: a final notice whose delivery
     // failed, or was interrupted by a restart, still ends the watch on retry.
     const ending = cursor.state !== 'open'
-    const kept = events.filter(event => this.action(event.kind) !== 'off')
+    const kept = await Promise.all(events.filter(event => this.action(event.kind) !== 'off').map(event => this.withFailedJobs(record, event, signal)))
+    if (signal.aborted) return
     const updated = await this.merge(id, current => ({
       ...current,
       title: activity.change.title,
@@ -349,6 +352,33 @@ export class ChangeWatcher {
     }))
     if (updated === undefined) return
     await this.flush(updated, ending)
+  }
+
+  /**
+   * Add the failed jobs of each failed whole-run check (GitLab pipelines) to a
+   * `ciFailed` event, so the Session can read their logs directly. A failed
+   * read is noted in the event; the failure is still reported.
+   */
+  private async withFailedJobs(record: WatchRecord, event: WatchEvent, signal: AbortSignal): Promise<WatchEvent> {
+    if (event.kind !== 'ciFailed' || event.failures === undefined) return event
+    const failures = await Promise.all(event.failures.map(async (failure): Promise<WatchCiFailure> => {
+      if (failure.runId === undefined || failure.jobId !== undefined) return failure
+      try {
+        const jobs = await this.deps.service.failedCiJobs(`${record.host}/${record.path}`, failure.runId, { signal })
+        return {
+          ...failure,
+          jobs: jobs.map(job => ({
+            id: job.id,
+            name: job.name,
+            ...job.stage === undefined ? {} : { stage: job.stage },
+            ...job.failureReason === undefined ? {} : { failureReason: job.failureReason },
+          })),
+        }
+      } catch (error) {
+        return { ...failure, jobsError: errorText(error) }
+      }
+    }))
+    return { ...event, failures }
   }
 
   /** CI is read while it may change: the head moved recently, CI runs or failed (and may be rerun), or it was never read. */

@@ -41,6 +41,8 @@ export const SETTING_BOUNDS = {
   maxDiffBytes: { min: 1, max: 64 * 1024 * 1024 },
   maxTreeEntries: { min: 1, max: 100_000 },
   maxComments: { min: 1, max: 100 },
+  maxLogBytes: { min: 1024, max: 4 * 1024 * 1024 },
+  maxCiFailures: { min: 1, max: 500 },
   activeIntervalMs: { min: 15_000, max: 3_600_000 },
   quietIntervalMs: { min: 60_000, max: 86_400_000 },
   quietAfterMs: { min: 60_000, max: 7 * 86_400_000 },
@@ -86,6 +88,8 @@ export interface RepoSettingsWire {
     maxDiffBytes: number
     maxTreeEntries: number
     maxComments: number
+    maxLogBytes: number
+    maxCiFailures: number
   }
   tools: {
     enabled: boolean

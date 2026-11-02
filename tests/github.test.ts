@@ -257,3 +257,101 @@ describe('GitHub token account', () => {
     expect(polled.items).toHaveLength(120)
   })
 })
+
+describe('GitHub Actions CI', () => {
+  const runBody = (overrides: Record<string, unknown> = {}) => ({
+    id: 77, name: 'CI', status: 'completed', conclusion: 'failure', head_branch: 'fix', head_sha: SHA, event: 'pull_request',
+    created_at: '2026-11-02T10:00:00Z', updated_at: '2026-11-02T10:05:00Z', run_started_at: '2026-11-02T10:00:30Z', run_attempt: 1, html_url: `${REPO}/actions/runs/77`, ...overrides,
+  })
+  const jobBody = (id: number, conclusion: string | null, overrides: Record<string, unknown> = {}) => ({
+    id, name: `job-${id}`, status: conclusion === null ? 'in_progress' : 'completed', conclusion, started_at: '2026-11-02T10:01:00Z', completed_at: conclusion === null ? null : '2026-11-02T10:02:30Z',
+    html_url: `${REPO}/actions/runs/77/job/${id}`, steps: [{ name: 'Run npm test', status: 'completed', conclusion: conclusion ?? 'success', number: 3 }], ...overrides,
+  })
+
+  it('lists the runs of a PR\'s head commit with a status filter', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/pulls/5`, reply: { body: { head: { sha: SHA } } } },
+      { method: 'GET', path: `${API}/actions/runs`, reply: { body: { total_count: 1, workflow_runs: [runBody()] } } },
+    ])
+    expect(await createService(testConfig(), TOKENS).listCiRuns(REPO, { change: 5, state: 'failure' })).toEqual({
+      items: [{ id: 77, name: 'CI', state: 'failure', status: 'failure', ref: 'fix', sha: SHA, event: 'pull_request', createdAt: '2026-11-02T10:00:00Z', updatedAt: '2026-11-02T10:05:00Z', attempt: 1, webUrl: `${REPO}/actions/runs/77` }],
+    })
+    expect(Object.fromEntries(requests.at(-1)!.url.searchParams)).toMatchObject({ head_sha: SHA, status: 'failure', per_page: '30', page: '1' })
+  })
+
+  it('reads a failed run with its latest jobs, steps, and the failure annotations of failed jobs', async () => {
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/actions/runs/77`, reply: { body: runBody() } },
+      { method: 'GET', path: `${API}/actions/runs/77/jobs`, reply: { body: { total_count: 2, jobs: [jobBody(1, 'success'), jobBody(2, 'failure')] } } },
+      { method: 'GET', path: `${API}/check-runs/2/annotations`, reply: { body: [
+        { annotation_level: 'failure', title: 'TS2322', message: 'Type mismatch', path: 'src/a.ts', start_line: 4 },
+        { annotation_level: 'warning', title: 'Node 20 is deprecated', message: 'w', path: '.github', start_line: 1 },
+        { annotation_level: 'failure', title: '', message: 'Process completed with exit code 1.', path: '.github', start_line: 1 },
+      ] } },
+    ])
+    const run = await createService(testConfig(), TOKENS).getCiRun(REPO, 77)
+    expect(run).toMatchObject({ id: 77, state: 'failure', startedAt: '2026-11-02T10:00:30Z', finishedAt: '2026-11-02T10:05:00Z', durationSeconds: 270, jobsTruncated: false, failuresTruncated: false })
+    expect(run.jobs[1]).toEqual({
+      id: 2, name: 'job-2', state: 'failure', status: 'failure', allowFailure: false, startedAt: '2026-11-02T10:01:00Z', finishedAt: '2026-11-02T10:02:30Z', durationSeconds: 90,
+      webUrl: `${REPO}/actions/runs/77/job/2`, steps: [{ number: 3, name: 'Run npm test', state: 'failure', status: 'failure' }],
+    })
+    expect(run.failures).toEqual([
+      { job: 'job-2', name: 'TS2322', message: 'Type mismatch', path: 'src/a.ts', line: 4 },
+      { job: 'job-2', name: 'job-2', message: 'Process completed with exit code 1.' },
+    ])
+    expect(requests.find(request => request.url.pathname.endsWith('/jobs'))?.url.searchParams.get('filter')).toBe('latest')
+  })
+
+  it('reads further annotation pages when warnings fill the first one', async () => {
+    const warnings = Array.from({ length: 100 }, (_, index) => ({ annotation_level: 'warning', title: `w${index}`, message: 'w', path: '.github', start_line: 1 }))
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/actions/runs/77`, reply: { body: runBody() } },
+      { method: 'GET', path: `${API}/actions/runs/77/jobs`, reply: { body: { total_count: 1, jobs: [jobBody(2, 'failure')] } } },
+      { method: 'GET', path: `${API}/check-runs/2/annotations`, reply: request => request.url.searchParams.get('page') === '1'
+        ? { body: warnings }
+        : { body: [{ annotation_level: 'failure', title: 'TS2322', message: 'Type mismatch', path: 'src/a.ts', start_line: 4 }] } },
+    ])
+    const run = await createService(testConfig(), TOKENS).getCiRun(REPO, 77)
+    expect(run.failures).toEqual([{ job: 'job-2', name: 'TS2322', message: 'Type mismatch', path: 'src/a.ts', line: 4 }])
+    expect(run.failuresTruncated).toBe(false)
+    expect(requests.filter(request => request.url.pathname.endsWith('/annotations'))).toHaveLength(2)
+  })
+
+  it('downloads a job log by following the redirect without sending the token to storage', async () => {
+    const storage = 'https://results-receiver.actions.githubusercontent.com/logs/2.txt'
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/actions/jobs/2`, reply: { body: jobBody(2, 'failure') } },
+      { method: 'GET', path: `${API}/actions/jobs/2/logs`, reply: { status: 302, body: '', headers: { location: storage } } },
+      { method: 'GET', path: '/logs/2.txt', reply: { body: '2026-11-02T10:00:00.0Z ##[group]Run npm test\n2026-11-02T10:00:01.0Z FAIL a.test.ts\n2026-11-02T10:00:02.0Z ##[endgroup]\n' } },
+    ])
+    const log = await createService(testConfig(), TOKENS).ciJobLog(REPO, 2)
+    expect(log).toMatchObject({ job: { id: 2 }, totalLines: 2, text: '▶ Run npm test\nFAIL a.test.ts', sections: ['Run npm test'] })
+    const [api, blob] = requests.slice(-2)
+    expect(api?.headers.get('authorization')).toBe('token gh-token')
+    expect(blob?.url.href).toBe(storage)
+    expect(blob?.headers.get('authorization')).toBeNull()
+  })
+
+  it('reruns failed jobs or one job, cancels runs, and refuses to cancel a single job', async () => {
+    const { requests } = fakeHttp([
+      { method: 'POST', path: `${API}/actions/runs/77/rerun-failed-jobs`, reply: { status: 201, body: {} } },
+      { method: 'POST', path: `${API}/actions/jobs/2/rerun`, reply: { status: 201, body: {} } },
+      { method: 'POST', path: `${API}/actions/runs/77/cancel`, reply: { status: 202, body: {} } },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    expect(await service.retryCi(REPO, { runId: 77 })).toEqual({ runId: 77 })
+    expect(await service.retryCi(REPO, { jobId: 2 })).toEqual({ jobId: 2 })
+    expect(await service.cancelCi(REPO, { runId: 77 })).toEqual({ runId: 77 })
+    await expect(service.cancelCi(REPO, { jobId: 2 })).rejects.toMatchObject({ code: 'invalid' })
+    expect(requests).toHaveLength(3)
+  })
+
+  it('adds the run and job ids of Actions check runs to the PR status', async () => {
+    fakeHttp([
+      { method: 'GET', path: `${API}/pulls/5`, reply: { body: { head: { sha: SHA }, mergeable: true } } },
+      { method: 'GET', path: `${API}/commits/${SHA}/check-runs`, reply: { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure', html_url: `${REPO}/actions/runs/77/job/2` }] } } },
+      { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [] } } },
+    ])
+    expect((await createService(testConfig(), TOKENS).changeStatus(REPO, 5)).checks).toEqual([{ name: 'test', state: 'failure', webUrl: `${REPO}/actions/runs/77/job/2`, runId: 77, jobId: 2 }])
+  })
+})

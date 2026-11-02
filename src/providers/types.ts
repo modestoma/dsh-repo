@@ -6,7 +6,7 @@
  */
 
 import type {
-  BranchInfo, ChangeDetail, CommitAuthor, ChangeDiff, ChangeInfo, ChangeState, ChangeStatus, CommentInfo, CommitInfo,
+  BranchInfo, ChangeDetail, CommitAuthor, ChangeDiff, ChangeInfo, ChangeState, ChangeStatus, CiActionResult, CiJob, CiRun, CiRunDetail, CiRunListOptions, CommentInfo, CommitInfo,
   FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, RepoUser, TreeListing,
 } from '../contract.ts'
 import type { RepoLimits } from '../config.ts'
@@ -54,6 +54,66 @@ export interface Provider {
   mergeChange(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod; readonly deleteSourceBranch: boolean }, call: Call): Promise<MergeResult>
   /** One poll for a watch: always the change request, CI and comments only as `request` asks. */
   changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity>
+
+  listRuns(ref: RepoRef, query: Paging & Pick<CiRunListOptions, 'ref' | 'sha' | 'change' | 'state'>, call: Call): Promise<Page<CiRun>>
+  /** The run with every job; failures are read only for a failed run. */
+  getRun(ref: RepoRef, id: number, call: Call): Promise<CiRunDetail>
+  /** Failed jobs of a run, for a watch's CI failure message. */
+  failedJobs(ref: RepoRef, runId: number, call: Call): Promise<CiJob[]>
+  /** The job and its raw log; the caller reads the stream before the call's deadline. */
+  jobLog(ref: RepoRef, jobId: number, call: Call): Promise<{ readonly job: CiJob; readonly body: ReadableStream<Uint8Array> }>
+  retryRun(ref: RepoRef, runId: number, call: Call): Promise<CiActionResult>
+  retryJob(ref: RepoRef, jobId: number, call: Call): Promise<CiActionResult>
+  cancelRun(ref: RepoRef, runId: number, call: Call): Promise<CiActionResult>
+  cancelJob(ref: RepoRef, jobId: number, call: Call): Promise<CiActionResult>
+}
+
+/**
+ * Cut each failure message to an equal share of the log limit and keep at
+ * most `maxCiFailures` failures.
+ * @param failures - every failure read, in report order.
+ * @param limits - the configured limits.
+ * @returns the kept failures and whether any were left out.
+ */
+export function capFailures<T extends { readonly message?: string }>(failures: readonly T[], limits: Pick<RepoLimits, 'maxLogBytes' | 'maxCiFailures'>): { failures: T[]; failuresTruncated: boolean } {
+  const share = Math.max(1, Math.floor(limits.maxLogBytes / limits.maxCiFailures))
+  const kept = failures.slice(0, limits.maxCiFailures).map((failure) => {
+    if (failure.message === undefined) return failure
+    const { text, truncated } = truncateBytes(failure.message, share)
+    return { ...failure, message: truncated ? `${text}…` : text }
+  })
+  return { failures: kept, failuresTruncated: failures.length > kept.length }
+}
+
+/**
+ * A raw HTTP failure from a request made without an SDK, classified like an
+ * Octokit error (`name` is `HttpError`).
+ */
+export class HttpStatusError extends Error {
+  override readonly name = 'HttpError'
+
+  /**
+   * @param status - HTTP status.
+   * @param message - the host's message.
+   */
+  constructor(readonly status: number, message: string) {
+    super(message)
+  }
+}
+
+/**
+ * The body of a successful response.
+ * @param response - the response.
+ * @returns its body stream.
+ * @throws {HttpStatusError} for a status outside 200–299 or a missing body.
+ */
+export async function okBody(response: Response): Promise<ReadableStream<Uint8Array>> {
+  if (!response.ok) {
+    const text = await response.text().catch((error: unknown) => errorText(error))
+    throw new HttpStatusError(response.status, text.slice(0, 500))
+  }
+  if (response.body === null) throw new HttpStatusError(response.status, '响应没有内容')
+  return response.body
 }
 
 /** What a watch already knows about a change request, so a poll reads only what may have changed. */

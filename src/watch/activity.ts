@@ -39,6 +39,26 @@ export interface WatchItem {
   readonly path?: string
 }
 
+/** A failed job of a failed check, as a CI failure message lists it. */
+export interface WatchFailedJob {
+  readonly id: number
+  readonly name: string
+  readonly stage?: string
+  readonly failureReason?: string
+}
+
+/** One failed check of a `ciFailed` event, with the ids the CI tools take. */
+export interface WatchCiFailure {
+  readonly name: string
+  readonly runId?: number
+  readonly jobId?: number
+  readonly webUrl?: string
+  /** Failed jobs of `runId` when the check is a whole run (GitLab pipelines). */
+  readonly jobs?: readonly WatchFailedJob[]
+  /** Why the failed jobs could not be read. */
+  readonly jobsError?: string
+}
+
 /** One piece of PR/MR activity. */
 export interface WatchEvent {
   readonly kind: WatchEventKind
@@ -48,6 +68,8 @@ export interface WatchEvent {
   readonly sha?: string
   /** Failed check names, for `ciFailed`. */
   readonly checks?: readonly string[]
+  /** Failed checks with their CI ids, for `ciFailed`. */
+  readonly failures?: readonly WatchCiFailure[]
   /** The comment or review, for `comment`, `approved`, and `changesRequested`. */
   readonly item?: WatchItem
 }
@@ -164,9 +186,18 @@ export function detect(record: WatchRecord, activity: ChangeActivity, now: strin
   let failing: readonly string[] = moved ? [] : previous.failing
   const status = activity.status
   if (status !== undefined && status.headSha === change.headSha) {
-    const failed = status.checks.filter(check => check.state === 'failure').map(check => check.name)
+    const failedChecks = status.checks.filter(check => check.state === 'failure')
+    const failed = failedChecks.map(check => check.name)
     // A check is reported once per failure; a rerun that fails again is new.
-    if (failed.some(name => !failing.includes(name))) events.push({ kind: 'ciFailed', at: now, sha: change.headSha, checks: failed })
+    if (failed.some(name => !failing.includes(name))) {
+      const failures = failedChecks.map((check): WatchCiFailure => ({
+        name: check.name,
+        ...check.runId === undefined ? {} : { runId: check.runId },
+        ...check.jobId === undefined ? {} : { jobId: check.jobId },
+        ...check.webUrl === undefined ? {} : { webUrl: check.webUrl },
+      }))
+      events.push({ kind: 'ciFailed', at: now, sha: change.headSha, checks: failed, failures })
+    }
     const next = settledChecks(status)
     if (next === 'success' && checks !== 'success' && checks !== 'unknown') events.push({ kind: 'ciPassed', at: now, sha: change.headSha })
     checks = next
@@ -234,13 +265,34 @@ function short(sha: string | undefined): string {
   return sha === undefined ? '' : sha.slice(0, 12)
 }
 
+/** One failed check with its ids, then its failed jobs. */
+function failureLines(failure: WatchCiFailure): string {
+  const ids = [failure.runId === undefined ? undefined : `runId ${failure.runId}`, failure.jobId === undefined ? undefined : `jobId ${failure.jobId}`].filter(part => part !== undefined)
+  const head = `  - ${failure.name}${ids.length === 0 ? '' : `（${ids.join('，')}）`}`
+  const jobs = (failure.jobs ?? []).map(job => `    - ${job.stage === undefined ? '' : `${job.stage} / `}${job.name}（jobId ${job.id}${job.failureReason === undefined ? '' : `，${job.failureReason}`}）`)
+  const error = failure.jobsError === undefined ? [] : [`    - 没能读取失败作业：${failure.jobsError}`]
+  return [head, ...jobs, ...error].join('\n')
+}
+
+/** The `ciFailed` line: with CI ids, the failed checks and jobs and how to read their logs. */
+function ciFailedLines(event: WatchEvent): string {
+  const failures = event.failures ?? []
+  // Checks without CI ids (external commit statuses) have nothing for the CI tools to read.
+  if (!failures.some(failure => failure.runId !== undefined || failure.jobId !== undefined)) return `- CI 失败（提交 ${short(event.sha)}）：${(event.checks ?? []).join('、') || '未列出失败的检查'}`
+  return [
+    `- CI 失败（提交 ${short(event.sha)}）：`,
+    ...failures.map(failureLines),
+    '  用 repo_ci_job_log 读失败作业的日志，repo_ci_run 看整条流水线和失败用例。',
+  ].join('\n')
+}
+
 /** One line (plus quote) per event. */
 function eventLines(event: WatchEvent): string {
   const item = event.item
   const by = item === undefined ? '' : `@${item.author}`
   const link = item?.webUrl === undefined ? '' : `\n  ${item.webUrl}`
   switch (event.kind) {
-    case 'ciFailed': return `- CI 失败（提交 ${short(event.sha)}）：${(event.checks ?? []).join('、') || '未列出失败的检查'}`
+    case 'ciFailed': return ciFailedLines(event)
     case 'ciPassed': return `- CI 通过（提交 ${short(event.sha)}）`
     case 'comment': return `- ${by} 评论${item?.path === undefined ? '' : `了 ${item.path}`}：\n${quote(item?.body ?? '')}${link}`
     case 'changesRequested': return `- ${by} 要求修改${item?.body === undefined || item.body === '' ? '' : `：\n${quote(item.body)}`}${link}`

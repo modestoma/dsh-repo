@@ -15,10 +15,11 @@ import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type {
-  CallOptions, ChangeCreate, ChangeInfo, CommitAuthor, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
+  CallOptions, ChangeCreate, ChangeInfo, CiActionResult, CiJob, CiJobLog, CiLogOptions, CiRunListOptions, CiTarget, CommitAuthor, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
   HostCreate, HostInfo, HostsChange, MergedBranchDeletion, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, Page, PageOptions, RepoRef, RepoTarget,
   SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
 } from './contract.ts'
+import { readLog } from './ci/log.ts'
 import { apiBaseUrl, DEFAULT_SETTINGS, expandHome, resolveSettings } from './config.ts'
 import type { HostSpec, RepoSettings } from './config.ts'
 import type { MirrorUsage } from './settings/contract.ts'
@@ -79,6 +80,27 @@ function requireNumber(value: number): void {
 
 function requireText(value: string, label: string): void {
   if (value.trim() === '') throw new RepoError('invalid', `${label}不能为空`)
+}
+
+function requireId(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value < 1) throw new RepoError('invalid', `${label}必须是正整数：${value}`)
+}
+
+const COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+/** Most search texts of one job log call. */
+const MAX_LOG_SEARCH = 20
+/** Longest search text or section filter. */
+const MAX_LOG_TERM = 200
+/** Default and largest context of a job log search. */
+const LOG_CONTEXT = { default: 3, max: 50 } as const
+
+/** The run or job a retry or cancel names, with the label for messages. */
+function ciTarget(target: CiTarget): { readonly kind: 'run' | 'job'; readonly id: number; readonly label: string } {
+  if ((target.runId === undefined) === (target.jobId === undefined)) throw new RepoError('invalid', 'runId 和 jobId 必须给且只给一个')
+  const kind = target.runId === undefined ? 'job' : 'run'
+  const id = target.runId ?? target.jobId ?? 0
+  requireId(id, kind === 'run' ? 'runId' : 'jobId')
+  return { kind, id, label: kind === 'run' ? `流水线 ${id}` : `作业 ${id}` }
 }
 
 /** Most trailers one push may add besides `DSH-Session:`. */
@@ -299,6 +321,78 @@ export class RepoService implements DshRepoService {
   async changeActivity(repo: RepoTarget, number: number, request: ActivityRequest, options: CallOptions = {}): Promise<ChangeActivity> {
     requireNumber(number)
     return await this.run(repo, options, `检查 PR/MR #${number} 的动态`, (provider, ref, call) => provider.changeActivity(ref, number, request, call))
+  }
+
+  async listCiRuns(repo: RepoTarget, options: CiRunListOptions = {}) {
+    if (options.ref !== undefined) requireBranch(options.ref, 'ref')
+    if (options.sha !== undefined && !COMMIT.test(options.sha)) throw new RepoError('invalid', `sha 必须是完整的提交 id：${options.sha}`)
+    if (options.change !== undefined) {
+      requireNumber(options.change)
+      if (options.ref !== undefined || options.sha !== undefined) throw new RepoError('invalid', '按 PR/MR 列出时不能再给 ref 或 sha')
+    }
+    const query = {
+      ...this.paging(options),
+      ...options.ref === undefined ? {} : { ref: options.ref },
+      ...options.sha === undefined ? {} : { sha: options.sha },
+      ...options.change === undefined ? {} : { change: options.change },
+      ...options.state === undefined ? {} : { state: options.state },
+    }
+    return await this.run(repo, options, '列出 CI 流水线', (provider, ref, call) => provider.listRuns(ref, query, call))
+  }
+
+  async getCiRun(repo: RepoTarget, runId: number, options: CallOptions & { readonly onlyFailed?: boolean } = {}) {
+    requireId(runId, 'runId')
+    const detail = await this.run(repo, options, `读取流水线 ${runId}`, (provider, ref, call) => provider.getRun(ref, runId, call))
+    return options.onlyFailed === true ? { ...detail, jobs: detail.jobs.filter(job => job.state === 'failure') } : detail
+  }
+
+  /**
+   * Failed jobs of a CI run, for a watch's CI failure message; not part of the `dshRepos` service.
+   * @param repo - repository target.
+   * @param runId - run id.
+   * @param options - cancellation.
+   * @returns the failed jobs.
+   * @throws {RepoError} classified as every other call.
+   */
+  async failedCiJobs(repo: RepoTarget, runId: number, options: CallOptions = {}): Promise<CiJob[]> {
+    requireId(runId, 'runId')
+    return await this.run(repo, options, `读取流水线 ${runId} 的失败作业`, (provider, ref, call) => provider.failedJobs(ref, runId, call))
+  }
+
+  async ciJobLog(repo: RepoTarget, jobId: number, options: CiLogOptions = {}): Promise<CiJobLog> {
+    requireId(jobId, 'jobId')
+    const search = (options.search ?? []).map(term => term.trim()).filter(term => term !== '')
+    if (search.length > MAX_LOG_SEARCH) throw new RepoError('invalid', `搜索词最多 ${MAX_LOG_SEARCH} 个`)
+    if (search.some(term => term.length > MAX_LOG_TERM)) throw new RepoError('invalid', `每个搜索词最多 ${MAX_LOG_TERM} 个字符`)
+    const context = options.context ?? LOG_CONTEXT.default
+    if (!Number.isSafeInteger(context) || context < 0 || context > LOG_CONTEXT.max) throw new RepoError('invalid', `context 必须在 0 到 ${LOG_CONTEXT.max} 之间：${context}`)
+    if (options.beforeLine !== undefined) {
+      requireId(options.beforeLine, 'beforeLine')
+      if (search.length > 0) throw new RepoError('invalid', 'beforeLine 只用于读取日志末尾，不能和 search 一起用')
+    }
+    const section = options.section?.trim()
+    if (section !== undefined && (section === '' || section.length > MAX_LOG_TERM)) throw new RepoError('invalid', `section 不能为空，最多 ${MAX_LOG_TERM} 个字符`)
+    return await this.run(repo, options, `读取作业 ${jobId} 的日志`, async (provider, ref, call) => {
+      const { job, body } = await provider.jobLog(ref, jobId, call)
+      const excerpt = await readLog(body, {
+        search,
+        context,
+        ...section === undefined ? {} : { section },
+        ...options.beforeLine === undefined ? {} : { beforeLine: options.beforeLine },
+        maxBytes: call.limits.maxLogBytes,
+      }, call.signal)
+      return { job, ...excerpt }
+    })
+  }
+
+  async retryCi(repo: RepoTarget, target: CiTarget, options: CallOptions = {}): Promise<CiActionResult> {
+    const { kind, id, label } = ciTarget(target)
+    return await this.run(repo, options, `重试${label}`, (provider, ref, call) => kind === 'run' ? provider.retryRun(ref, id, call) : provider.retryJob(ref, id, call))
+  }
+
+  async cancelCi(repo: RepoTarget, target: CiTarget, options: CallOptions = {}): Promise<CiActionResult> {
+    const { kind, id, label } = ciTarget(target)
+    return await this.run(repo, options, `取消${label}`, (provider, ref, call) => kind === 'run' ? provider.cancelRun(ref, id, call) : provider.cancelJob(ref, id, call))
   }
 
   async createChange(repo: RepoTarget, change: ChangeCreate) {
