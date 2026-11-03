@@ -14,6 +14,7 @@ function setup(tokens: Record<string, string> = {}) {
   const hosts = new HostStore(config.hosts, join(root, 'hosts.json'))
   const errors: unknown[] = []
   const service = new RepoService({
+    forbiddenMirrorRoots: [],
     credentials: store,
     logger: { error: (_message, ...args) => { errors.push(...args) } },
     hosts,

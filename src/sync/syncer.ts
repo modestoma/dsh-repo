@@ -49,8 +49,8 @@ const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u00
 /** The service calls a sync makes. */
 export interface SyncService {
   syncMirror(url: string, options?: MirrorSyncOptions): Promise<MirrorState>
-  /** @returns the mirror directory now in use; sync directories must stay outside it. */
-  mirrorSettings(): { readonly dir: string }
+  /** @returns the mirror directory now in use, or undefined while none is chosen; sync directories must stay outside it. */
+  mirrorSettings(): { readonly dir: string | undefined }
 }
 
 /** Collaborators of the syncer. */
@@ -327,7 +327,8 @@ export class LocalSyncer {
    * sync's directory, read before the list changes so the check itself stays synchronous.
    */
   private async realPaths(dir: string): Promise<Map<string, string>> {
-    const paths = [dir, this.deps.service.mirrorSettings().dir, ...this.deps.store.all().map(record => record.dir)]
+    const mirrors = this.deps.service.mirrorSettings().dir
+    const paths = [dir, ...mirrors === undefined ? [] : [mirrors], ...this.deps.store.all().map(record => record.dir)]
     return new Map(await Promise.all(paths.map(async path => [path, await realPathOf(path)] as const)))
   }
 
@@ -343,7 +344,7 @@ export class LocalSyncer {
       return within(a, b) || within(b, a) || within(ra, rb) || within(rb, ra)
     }
     const mirrors = this.deps.service.mirrorSettings().dir
-    if (overlap(mirrors, dir)) throw new RepoError('conflict', `本地目录 ${dir} 与镜像目录 ${mirrors} 重叠，请换一个目录`)
+    if (mirrors !== undefined && overlap(mirrors, dir)) throw new RepoError('conflict', `本地目录 ${dir} 与镜像目录 ${mirrors} 重叠，请换一个目录`)
     const other = current.find(item => item.id !== self && overlap(item.dir, dir))
     if (other !== undefined) throw new RepoError('conflict', `本地目录 ${dir} 与 ${other.url} 的本地目录 ${other.dir} 重叠，请换一个目录`)
   }
@@ -426,11 +427,13 @@ export class LocalSyncer {
    * @throws {RepoError} the mirror's failures; `conflict` when the directory now overlaps the mirror directory or a first sync finds a non-empty directory; `unavailable` when the claim or the result cannot be saved.
    */
   private async expand(record: SyncRecord, signal: AbortSignal): Promise<void> {
-    // The mirror directory can change after the sync was added, so the overlap is checked again here.
+    // The mirror directory can change after the sync was added, so the overlap is checked again here; an unset directory fails the mirror sync itself.
     const mirrors = this.deps.service.mirrorSettings().dir
-    const [realDir, realMirrors] = await Promise.all([realPathOf(record.dir), realPathOf(mirrors)])
-    if (within(mirrors, record.dir) || within(record.dir, mirrors) || within(realMirrors, realDir) || within(realDir, realMirrors)) {
-      throw new RepoError('conflict', `本地目录 ${record.dir} 与镜像目录 ${mirrors} 重叠，没有同步；请把本地同步或镜像目录换到不重叠的位置`)
+    if (mirrors !== undefined) {
+      const [realDir, realMirrors] = await Promise.all([realPathOf(record.dir), realPathOf(mirrors)])
+      if (within(mirrors, record.dir) || within(record.dir, mirrors) || within(realMirrors, realDir) || within(realDir, realMirrors)) {
+        throw new RepoError('conflict', `本地目录 ${record.dir} 与镜像目录 ${mirrors} 重叠，没有同步；请把本地同步或镜像目录换到不重叠的位置`)
+      }
     }
     const mirror = await this.deps.service.syncMirror(record.url, { ...record.branch === undefined ? {} : { branch: record.branch }, signal })
     const index = this.indexFile(record.id, record.dir)

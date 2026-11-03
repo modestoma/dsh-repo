@@ -84,6 +84,7 @@ export function mirrorLimits(maxFileBytes: number, maxTreeEntries: number, timeo
 export function createService(config: RepoConfig, tokens: Record<string, string> = {}, settings: RepoSettings = DEFAULT_SETTINGS): RepoService {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-test-'))
   return new RepoService({
+    forbiddenMirrorRoots: [],
     credentials: credentials(tokens),
     hosts: hostStore(config, root, settings),
     ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(settings.limits.maxFileBytes, settings.limits.maxTreeEntries) })),

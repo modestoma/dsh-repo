@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -34,6 +34,7 @@ function setup(options: { git?: GitRunner; otherHosts?: boolean; tokens?: Record
   const config = testConfig()
   const settings = testSettings({ mirror: { otherHosts: options.otherHosts ?? true }, repos: ['github.com/modestoma/*', 'code.example.com/team/**'] })
   const service = new RepoService({
+    forbiddenMirrorRoots: [],
     credentials: credentials(options.tokens ?? {}),
     hosts: hostStore(config, root, settings),
     ...withMirrors(new MirrorStore({ git: options.git ?? runGit, root: join(root, 'mirrors'), limits: mirrorLimits(64, 10) }), options.git ?? runGit),
@@ -143,6 +144,7 @@ describe('mirror store', () => {
     const config = testConfig()
     const root = mkdtempSync(join(tmpdir(), 'dsh-repo-restart-'))
     const make = () => new RepoService({
+      forbiddenMirrorRoots: [],
       credentials: credentials({}),
       hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
       ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(64, 10) })),
@@ -187,7 +189,7 @@ describe('mirror directory changes', () => {
     expect(lease.dir.startsWith(join(root, 'mirrors', '.snapshots'))).toBe(true)
 
     const moved = join(root, 'moved')
-    expect(await service.setMirrorDir(moved)).toEqual({ dir: moved, defaultDir: join(root, 'mirrors') })
+    expect(await service.setMirrorDir(moved)).toEqual({ dir: moved })
     expect(existsSync(lease.dir)).toBe(true)
     const second = await service.syncMirror(source)
     expect(second.dir.startsWith(moved)).toBe(true)
@@ -196,5 +198,54 @@ describe('mirror directory changes', () => {
     lease.release()
     expect((await service.acquireSnapshot(source, commit)).dir.startsWith(join(moved, '.snapshots'))).toBe(true)
     await expect(service.setMirrorDir('~nobody/x')).rejects.toMatchObject({ code: 'invalid' })
+  })
+
+  it('refuses every mirror operation while no directory is chosen, and resumes after one is', async () => {
+    const { dir: source, commit } = origin()
+    const { root, service } = setup()
+    expect(await service.setMirrorDir(undefined)).toEqual({ dir: undefined })
+    expect(service.mirrorSettings().dir).toBeUndefined()
+    await expect(service.syncMirror(source)).rejects.toMatchObject({ code: 'unavailable', message: expect.stringContaining('镜像目录未设置') })
+    await expect(service.acquireSnapshot(source, commit)).rejects.toMatchObject({ code: 'unavailable' })
+    await expect(service.mirrorUsage()).rejects.toMatchObject({ code: 'unavailable' })
+    await expect(service.openWorkspace(source, { dir: join(root, 'ws') })).rejects.toMatchObject({ code: 'unavailable' })
+    await service.setMirrorDir(join(root, 'chosen'))
+    expect((await service.syncMirror(source)).commit).toBe(commit)
+  })
+
+  it('refuses a directory in a forbidden root, also through a symbolic link, and leaves the choice unchanged', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-repo-forbidden-'))
+    const home = join(root, 'dsh-home')
+    mkdirSync(home)
+    symlinkSync(home, join(root, 'home-link'))
+    const service = new RepoService({
+      forbiddenMirrorRoots: [home, '/tmp/surely-missing-root'],
+      credentials: credentials({}),
+      hosts: new HostStore(testConfig().hosts, join(root, 'hosts.json')),
+      ...withMirrors(new MirrorStore({ git: runGit, root: undefined, limits: mirrorLimits(64, 10) })),
+    })
+    for (const dir of [home, join(home, 'dsh-repo', 'mirrors'), join(home, '..mirrors'), join(root, 'home-link', 'mirrors'), '/tmp/surely-missing-root/x']) {
+      await expect(service.setMirrorDir(dir)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('不能是') })
+    }
+    expect(service.mirrorSettings()).toEqual({ dir: undefined })
+    expect(existsSync(join(home, 'dsh-repo'))).toBe(false)
+    const allowed = join(root, 'mirrors')
+    expect(await service.setMirrorDir(allowed)).toEqual({ dir: allowed })
+  })
+
+  it('leaves a stored directory that breaks the rules unused and reports why', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-repo-stored-'))
+    const home = join(root, 'dsh-home')
+    writeFileSync(join(root, 'hosts.json'), `${JSON.stringify({ hosts: [], mirrorDir: join(home, 'mirrors') })}\n`)
+    const errors: unknown[] = []
+    const service = new RepoService({
+      forbiddenMirrorRoots: [home],
+      credentials: credentials({}),
+      logger: { error: (_message, ...args) => { errors.push(...args) } },
+      hosts: new HostStore(testConfig().hosts, join(root, 'hosts.json')),
+      ...withMirrors(new MirrorStore({ git: runGit, root: undefined, limits: mirrorLimits(64, 10) })),
+    })
+    expect(service.mirrorSettings()).toEqual({ dir: undefined, problem: expect.stringContaining(join(home, 'mirrors')) })
+    expect(errors).toHaveLength(1)
   })
 })

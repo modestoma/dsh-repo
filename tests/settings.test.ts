@@ -42,7 +42,8 @@ async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {},
     inject: (names, callback) => { if (names.every(name => services[name] !== undefined)) callback(ctx) },
   }
   const env = { DSH_HOME: home ?? mkdtempSync(join(tmpdir(), 'dsh-repo-settings-')) }
-  plugin.apply(ctx, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
+  // Test directories live under the system temporary directory, so only `$DSH_HOME` stays forbidden here.
+  plugin.apply(ctx, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env, forbiddenMirrorRoots: [env.DSH_HOME] })
   const http = createServer((req, res) => {
     const handler = routes.get(new URL(req.url ?? '/', 'http://x').pathname)
     if (handler === undefined) {
@@ -64,12 +65,12 @@ async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {},
 }
 
 describe('settings routes', () => {
-  it('reports hosts with token status and the mirror directory', async () => {
-    const { call, env } = await serve()
+  it('reports hosts with token status and that no mirror directory is chosen', async () => {
+    const { call } = await serve()
     const { status, body } = await call('/dsh-repo/state')
     expect(status).toBe(200)
     const state = body as unknown as SettingsState
-    expect(state.mirror).toEqual({ dir: join(env.DSH_HOME, 'dsh-repo', 'mirrors'), defaultDir: join(env.DSH_HOME, 'dsh-repo', 'mirrors') })
+    expect(state.mirror).toEqual({})
     expect(state.pickerAvailable).toBe(false)
     expect(state.hosts).toMatchObject([{ kind: 'github', url: 'https://github.com', origin: 'config', token: { configured: true, source: 'file' } }])
     expect(JSON.stringify(body)).not.toContain('"gh"')
@@ -111,14 +112,14 @@ describe('settings routes', () => {
     expect((await (await serve(401)).call('/dsh-repo/state')).status).toBe(401)
   })
 
-  it('moves the mirror directory, keeps the choice in hosts.json, and returns to the default', async () => {
+  it('chooses the mirror directory, keeps the choice in hosts.json, refuses forbidden roots, and clears it', async () => {
     const { call, json, service, env } = await serve()
-    const changes: string[] = []
+    const changes: (string | undefined)[] = []
     service.onHostsChange((change) => { if (change.kind === 'mirror') changes.push(change.dir) })
-    const chosen = join(env.DSH_HOME, 'elsewhere', 'mirrors')
+    const chosen = join(mkdtempSync(join(tmpdir(), 'dsh-repo-chosen-')), 'mirrors')
     let response = await call('/dsh-repo/mirror', json('PUT', { dir: chosen }))
     expect(response.status).toBe(200)
-    expect((response.body.state as SettingsState).mirror.dir).toBe(chosen)
+    expect((response.body.state as SettingsState).mirror).toEqual({ dir: chosen })
     expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'hosts.json'), 'utf8'))).toEqual({ hosts: [], mirrorDir: chosen })
     expect(existsSync(chosen)).toBe(true)
 
@@ -126,10 +127,27 @@ describe('settings routes', () => {
     expect(reloaded.service.mirrorSettings().dir).toBe(chosen)
 
     expect((await call('/dsh-repo/mirror', json('PUT', { dir: 'relative/mirrors' }))).status).toBe(400)
+    const forbidden = await call('/dsh-repo/mirror', json('PUT', { dir: join(env.DSH_HOME, 'dsh-repo', 'mirrors') }))
+    expect(forbidden.status).toBe(400)
+    expect(forbidden.body.error).toContain(env.DSH_HOME)
+    expect((await call('/dsh-repo/state')).body).toMatchObject({ mirror: { dir: chosen } })
     response = await call('/dsh-repo/mirror', { method: 'DELETE' })
-    expect((response.body.state as SettingsState).mirror.dir).toBe(join(env.DSH_HOME, 'dsh-repo', 'mirrors'))
+    expect((response.body.state as SettingsState).mirror).toEqual({})
     expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'hosts.json'), 'utf8'))).toEqual({ hosts: [] })
-    expect(changes).toEqual([chosen, join(env.DSH_HOME, 'dsh-repo', 'mirrors')])
+    expect(changes).toEqual([chosen, undefined])
+  })
+
+  it('reports a stored mirror directory that breaks the rules and refuses the usage listing', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-repo-stored-'))
+    mkdirSync(join(home, 'dsh-repo'))
+    writeFileSync(join(home, 'dsh-repo', 'hosts.json'), `${JSON.stringify({ hosts: [], mirrorDir: join(home, 'dsh-repo', 'mirrors') })}\n`)
+    const { call } = await serve(undefined, {}, home)
+    const state = (await call('/dsh-repo/state')).body as unknown as SettingsState
+    expect(state.mirror.dir).toBeUndefined()
+    expect(state.mirror.problem).toContain(join(home, 'dsh-repo', 'mirrors'))
+    const usage = await call('/dsh-repo/mirror-usage')
+    expect(usage.status).toBe(503)
+    expect(usage.body.error).toContain('镜像目录未设置')
   })
 
   it('saves run-time settings as overrides, applies them at once, and resets them', async () => {
@@ -208,7 +226,15 @@ describe('settings routes', () => {
     const { call, json, env } = await serve()
     const dir = join(env.DSH_HOME, 'shared-skills')
 
+    // Without a mirror directory the sync is recorded but its first run fails with the refusal.
     let response = await call('/dsh-repo/syncs', json('POST', { url: repo, dir }))
+    expect(response.status).toBe(200)
+    expect((response.body.state as SettingsState).syncs[0]).toMatchObject({ state: 'idle', error: expect.stringContaining('镜像目录未设置') })
+    expect((await call('/dsh-repo/syncs', json('DELETE', { id: (response.body.state as SettingsState).syncs[0]?.id }))).status).toBe(200)
+    const mirrors = join(mkdtempSync(join(tmpdir(), 'dsh-repo-settings-mirrors-')), 'mirrors')
+    expect((await call('/dsh-repo/mirror', json('PUT', { dir: mirrors }))).status).toBe(200)
+
+    response = await call('/dsh-repo/syncs', json('POST', { url: repo, dir }))
     expect(response.status).toBe(200)
     const [added] = (response.body.state as SettingsState).syncs
     expect(added).toMatchObject({ url: repo, dir, intervalMinutes: 720, syncedBranch: 'main', state: 'idle' })
@@ -227,7 +253,7 @@ describe('settings routes', () => {
     expect((await call('/dsh-repo/syncs/run', json('POST', { id: 'missing' }))).status).toBe(404)
 
     const usage = (await call('/dsh-repo/mirror-usage')).body as unknown as MirrorUsage
-    expect(usage.root).toBe(join(env.DSH_HOME, 'dsh-repo', 'mirrors'))
+    expect(usage.root).toBe(mirrors)
     expect(usage.mirrors).toHaveLength(1)
     expect(usage.mirrors[0]).toMatchObject({ path: expect.stringMatching(/^local\//), url: repo })
     expect(usage.mirrors[0]?.bytes).toBeGreaterThan(0)

@@ -94,13 +94,13 @@ export class HostStore {
     return parsed.data
   }
 
-  /** @returns the mirror directory chosen at run time, or undefined for the default. */
+  /** @returns the mirror directory stored in the settings file, or undefined while none is chosen. */
   mirrorDir(): string | undefined {
     return this.stored.mirrorDir
   }
 
   /**
-   * Persist the mirror directory, or clear it to return to the default.
+   * Persist the mirror directory, or clear the choice.
    * @param dir - absolute directory, or undefined.
    * @throws {RepoError} `unavailable` when the file cannot be written.
    */

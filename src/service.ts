@@ -20,13 +20,14 @@ import type {
   SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
 } from './contract.ts'
 import { readLog } from './ci/log.ts'
-import { apiBaseUrl, DEFAULT_SETTINGS, expandHome, resolveSettings } from './config.ts'
+import { apiBaseUrl, DEFAULT_SETTINGS, resolveSettings } from './config.ts'
 import type { HostSpec, RepoSettings } from './config.ts'
 import type { MirrorUsage } from './settings/contract.ts'
 import { RepoError, toRepoError } from './errors.ts'
 import type { HostCredentials, HostLogger } from './host.ts'
 import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
 import { credentialEnvironment } from './mirror/git.ts'
+import { checkMirrorDir } from './mirror/root.ts'
 import type { MirrorStore } from './mirror/store.ts'
 import type { WorkspaceStore } from './mirror/workspace.ts'
 import { GithubProvider } from './providers/github.ts'
@@ -148,15 +149,19 @@ export interface RepoServiceDeps {
   /** Writable checkouts of mirror commits. */
   readonly workspaces: WorkspaceStore
   readonly factory?: ProviderFactory
-  /** Mirror directory used while none is chosen; default: the mirrors' starting root. */
-  readonly defaultMirrorDir?: string
+  /**
+   * Roots the mirror directory may not be or lie in; see `forbiddenMirrorRoots`.
+   * The stored choice is checked against them at construction and every new
+   * choice before it is saved.
+   */
+  readonly forbiddenMirrorRoots: readonly string[]
   /** Reports a throwing {@link RepoService.onHostsChange} listener. */
   readonly logger?: HostLogger
 }
 
 /** The service implementation. */
 export class RepoService implements DshRepoService {
-  readonly version = 2 as const
+  readonly version = 3 as const
   private readonly providers = new Map<string, Provider>()
   private readonly credentials: HostCredentials
   private readonly hosts: HostStore
@@ -164,12 +169,19 @@ export class RepoService implements DshRepoService {
   private readonly workspaces: WorkspaceStore
   private readonly factory: ProviderFactory
   private readonly logger: HostLogger | undefined
-  private readonly defaultMirrorDir: string
+  private readonly forbiddenMirrorRoots: readonly string[]
+  /** Why the stored mirror directory is not in use, while it was rejected at construction. */
+  private mirrorProblem: string | undefined
   private readonly hostListeners = new Set<(change: HostsChange) => void>()
   /** Commit identity of each host's token account, keyed by host URL and checked against the token it was read with. */
   private readonly identities = new Map<string, { readonly token: string; readonly author: Promise<CommitAuthor> }>()
 
-  /** @param deps - credential store, hosts and settings, mirrors, and provider factory. */
+  /**
+   * A mirror directory stored in the settings file replaces the mirrors'
+   * starting root; one that breaks the rules is left unused and reported by
+   * {@link mirrorSettings} until it is replaced or cleared.
+   * @param deps - credential store, hosts and settings, mirrors, forbidden mirror roots, and provider factory.
+   */
   constructor(deps: RepoServiceDeps) {
     this.credentials = deps.credentials
     this.hosts = deps.hosts
@@ -177,7 +189,17 @@ export class RepoService implements DshRepoService {
     this.workspaces = deps.workspaces
     this.factory = deps.factory ?? defaultProviderFactory
     this.logger = deps.logger
-    this.defaultMirrorDir = deps.defaultMirrorDir ?? deps.mirrors.root
+    this.forbiddenMirrorRoots = deps.forbiddenMirrorRoots
+    const stored = deps.hosts.mirrorDir()
+    if (stored !== undefined) {
+      try {
+        this.mirrors.setRoot(checkMirrorDir(stored, this.forbiddenMirrorRoots))
+      } catch (error) {
+        this.mirrors.setRoot(undefined)
+        this.mirrorProblem = `设置文件里的镜像目录不可用，镜像操作已停用：${error instanceof Error ? error.message : String(error)}`
+        this.logger?.error?.('dsh-repo: %s', this.mirrorProblem)
+      }
+    }
   }
 
   /** Whether any host is configured or added. */
@@ -508,25 +530,22 @@ export class RepoService implements DshRepoService {
   }
 
   mirrorSettings(): MirrorSettings {
-    return { dir: this.mirrors.root, defaultDir: this.defaultMirrorDir }
+    return { dir: this.mirrors.root, ...this.mirrorProblem === undefined ? {} : { problem: this.mirrorProblem } }
   }
 
   async setMirrorDir(dir: string | undefined): Promise<MirrorSettings> {
-    let target = this.defaultMirrorDir
-    if (dir !== undefined) {
-      const trimmed = dir.trim()
-      if (trimmed === '' || /[\u0000-\u001f\u007f]/.test(trimmed)) throw new RepoError('invalid', '镜像目录不能为空或包含控制字符')
-      if (!isAbsolute(trimmed) && trimmed !== '~' && !trimmed.startsWith('~/')) throw new RepoError('invalid', `镜像目录必须是绝对路径：${trimmed}`)
-      target = expandHome(trimmed)
+    const target = dir === undefined ? undefined : checkMirrorDir(dir, this.forbiddenMirrorRoots)
+    if (target !== undefined) {
+      try {
+        await mkdir(target, { recursive: true })
+        await access(target, constants.W_OK)
+      } catch (error) {
+        throw new RepoError('invalid', `无法创建或写入镜像目录 ${target}：${error instanceof Error ? error.message : String(error)}`)
+      }
     }
-    try {
-      await mkdir(target, { recursive: true })
-      await access(target, constants.W_OK)
-    } catch (error) {
-      throw new RepoError('invalid', `无法创建或写入镜像目录 ${target}：${error instanceof Error ? error.message : String(error)}`)
-    }
-    await this.hosts.setMirrorDir(target === this.defaultMirrorDir ? undefined : target)
+    await this.hosts.setMirrorDir(target)
     this.mirrors.setRoot(target)
+    this.mirrorProblem = undefined
     this.emitHostsChange({ kind: 'mirror', dir: target })
     return this.mirrorSettings()
   }

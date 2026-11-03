@@ -13,7 +13,7 @@ import type { ReactNode } from 'react'
 import type { ForgeKind, HostInfo, TokenStatus } from '../contract.ts'
 import { DEFAULT_SYNC_INTERVAL_MINUTES } from '../settings/contract.ts'
 import type { HostAddRequest, MirrorUsage, SettingsState, SyncInfo, SyncInput, WatchInfo } from '../settings/contract.ts'
-import { addHost, addSync, clearHostToken, fetchMirrorUsage, fetchState, messageOf, pickDirectory, removeHost, removeSync, resetMirrorDir, resetSettings, runSync, saveHostToken, saveMirrorDir, saveSettings, stopWatch, updateSync } from './api.ts'
+import { addHost, addSync, clearHostToken, fetchMirrorUsage, fetchState, messageOf, pickDirectory, removeHost, removeSync, clearMirrorDir, resetSettings, runSync, saveHostToken, saveMirrorDir, saveSettings, stopWatch, updateSync } from './api.ts'
 import { formatBytes, formatInterval, fromDraft, intervalHoursText, NUMBER_FIELDS, parseIntervalHours, sameDraft, toDraft, WATCH_ACTIONS, WATCH_EVENTS, WRITE_MODES } from './form.ts'
 import type { DraftField, NumberKey, SettingsDraft } from './form.ts'
 
@@ -532,25 +532,26 @@ function AddHostForm({ busy, run, onDone }: { busy: boolean; run: Run; onDone: (
 
 function MirrorSection({ state, busy, run, onError }: { state: SettingsState; busy: boolean; run: Run; onError: (text: string) => void }): JSX.Element {
   const [mirrorDraft, setMirrorDraft] = useState<string | undefined>()
-  const mirrorValue = mirrorDraft ?? state.mirror.dir
-  const isDefault = state.mirror.dir === state.mirror.defaultDir
+  const current = state.mirror.dir ?? ''
+  const mirrorValue = mirrorDraft ?? current
   const saveMirror = (): void => {
     const dir = mirrorValue.trim()
-    if (dir === '' || dir === state.mirror.dir || busy) return
+    if (dir === '' || dir === current || busy) return
     void run(() => saveMirrorDir(dir), `镜像目录已改为 ${dir}`).then((ok) => { if (ok) setMirrorDraft(undefined) })
   }
   const choose = (): void => {
     void pickDirectory().then((path) => { if (path !== null) setMirrorDraft(path) }, (error: unknown) => { onError(messageOf(error)) })
   }
-  const changed = mirrorValue.trim() !== '' && mirrorValue.trim() !== state.mirror.dir
+  const changed = mirrorValue.trim() !== '' && mirrorValue.trim() !== current
   return (
     <Section title="本地镜像">
-      <Row label="镜像目录" summary="仓库的只读本地副本。改目录立即保存，旧镜像不搬也不删。" block>
+      <Row label="镜像目录" summary="仓库只读本地副本所在的目录，没有默认值：未设置时拉取仓库、代码快照、工作区和本地同步都不可用。不能在 DSH 主目录或 /tmp 下，也不要放在 Agent 可写的目录里。改目录立即保存，旧镜像不搬也不删。" block>
+        {state.mirror.dir === undefined ? <div className="dr__rowError">{state.mirror.problem ?? '镜像目录未设置。'}</div> : null}
         <div className="dr__inline">
-          <input className="dr__input dr__mono" spellCheck={false} aria-label="镜像目录" placeholder={state.mirror.defaultDir} value={mirrorValue} onChange={(event) => { setMirrorDraft(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') saveMirror() }} />
+          <input className="dr__input dr__mono" spellCheck={false} aria-label="镜像目录" placeholder="例如 /srv/dsh-repo/mirrors" value={mirrorValue} onChange={(event) => { setMirrorDraft(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') saveMirror() }} />
           {state.pickerAvailable ? <button type="button" className="dr__btn" disabled={busy} onClick={choose}>选择…</button> : null}
           {changed ? <button type="button" className="dr__btn dr__btn--primary" disabled={busy} onClick={saveMirror}>保存</button> : null}
-          {isDefault || changed ? null : <button type="button" className="dr__link dr__link--small" disabled={busy} onClick={() => { void run(resetMirrorDir, '已恢复默认镜像目录').then((ok) => { if (ok) setMirrorDraft(undefined) }) }}>恢复默认</button>}
+          {state.mirror.dir === undefined || changed ? null : <button type="button" className="dr__link dr__link--small" disabled={busy} onClick={() => { void run(clearMirrorDir, '已清除镜像目录').then((ok) => { if (ok) setMirrorDraft(undefined) }) }}>清除</button>}
         </div>
       </Row>
     </Section>
@@ -662,11 +663,16 @@ function SyncForm({ sync, picker, busy, onError, onCancel, onSubmit }: { sync?: 
   )
 }
 
-function MirrorUsageSection({ mirrorDir }: { mirrorDir: string }): JSX.Element {
+function MirrorUsageSection({ mirrorDir }: { mirrorDir: string | undefined }): JSX.Element {
   const [usage, setUsage] = useState<MirrorUsage | undefined>()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | undefined>()
   const load = useCallback(async () => {
+    if (mirrorDir === undefined) {
+      setUsage(undefined)
+      setError('镜像目录未设置，没有可统计的内容。')
+      return
+    }
     setLoading(true)
     try {
       setUsage(await fetchMirrorUsage())
@@ -676,8 +682,8 @@ function MirrorUsageSection({ mirrorDir }: { mirrorDir: string }): JSX.Element {
     } finally {
       setLoading(false)
     }
-  }, [])
-  useEffect(() => { void load() }, [load, mirrorDir])
+  }, [mirrorDir])
+  useEffect(() => { void load() }, [load])
   const now = Date.now()
   return (
     <section className="dr__sec">

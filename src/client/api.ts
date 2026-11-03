@@ -103,8 +103,8 @@ export function saveMirrorDir(dir: string): Promise<SettingsState> {
   return mutate(MIRROR_ROUTE, 'PUT', { dir })
 }
 
-/** @returns the state after returning to the default mirror directory. */
-export function resetMirrorDir(): Promise<SettingsState> {
+/** @returns the state after clearing the mirror directory choice. */
+export function clearMirrorDir(): Promise<SettingsState> {
   return mutate(MIRROR_ROUTE, 'DELETE')
 }
 
