@@ -22,10 +22,10 @@ function fakeService(overrides: Record<string, unknown> = {}): DshRepoService {
 /** The tools the settings offer, by name. */
 function tools(
   settings = testSettings(), service = fakeService(), approval?: HostApproval, workingDirectory?: WorkingDirectoryService,
-  commitDetails?: ToolDeps['commitDetails'],
+  authorize?: ToolDeps['authorize'],
 ): Map<string, ToolDefinition> {
   return new Map(createTools({
-    service, settings: () => settings.tools, approval: () => approval, workingDirectory: () => workingDirectory, ...commitDetails === undefined ? {} : { commitDetails },
+    service, settings: () => settings.tools, approval: () => approval, workingDirectory: () => workingDirectory, ...authorize === undefined ? {} : { authorize },
   }).filter(tool => toolOffered(tool.access, settings.tools)).map(tool => [tool.definition.name, tool.definition]))
 }
 
@@ -324,7 +324,38 @@ describe('createTools', () => {
     expect(openWorkspace).toHaveBeenCalledWith('https://github.com/a/b.git', { dir: join(root, 'b-2'), baseBranch: 'dev', branch: 'fix/a', signal: run.signal })
   })
 
-  it('adds the trailers and author other plugins contribute for the calling Session to the push', async () => {
+  it('asks the access/authorize listeners for the calling Session before the user, and refuses a write they reject', async () => {
+    const order: string[] = []
+    const createIssue = vi.fn(async () => ({ number: 1 }))
+    const request = vi.fn(async () => { order.push('approve'); return 'allowed-once' as const })
+    const authorize = vi.fn<NonNullable<ToolDeps['authorize']>>(async () => { order.push('authorize') })
+    const { exec: run } = session()
+    const create = tools(testSettings(), fakeService({ createIssue }), { request }, undefined, authorize).get('repo_issue_create')!
+    expect(await create.execute({ repo: 'github.com/a/b', title: 'T' }, run)).toEqual({ number: 1 })
+    expect(authorize).toHaveBeenCalledWith({ session: 'session-1', level: 'code-write', action: 'repo_issue_create', summary: '在 github.com/a/b 创建 issue：T' })
+    expect(order).toEqual(['authorize', 'approve'])
+
+    authorize.mockRejectedValueOnce(new RepoError('forbidden', 'repo_issue_create 未获授权，没有执行：发起人没有改代码权限'))
+    await expect(create.execute({ repo: 'github.com/a/b', title: 'U' }, run)).rejects.toThrow(/\[forbidden\] repo_issue_create 未获授权，没有执行：发起人没有改代码权限/)
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(createIssue).toHaveBeenCalledTimes(1)
+
+    // Invalid arguments and a closed write setting are reported without asking anyone.
+    await expect(create.execute({ repo: 'github.com/a/b' }, run)).rejects.toThrow(/\[invalid\]/)
+    const off = tools(testSettings({ tools: { writes: 'off' } }), fakeService({ createIssue }), { request }, undefined, authorize)
+    expect(off.has('repo_issue_create')).toBe(false)
+    expect(authorize).toHaveBeenCalledTimes(2)
+
+    // Without a Session nobody is asked; in allow mode the listeners still are.
+    await create.execute({ repo: 'github.com/a/b', title: 'V' }, exec)
+    expect(authorize).toHaveBeenCalledTimes(2)
+    const allow = tools(testSettings({ tools: { writes: 'allow' } }), fakeService({ createIssue }), undefined, undefined, authorize).get('repo_issue_create')!
+    await allow.execute({ repo: 'github.com/a/b', title: 'W' }, run)
+    expect(authorize).toHaveBeenCalledTimes(3)
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('pushes and opens PR/MRs for the calling Session, leaving trailers and author to the service', async () => {
     const { root, workingDirectory, exec: run } = session('ws')
     checkout(join(root, 'ws'))
     const changes = {
@@ -332,25 +363,25 @@ describe('createTools', () => {
       commits: [], uncommitted: true, diff: '', truncated: false, files: [],
     }
     const pushWorkspace = vi.fn(async () => ({ url: 'https://github.com/a/b.git', branch: 'fix/a', baseBranch: 'main' }))
-    const service = fakeService({ workspaceChanges: async () => changes, pushWorkspace, listChanges: async () => ({ items: [] }) })
+    const createChange = vi.fn(async (_repo: string, _change: Record<string, unknown>) => ({ number: 7, title: 'Fix a', targetBranch: 'main', webUrl: 'https://github.com/a/b/pull/7', body: '', state: 'open' }))
+    const service = fakeService({ workspaceChanges: async () => changes, pushWorkspace, createChange, listChanges: async () => ({ items: [] }) })
     const request = async () => 'allowed-once' as const
-    const zhang = { name: '张三', email: 'zhang@example.com' }
-    const commitDetails = vi.fn<NonNullable<ToolDeps['commitDetails']>>(async () => ({ trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }], author: zhang }))
-    const push = tools(testSettings(), service, { request }, workingDirectory, commitDetails).get('repo_workspace_push')!
-    await push.execute({ branch: 'fix/a', message: 'fix: a' }, run)
-    expect(commitDetails).toHaveBeenCalledWith({ session: 'session-1', dir: join(root, 'ws') })
-    expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), {
-      branch: 'fix/a', message: 'fix: a', session: 'session-1', trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }], author: zhang, signal: run.signal,
-    })
+    const authorize = vi.fn<NonNullable<ToolDeps['authorize']>>(async () => {})
+    const built = tools(testSettings(), service, { request }, workingDirectory, authorize)
+    await built.get('repo_workspace_push')!.execute({ branch: 'fix/a', message: 'fix: a' }, run)
+    expect(authorize).toHaveBeenLastCalledWith(expect.objectContaining({ session: 'session-1', action: 'repo_workspace_push', summary: expect.stringContaining('fix/a') }))
+    expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: a', session: 'session-1', signal: run.signal })
+    await built.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'Fix a', sourceBranch: 'fix/a' }, run)
+    expect(createChange).toHaveBeenLastCalledWith('github.com/a/b', expect.objectContaining({ session: 'session-1', sourceBranch: 'fix/a' }))
 
-    // No Session, no event; no trailers or author, no options.
-    await push.execute({ dir: join(root, 'ws'), branch: 'fix/a', message: 'fix: b' }, { ...run, agent: { id: 'agent-1' } })
-    expect(commitDetails).toHaveBeenCalledTimes(1)
+    // No Session: no event, no session option.
+    await built.get('repo_workspace_push')!.execute({ dir: join(root, 'ws'), branch: 'fix/a', message: 'fix: b' }, { ...run, agent: { id: 'agent-1' } })
     expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: b', signal: run.signal })
-    commitDetails.mockResolvedValueOnce({ trailers: [] })
-    await push.execute({ branch: 'fix/a', message: 'fix: c' }, run)
-    expect(pushWorkspace).toHaveBeenLastCalledWith(join(root, 'ws'), { branch: 'fix/a', message: 'fix: c', session: 'session-1', signal: run.signal })
+    await built.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'Fix b', sourceBranch: 'fix/b' }, { ...run, agent: { id: 'agent-1' } })
+    expect(createChange.mock.calls.at(-1)?.[1]).not.toHaveProperty('session')
+    expect(authorize).toHaveBeenCalledTimes(2)
   })
+
   it('watches PRs/MRs opened, reopened, or pushed to for the calling Session, and remembers comments it posts', async () => {
     const { root, workingDirectory, exec: run } = session('ws')
     checkout(join(root, 'ws'))

@@ -29,7 +29,7 @@ export type DshReposServiceName = 'dshRepos'
  * consumer misbehave; a consumer refuses a provider whose version it does not
  * know.
  */
-export type DshReposVersion = 3
+export type DshReposVersion = 4
 
 /** Code host family. */
 export type ForgeKind = 'github' | 'gitlab'
@@ -166,6 +166,35 @@ export interface FileContent {
   readonly truncated: boolean
 }
 
+/**
+ * What an `access/authorize` listener is asked to allow. dsh-repo asks for
+ * `code-write`; other plugins use the other levels for their own writes.
+ * Listeners refuse a level they do not know.
+ */
+export type AuthorizeLevel = 'code-write' | 'wiki-read' | 'wiki-write' | 'admin'
+
+/**
+ * Payload of the `access/authorize` event, dispatched with `ctx.parallel`
+ * before a write is made for a Session: by every write tool after its
+ * arguments are validated and before the user is asked to approve, and by
+ * {@link DshRepoService.pushWorkspace} and {@link DshRepoService.createChange}
+ * when called with `session` (a tool call therefore asks twice with the same
+ * answer). A listener that knows the Session and refuses throws an `Error`
+ * whose message says why; the write then fails with `forbidden` and nothing
+ * is asked or changed. A listener that does not know the Session returns.
+ * No listener means allowed. The Session may be a subagent's; listeners
+ * resolve it to the Session they know (e.g. through `parentSession`).
+ */
+export interface AuthorizeEvent {
+  /** Session id of the Agent the write is made for. */
+  readonly session: string
+  readonly level: AuthorizeLevel
+  /** What is about to happen: the tool name or the service method. */
+  readonly action: string
+  /** Chinese description of the write, as the approval request shows it. */
+  readonly summary: string
+}
+
 /** Name and email recorded on a commit. */
 export interface CommitAuthor {
   readonly name: string
@@ -185,8 +214,10 @@ export interface CommitTrailer {
 
 /**
  * Payload of the `repo/commit-trailers` event, dispatched with
- * `ctx.parallel` before `repo_workspace_push` records uncommitted changes
- * for an Agent's Session. Listeners call {@link add} and {@link setAuthor}
+ * `ctx.parallel` before {@link DshRepoService.pushWorkspace} records
+ * uncommitted changes for a Session (every push with `session`, from the
+ * `repo_workspace_push` tool or a service call), after `access/authorize`
+ * allowed it. Listeners call {@link add} and {@link setAuthor}
  * before their returned promise settles. Calls made after every listener has
  * settled are ignored; a call a listener makes after its own promise settled,
  * while another listener is still running, is still recorded. A listener that
@@ -195,7 +226,7 @@ export interface CommitTrailer {
  * author like {@link WorkspacePushOptions.author}.
  */
 export interface CommitTrailersEvent {
-  /** Session id of the Agent that called the tool. */
+  /** Session the push is made for. */
   readonly session: string
   /** Workspace directory being pushed. */
   readonly dir: string
@@ -208,8 +239,9 @@ export interface CommitTrailersEvent {
   /**
    * Make someone other than the committer the commit's author, e.g. the person
    * who asked for the change; the committer stays the host token's account.
-   * More than one call during one push, from any listeners, fails the push
-   * with `invalid` and nothing is committed.
+   * It wins over the caller's {@link WorkspacePushOptions.author}. More than
+   * one call during one push, from any listeners, fails the push with
+   * `invalid` and nothing is committed.
    * @param name - author name: one line without `<` or `>`.
    * @param email - author email: no `<`, `>`, or whitespace.
    */
@@ -529,6 +561,12 @@ export interface CiActionResult {
 
 /** Fields of a new change request. */
 export interface ChangeCreate extends CallOptions {
+  /**
+   * Session the request is opened for: `access/authorize` is dispatched for
+   * it (level `code-write`) before the host is called, and a refusal fails
+   * with `forbidden`. One line of at most 200 characters.
+   */
+  readonly session?: string
   readonly title: string
   readonly body?: string
   readonly sourceBranch: string
@@ -784,7 +822,9 @@ export interface WorkspacePushOptions extends CallOptions {
   /** Message of the commit recording uncommitted changes; required when there are any. */
   readonly message?: string
   /**
-   * Author of that commit; default: its committer. The committer is always
+   * Author of that commit; default: its committer. An author a
+   * `repo/commit-trailers` listener sets for {@link session} wins over this
+   * one. The committer is always
    * the account that owns the host's token, read from the host's
    * current-user API (on GitHub a missing public email becomes the account's
    * noreply address), so pushes still pass push rules that check the
@@ -793,9 +833,15 @@ export interface WorkspacePushOptions extends CallOptions {
    * push with `forbidden` or `unauthenticated`.
    */
   readonly author?: CommitAuthor
-  /** Session that made the change, added to that commit's message as a `DSH-Session:` trailer. One line of at most 200 characters. */
+  /**
+   * Session that made the change, added to that commit's message as a
+   * `DSH-Session:` trailer. One line of at most 200 characters. With it the
+   * push first dispatches `access/authorize` (level `code-write`; a refusal
+   * fails with `forbidden`) and then `repo/commit-trailers`, whose trailers
+   * follow {@link trailers} and whose author wins over {@link author}.
+   */
   readonly session?: string
-  /** Further trailers of that commit, after `DSH-Session:`, in order; at most 20. An invalid one fails the push with `invalid`. */
+  /** Further trailers of that commit, after `DSH-Session:`, in order; with the listeners' at most 20. An invalid one fails the push with `invalid`. */
   readonly trailers?: readonly CommitTrailer[]
 }
 

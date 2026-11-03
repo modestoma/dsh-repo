@@ -15,7 +15,7 @@ import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type {
-  CallOptions, ChangeCreate, ChangeInfo, CiActionResult, CiJob, CiJobLog, CiLogOptions, CiRunListOptions, CiTarget, CommitAuthor, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
+  CallOptions, ChangeCreate, ChangeInfo, CiActionResult, CiJob, CiJobLog, CiLogOptions, CiRunListOptions, CiTarget, CommitAuthor, CommitDetails, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
   HostCreate, HostInfo, HostsChange, MergedBranchDeletion, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, Page, PageOptions, RepoRef, RepoTarget,
   SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
 } from './contract.ts'
@@ -24,6 +24,8 @@ import { apiBaseUrl, DEFAULT_SETTINGS, resolveSettings } from './config.ts'
 import type { HostSpec, RepoSettings } from './config.ts'
 import type { MirrorUsage } from './settings/contract.ts'
 import { RepoError, toRepoError } from './errors.ts'
+import { authorize, collectDetails } from './events.ts'
+import type { ParallelDispatch } from './events.ts'
 import type { HostCredentials, HostLogger } from './host.ts'
 import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
 import { credentialEnvironment } from './mirror/git.ts'
@@ -138,6 +140,26 @@ function gitUsername(kind: HostSpec['kind']): string {
   return kind === 'gitlab' ? 'oauth2' : 'x-access-token'
 }
 
+/**
+ * A commit author as given.
+ * @throws {RepoError} `invalid` for an empty name or one with `<`, `>`, or a newline, or an empty email or one with `<`, `>`, or whitespace.
+ */
+function checkAuthor(author: CommitAuthor): CommitAuthor {
+  if (!/^[^<>\n]+$/.test(author.name.trim())) throw new RepoError('invalid', '提交作者名不能为空，也不能包含 < > 或换行')
+  if (!/^[^<>\s]+$/.test(author.email.trim())) throw new RepoError('invalid', '提交作者邮箱不能为空，也不能包含 < > 或空白')
+  return author
+}
+
+/**
+ * A Session id as a `DSH-Session:` trailer value and an `access/authorize` subject.
+ * @throws {RepoError} `invalid` when empty, over 200 characters, or containing control characters.
+ */
+function requireSession(session: string): string {
+  const trimmed = session.trim()
+  if (trimmed === '' || trimmed.length > 200 || /[\u0000-\u001f\u007f]/.test(trimmed)) throw new RepoError('invalid', '会话 id 不能为空、超过 200 个字符或包含换行等控制字符')
+  return trimmed
+}
+
 /** Collaborators of the service. */
 export interface RepoServiceDeps {
   /** DSH credential store; tokens are resolved per request. */
@@ -157,12 +179,15 @@ export interface RepoServiceDeps {
   readonly forbiddenMirrorRoots: readonly string[]
   /** Reports a throwing {@link RepoService.onHostsChange} listener. */
   readonly logger?: HostLogger
+  /** `ctx.parallel`, which dispatches `access/authorize` and `repo/commit-trailers`; absent means no listeners. */
+  readonly parallel?: ParallelDispatch
 }
 
 /** The service implementation. */
 export class RepoService implements DshRepoService {
-  readonly version = 3 as const
+  readonly version = 4 as const
   private readonly providers = new Map<string, Provider>()
+  private readonly parallel: ParallelDispatch | undefined
   private readonly credentials: HostCredentials
   private readonly hosts: HostStore
   private readonly mirrors: MirrorStore
@@ -189,6 +214,7 @@ export class RepoService implements DshRepoService {
     this.workspaces = deps.workspaces
     this.factory = deps.factory ?? defaultProviderFactory
     this.logger = deps.logger
+    this.parallel = deps.parallel
     this.forbiddenMirrorRoots = deps.forbiddenMirrorRoots
     const stored = deps.hosts.mirrorDir()
     if (stored !== undefined) {
@@ -421,10 +447,15 @@ export class RepoService implements DshRepoService {
     requireText(change.title, '标题')
     requireBranch(change.sourceBranch, '源分支名')
     if (change.targetBranch !== undefined) requireBranch(change.targetBranch, '目标分支名')
+    if (change.session !== undefined) {
+      const session = requireSession(change.session)
+      const { host, path } = this.target(repo)
+      await authorize(this.parallel, { session, level: 'code-write', action: 'createChange', summary: `在 ${host}/${path} 创建 PR/MR：${change.sourceBranch} → ${change.targetBranch ?? '默认分支'}，标题：${change.title}` })
+    }
     return await this.run(repo, change, '创建 PR/MR', async (provider, ref, call) => {
       const targetBranch = change.targetBranch ?? (await provider.repoInfo(ref, call)).defaultBranch
       if (targetBranch === change.sourceBranch) throw new RepoError('invalid', '源分支和目标分支不能相同')
-      const { signal: _signal, ...fields } = change
+      const { signal: _signal, session: _session, ...fields } = change
       return await provider.createChange(ref, { ...fields, targetBranch, draft: change.draft === true, deleteSourceBranch: change.deleteSourceBranch === true }, call)
     })
   }
@@ -603,16 +634,20 @@ export class RepoService implements DshRepoService {
 
   async pushWorkspace(dir: string, options: WorkspacePushOptions = {}): Promise<WorkspacePushResult> {
     if (options.branch !== undefined) requireBranch(options.branch, '分支名')
-    if (options.author !== undefined) {
-      if (!/^[^<>\n]+$/.test(options.author.name.trim())) throw new RepoError('invalid', '提交作者名不能为空，也不能包含 < > 或换行')
-      if (!/^[^<>\s]+$/.test(options.author.email.trim())) throw new RepoError('invalid', '提交作者邮箱不能为空，也不能包含 < > 或空白')
-    }
-    const session = options.session?.trim()
-    if (session !== undefined && (session === '' || session.length > 200 || /[\u0000-\u001f\u007f]/.test(session))) throw new RepoError('invalid', '会话 id 不能为空、超过 200 个字符或包含换行等控制字符')
-    const trailers = options.trailers === undefined ? undefined : checkTrailers(options.trailers)
+    if (options.author !== undefined) checkAuthor(options.author)
+    const session = options.session === undefined ? undefined : requireSession(options.session)
+    const own = options.trailers === undefined ? undefined : checkTrailers(options.trailers)
     const { url } = await this.workspaces.locate(dir)
+    let details: CommitDetails | undefined
+    if (session !== undefined) {
+      await authorize(this.parallel, { session, level: 'code-write', action: 'pushWorkspace', summary: `推送工作区 ${dir}${options.branch === undefined ? '' : ` 到新分支 ${options.branch}`}` })
+      details = await collectDetails(this.parallel, { session, dir })
+    }
+    const added = details === undefined || details.trailers.length === 0 ? undefined : checkTrailers([...own ?? [], ...details.trailers])
+    const trailers = added ?? own
     const env = await this.mirrorAuth(url, true)
-    const given = options.author === undefined ? undefined : { name: options.author.name.trim(), email: options.author.email.trim() }
+    const chosen = details?.author === undefined ? options.author : checkAuthor(details.author)
+    const given = chosen === undefined ? undefined : { name: chosen.name.trim(), email: chosen.email.trim() }
     const committer = await this.tokenIdentity(url, options.signal) ?? given
     const author = given ?? committer
     return await this.workspaces.push(dir, {

@@ -29,8 +29,8 @@ import { SyncStore } from './sync/store.ts'
 import { LocalSyncer } from './sync/syncer.ts'
 import { WatchStore } from './watch/store.ts'
 import { ChangeWatcher } from './watch/watcher.ts'
-import type { CommitAuthor, CommitDetails, CommitTrailer, CommitTrailersEvent } from './contract.ts'
-import { RepoError } from './errors.ts'
+import { authorize } from './events.ts'
+import type { ParallelDispatch } from './events.ts'
 
 export type * from './contract.ts'
 export type { HostSpec, RepoConfig, RepoLimits, RepoSettings, SettingsOverrides } from './config.ts'
@@ -78,36 +78,8 @@ export { DEFAULT_SYNC_INTERVAL_MINUTES, MAX_SYNCS, MIRROR_USAGE_ROUTE, SYNC_INTE
 export type { MirrorUsage, MirrorUsageEntry, SyncInfo, SyncInput } from './settings/contract.ts'
 export { syncIndexDir, syncsFile } from './config.ts'
 
-/** Cordis event other plugins listen to for extra trailers and the author of a pushed commit; payload {@link CommitTrailersEvent}. */
-export const COMMIT_TRAILERS_EVENT = 'repo/commit-trailers'
-
-/**
- * Collect the trailers and the author the `repo/commit-trailers` listeners add.
- * @param ctx - plugin context; without `parallel` there are no listeners.
- * @param request - Session and workspace of the push.
- * @returns the trailers in the order they were added, and the author when a listener set one.
- * @throws {RepoError} `unavailable` naming the listener failures; `invalid` when more than one author was set.
- */
-async function collectDetails(ctx: HostContext, request: { readonly session: string; readonly dir: string }): Promise<CommitDetails> {
-  const trailers: CommitTrailer[] = []
-  const authors: CommitAuthor[] = []
-  let open = true
-  const event: CommitTrailersEvent = {
-    ...request,
-    add: (token, value) => { if (open) trailers.push({ token, value }) },
-    setAuthor: (name, email) => { if (open) authors.push({ name, email }) },
-  }
-  try {
-    await ctx.parallel?.(COMMIT_TRAILERS_EVENT, event)
-  } catch (error) {
-    const reasons = error instanceof AggregateError ? error.errors : [error]
-    throw new RepoError('unavailable', `${COMMIT_TRAILERS_EVENT} 监听者出错，没有提交：${reasons.map(reason => reason instanceof Error ? reason.message : String(reason)).join('；')}`)
-  } finally {
-    open = false
-  }
-  if (authors.length > 1) throw new RepoError('invalid', `${COMMIT_TRAILERS_EVENT} 监听者设置了 ${authors.length} 个提交作者，只能有一个，没有提交：${authors.map(author => `${author.name} <${author.email}>`).join('、')}`)
-  return { trailers, ...authors[0] === undefined ? {} : { author: authors[0] } }
-}
+export { ACCESS_AUTHORIZE_EVENT, COMMIT_TRAILERS_EVENT, authorize, collectDetails } from './events.ts'
+export type { ParallelDispatch } from './events.ts'
 
 /** Cordis plugin name. */
 export const name = 'dsh-repo'
@@ -135,10 +107,11 @@ export interface RepoPluginOptions {
 /**
  * Provide the `dshRepos` service, start the PR/MR watcher and the local
  * syncs, mount the settings routes while the Host serves the Web, and
- * register the model
- * tools, each offered only while at least one host is configured or added
- * and the current tool settings allow it (`repo_mr_watch` also needs
- * watching to be active).
+ * register the model tools, each offered only while at least one host is
+ * configured or added and the current tool settings allow it
+ * (`repo_mr_watch` also needs watching to be active). Writes made for a
+ * Session go through the `access/authorize` listeners first, and pushes
+ * collect `repo/commit-trailers` (see `dsh-repo/events`).
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
  * @param options - test seams.
@@ -165,6 +138,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
       return { timeoutMs: mirror.gitTimeoutMs, maxDiffBytes: limits.maxDiffBytes }
     },
   })
+  const parallel: ParallelDispatch | undefined = ctx.parallel === undefined ? undefined : (name, ...args) => ctx.parallel!(name, ...args)
   const service = new RepoService({
     credentials: ctx.credentials,
     hosts,
@@ -172,6 +146,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     workspaces,
     forbiddenMirrorRoots: options.forbiddenMirrorRoots ?? forbiddenMirrorRoots(env),
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
+    ...parallel === undefined ? {} : { parallel },
     ...options.providerFactory === undefined ? {} : { factory: options.providerFactory },
   })
   ctx.provide?.(DSH_REPOS_SERVICE, service)
@@ -205,7 +180,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     settings: () => service.settings.tools,
     approval: () => ctx.get?.('approval') as HostApproval | undefined,
     workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
-    commitDetails: request => collectDetails(ctx, request),
+    authorize: event => authorize(parallel, event),
     watch: watcher,
   })
   for (const { definition, access } of tools) {

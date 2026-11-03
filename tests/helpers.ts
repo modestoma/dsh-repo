@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { DEFAULT_SETTINGS, resolveConfig, resolveSettings, settingsOverrides } from '../src/config.ts'
 import type { RepoConfig, RepoSettings } from '../src/config.ts'
 import type { HostCredentials } from '../src/host.ts'
+import type { ParallelDispatch } from '../src/events.ts'
 import { HostStore } from '../src/hosts.ts'
 import { runGit } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
@@ -81,13 +82,14 @@ export function mirrorLimits(maxFileBytes: number, maxTreeEntries: number, timeo
 }
 
 /** Service over a configuration, fixed tokens, and settings, with its settings file and mirrors in a fresh directory. */
-export function createService(config: RepoConfig, tokens: Record<string, string> = {}, settings: RepoSettings = DEFAULT_SETTINGS): RepoService {
+export function createService(config: RepoConfig, tokens: Record<string, string> = {}, settings: RepoSettings = DEFAULT_SETTINGS, parallel?: ParallelDispatch): RepoService {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-test-'))
   return new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials(tokens),
     hosts: hostStore(config, root, settings),
     ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(settings.limits.maxFileBytes, settings.limits.maxTreeEntries) })),
+    ...parallel === undefined ? {} : { parallel },
   })
 }
 

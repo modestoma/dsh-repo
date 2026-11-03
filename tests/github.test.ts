@@ -72,8 +72,21 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/pulls/5`, reply: { body: pr } },
       { method: 'PUT', path: `${API}/pulls/5/merge`, reply: { status: 409, body: { message: 'Head branch was modified' } } },
     ])
-    const service = createService(testConfig(), TOKENS)
-    const created = await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', labels: ['x'] })
+    const events: unknown[] = []
+    let refuse: string | undefined
+    const service = createService(testConfig(), TOKENS, undefined, async (name, ...args) => {
+      events.push([name, args[0]])
+      if (refuse !== undefined) throw new AggregateError([new Error(refuse)])
+    })
+    refuse = '发起人没有改代码权限'
+    await expect(service.createChange(REPO, { title: 'T', sourceBranch: 'f', session: 's1' })).rejects.toMatchObject({ code: 'forbidden', message: 'createChange 未获授权，没有执行：发起人没有改代码权限' })
+    await expect(service.createChange(REPO, { title: 'T', sourceBranch: 'f', session: ' ' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('会话') })
+    expect(events).toEqual([['access/authorize', { session: 's1', level: 'code-write', action: 'createChange', summary: '在 github.com/modestoma/dsh-repo 创建 PR/MR：f → 默认分支，标题：T' }]])
+    expect(requests).toEqual([])
+    refuse = undefined
+    const created = await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', labels: ['x'], session: 's1' })
+    expect(events).toHaveLength(2)
+    expect(requests.find(request => request.method === 'POST')?.body).not.toHaveProperty('session')
     expect(created).toMatchObject({ number: 5, state: 'merged', labels: ['x'], assignees: [{ username: 'modestoma' }] })
     expect(requests.find(request => request.method === 'PATCH')?.body).toEqual({ labels: ['x'] })
     await expect(service.mergeChange(REPO, 5, { headSha: SHA, method: 'squash' })).rejects.toMatchObject({ code: 'conflict' })
