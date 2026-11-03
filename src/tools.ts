@@ -7,9 +7,11 @@
  *   repositories are reachable.
  * - Every tool is built; {@link toolOffered} decides from the current
  *   settings whether the model sees it. Write tools are offered unless
- *   `tools.writes` is `off` and ask once per call through `ctx.approval`
- *   while it is `ask`; without an approval service they refuse. The merge
- *   tool is offered only while `tools.merge` is also true.
+ *   `tools.writes` is `off`; for an Agent's Session they first ask the
+ *   `access/authorize` listeners ({@link ToolDeps.authorize}), then ask the
+ *   user once per call through `ctx.approval` while `tools.writes` is `ask`;
+ *   without an approval service they refuse. The merge tool is offered only
+ *   while `tools.merge` is also true.
  * - A declined approval returns `{ status: 'declined' }`; a service failure
  *   throws with the failure code in brackets, e.g. `[not-found] …`.
  *
@@ -23,7 +25,7 @@ import type { RepoSettings } from './config.ts'
 import { RepoError } from './errors.ts'
 import { lstat, readFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import type { ChangeInfo, CiTarget, CommitDetails, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
+import type { AuthorizeEvent, ChangeInfo, CiTarget, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
 import type { Agent, ContentBlock, HostApproval, ToolDefinition, ToolRunContext, WorkingDirectoryService } from './host.ts'
 import type { WatchInfo } from './settings/contract.ts'
 import type { TrackRequest } from './watch/watcher.ts'
@@ -45,10 +47,12 @@ export interface ToolDeps {
   /** DSH's working-directory service, looked up per call; absent in compositions without it. */
   readonly workingDirectory: () => WorkingDirectoryService | undefined
   /**
-   * Trailers and author other plugins add to a push made for a Session (the
-   * `repo/commit-trailers` event); absent means none.
+   * Ask other plugins whether the calling Session may make a write (the
+   * `access/authorize` event), after the arguments are validated and before
+   * the user is asked to approve; rejects with a `RepoError` `forbidden`.
+   * Absent means every Session may.
    */
-  readonly commitDetails?: (request: { readonly session: string; readonly dir: string }) => Promise<CommitDetails>
+  readonly authorize?: (event: AuthorizeEvent) => Promise<void>
   /** PR/MR watching; absent means PRs/MRs are not watched. */
   readonly watch?: WatchHooks
 }
@@ -307,13 +311,10 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       run: async (args, signal, exec) => {
         const root = await workspaceRoot(deps, args.dir, exec, signal)
         const session = exec.agent?.session?.header.id
-        const details = session === undefined || deps.commitDetails === undefined ? undefined : await deps.commitDetails({ session, dir: root })
         const pushed = await service.pushWorkspace(root, {
           ...args.branch === undefined ? {} : { branch: args.branch },
           ...args.message === undefined ? {} : { message: args.message },
           ...session === undefined ? {} : { session },
-          ...details === undefined || details.trailers.length === 0 ? {} : { trailers: details.trailers },
-          ...details?.author === undefined ? {} : { author: details.author },
           signal,
         })
         const { changes, ...open } = await openChangesOf(service, pushed, signal)
@@ -356,9 +357,11 @@ export function createTools(deps: ToolDeps): RepoTool[] {
         en: `Open a ${args.draft === true ? 'draft ' : ''}PR/MR\nRepository: ${args.repo}\nBranches: ${args.sourceBranch} → ${args.targetBranch ?? 'default branch'}\nTitle: ${args.title}`,
       }),
       run: async (args, signal, exec) => {
+        const session = exec.agent?.session?.header.id
         const change = await service.createChange(args.repo, {
           ...args,
           ...args.body === undefined ? {} : { body: sign(args.body) },
+          ...session === undefined ? {} : { session },
           deleteSourceBranch: deps.settings().deleteSourceBranch,
           signal,
         })
@@ -647,16 +650,20 @@ function define<S extends z.ZodType, V>(deps: ToolDeps, spec: Spec<S, V>): ToolD
       const args = parsed.data
       const writes = spec.describe === undefined ? undefined : deps.settings().writes
       if (writes === 'off') throw new Error(`[forbidden] dsh-repo 设置页已关闭写操作，${spec.name} 不会执行`)
-      if (spec.describe !== undefined && writes === 'ask') {
+      if (spec.describe !== undefined) {
         let text: Prompt
         try {
           text = await spec.describe(args, exec)
+          const session = exec.agent?.session?.header.id
+          if (session !== undefined) await deps.authorize?.({ session, level: 'code-write', action: spec.name, summary: text.zh })
         } catch (error) {
           if (error instanceof RepoError) throw new Error(`[${error.code}] ${error.message}`)
           throw error
         }
-        const outcome = await approve(deps, spec.name, text, exec)
-        if (outcome !== 'allowed-once') return { status: 'declined', outcome }
+        if (writes === 'ask') {
+          const outcome = await approve(deps, spec.name, text, exec)
+          if (outcome !== 'allowed-once') return { status: 'declined', outcome }
+        }
       }
       try {
         return await spec.run(args, exec.signal, exec)

@@ -8,6 +8,8 @@ import { runGit } from '../src/mirror/git.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
+import type { AuthorizeEvent, CommitTrailersEvent } from '../src/contract.ts'
+import type { ParallelDispatch } from '../src/events.ts'
 import { credentials, fakeHttp, mirrorLimits, testConfig, TOKENS, withMirrors } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
@@ -42,7 +44,7 @@ function origin(): { bare: string; commit: string } {
   return { bare, commit: git(work, 'rev-parse', 'HEAD') }
 }
 
-function setup(tokens: Record<string, string> = {}, git: GitRunner = runGit) {
+function setup(tokens: Record<string, string> = {}, git: GitRunner = runGit, parallel?: ParallelDispatch) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-'))
   const config = testConfig()
   const make = () => new RepoService({
@@ -50,6 +52,7 @@ function setup(tokens: Record<string, string> = {}, git: GitRunner = runGit) {
     credentials: credentials(tokens),
     hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
     ...withMirrors(new MirrorStore({ git, root: join(root, 'mirrors'), limits: mirrorLimits(1024, 100) }), git, 200),
+    ...parallel === undefined ? {} : { parallel },
   })
   const sandbox = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-session-'))
   return { root, sandbox, service: make(), make }
@@ -275,6 +278,64 @@ describe('workspaces', () => {
     await service.pushWorkspace(dir, { message: 'feat: last' })
     expect(git(bare, 'log', '-1', '--format=%an', 'fix/a')).toBe('shared-bot')
     expect(reads).toBe(2)
+  })
+
+  it('asks access/authorize and collects repo/commit-trailers for a Session push, the listener author winning', async () => {
+    const { bare } = origin()
+    const events: Array<[string, unknown]> = []
+    let listener: (event: CommitTrailersEvent) => void = () => {}
+    let refuse: string | undefined
+    const parallel: ParallelDispatch = async (name, ...args) => {
+      events.push([name, args[0]])
+      if (name === 'access/authorize' && refuse !== undefined) throw new AggregateError([new Error(refuse)])
+      if (name === 'repo/commit-trailers') listener(args[0] as CommitTrailersEvent)
+    }
+    const { sandbox, service } = setup({}, runGit, parallel)
+    const dir = join(sandbox, 'app')
+    await service.openWorkspace(bare, { dir })
+    writeFileSync(join(dir, 'app.ts'), 'export const a = 2\n')
+
+    // No session: nobody is asked, the caller's author and trailers stand.
+    await expect(service.pushWorkspace(dir, { branch: 'main', message: 'm', author: BOT })).rejects.toMatchObject({ code: 'invalid' })
+    expect(events).toEqual([])
+
+    refuse = '发起人没有改代码权限'
+    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', session: 's1', author: BOT })).rejects.toMatchObject({ code: 'forbidden', message: 'pushWorkspace 未获授权，没有执行：发起人没有改代码权限' })
+    expect(events).toEqual([['access/authorize', { session: 's1', level: 'code-write', action: 'pushWorkspace', summary: `推送工作区 ${dir} 到新分支 fix/a` }]])
+    expect(await service.workspaceChanges(dir)).toMatchObject({ uncommitted: true, commits: [] })
+    events.length = 0
+    refuse = undefined
+
+    listener = event => { event.setAuthor('张三', 'zhang@example.com'); event.add('Feishu-User', '张三 <u_1>') }
+    const pushed = await service.pushWorkspace(dir, { branch: 'fix/a', message: 'fix: a', session: 's1', author: BOT, trailers: [{ token: 'Reviewed-By', value: 'bot' }] })
+    expect(events.map(([name]) => name)).toEqual(['access/authorize', 'repo/commit-trailers'])
+    expect(events[1]?.[1]).toMatchObject({ session: 's1', dir: realpathSync(dir) })
+    expect(pushed).toMatchObject({ committed: true, author: { name: '张三', email: 'zhang@example.com' } })
+    // A local address has no token account, so the effective author also commits.
+    expect(git(bare, 'log', '-1', '--format=%an <%ae>|%cn <%ce>|%B', 'fix/a').trim()).toBe('张三 <zhang@example.com>|张三 <zhang@example.com>|fix: a\n\nDSH-Session: s1\nReviewed-By: bot\nFeishu-User: 张三 <u_1>')
+
+    // The listener's author is validated like the caller's; a second author or a throwing listener commits nothing.
+    writeFileSync(join(dir, 'more.ts'), 'export {}\n')
+    listener = event => { event.setAuthor('a<b', 'x@example.com') }
+    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('提交作者名') })
+    listener = event => { event.setAuthor('张三', 'zhang@example.com'); event.setAuthor('李四', 'li@example.com') }
+    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('2 个提交作者') })
+    listener = () => { throw new Error('directory down') }
+    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1' })).rejects.toMatchObject({ code: 'unavailable', message: expect.stringContaining('directory down') })
+    listener = event => { event.add('Feishu User', 'x') }
+    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('尾注名') })
+    expect(await service.workspaceChanges(dir)).toMatchObject({ uncommitted: true, commits: [{ subject: 'fix: a' }] })
+
+    // Without listener contributions the caller's author stands; the listeners' trailers count toward the limit of 20.
+    listener = () => {}
+    const second = await service.pushWorkspace(dir, { message: 'feat: more', session: 's1', author: BOT })
+    expect(second).toMatchObject({ committed: true, author: BOT })
+    writeFileSync(join(dir, 'last.ts'), 'export {}\n')
+    listener = event => { for (let index = 0; index < 11; index += 1) event.add(`L${index}`, 'x') }
+    const many = Array.from({ length: 10 }, (_, index) => ({ token: `T${index}`, value: 'x' }))
+    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1', trailers: many })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('最多 20 条') })
+    const authorizeEvent: AuthorizeEvent = { session: 's1', level: 'code-write', action: 'pushWorkspace', summary: `推送工作区 ${dir}` }
+    expect(events.filter(([name]) => name === 'access/authorize').at(-1)?.[1]).toEqual(authorizeEvent)
   })
 
   it.skipIf(!HAS_LFS)('uploads the Git LFS objects of pushed commits', async () => {
