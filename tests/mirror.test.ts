@@ -224,7 +224,7 @@ describe('mirror directory changes', () => {
       hosts: new HostStore(testConfig().hosts, join(root, 'hosts.json')),
       ...withMirrors(new MirrorStore({ git: runGit, root: undefined, limits: mirrorLimits(64, 10) })),
     })
-    for (const dir of [home, join(home, 'dsh-repo', 'mirrors'), join(root, 'home-link', 'mirrors'), '/tmp/surely-missing-root/x']) {
+    for (const dir of [home, join(home, 'dsh-repo', 'mirrors'), join(home, '..mirrors'), join(root, 'home-link', 'mirrors'), '/tmp/surely-missing-root/x']) {
       await expect(service.setMirrorDir(dir)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('不能是') })
     }
     expect(service.mirrorSettings()).toEqual({ dir: undefined })

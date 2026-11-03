@@ -13,7 +13,7 @@
 
 import { realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, isAbsolute, join, relative } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { expandHome, resolveDshHome } from '../config.ts'
 import { RepoError } from '../errors.ts'
 
@@ -52,9 +52,10 @@ export function realPathSyncOf(path: string): string {
   }
 }
 
+/** Whether `inner` is `outer` or lies inside it; a child whose name merely starts with `..` still lies inside. */
 function within(outer: string, inner: string): boolean {
   const rel = relative(outer, inner)
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
 
 /**
