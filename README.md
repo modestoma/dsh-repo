@@ -276,3 +276,14 @@ Host 端打包成 `lib/index.js`：ESM 依赖 `@octokit/rest`、`zod` 保持外�
 `src/client` 是浏览器端代码，单独用 `tsconfig.client.json` 检查，打包成 `lib/client.js` 经 DSH 的 `__ModuleLoader__` 加载，react 来自 Web 外壳的模块表。
 
 测试用替换全局 `fetch` 的方式驱动真实的 Octokit 和 GitBeaker，不访问网络。
+
+## 发布
+
+版本号由 semantic-release 按 Conventional Commits 计算，并始终保持 0.x：破坏性变更只升次版本号，不会升到 1.0.0。推送到 `dev` 后，检查通过就自动发布 beta；正式版**只在手动触发时发布**，推送到 `main` 只跑检查。只有 `feat`、`fix` 或破坏性变更会产生新版本。PR 标题需符合 `<type>(<scope>): <summary>`，type 取 `feat | fix | docs | test | refactor | chore | ci`。
+
+| 分支 | 触发 | 版本 | npm dist-tag |
+| --- | --- | --- | --- |
+| `main` | 手动 | 正式版，如 `0.1.0` | `latest` |
+| `dev` | 推送自动 | 预发布版，如 `0.1.0-beta.1` | `beta` |
+
+发布正式版：在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow** 并选择 `main`。workflow 取 `dev` 当前的提交，把 `main` 快进到这个提交后发布正式版，所以正式版的 tag 打在 `dev` 的提交上：不用再提 `dev` → `main` 的 PR，发版后也不用把 `main` 合回 `dev`，`dev` 的下一个 beta 自动从新版本往上算。`main` 有 `dev` 没有的提交时无法快进，workflow 报错停止。`dry_run` 默认勾选，只预览下一个版本号，不移动 `main`；取消勾选才真正快进 `main`、发布 npm 包、打 tag 并创建 GitHub Release。在 `dev` 上手动触发同样可用，用来预览或补发 beta。安装 beta 版用 `dsh-repo@beta`。
