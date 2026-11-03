@@ -29,7 +29,7 @@ export type DshReposServiceName = 'dshRepos'
  * consumer misbehave; a consumer refuses a provider whose version it does not
  * know.
  */
-export type DshReposVersion = 2
+export type DshReposVersion = 3
 
 /** Code host family. */
 export type ForgeKind = 'github' | 'gitlab'
@@ -653,16 +653,20 @@ export type HostsChange =
   }
   | {
     readonly kind: 'mirror'
-    /** The new mirror directory. */
-    readonly dir: string
+    /** The new mirror directory, or undefined when the choice was cleared. */
+    readonly dir: string | undefined
   }
 
-/** Where local mirrors live. */
+/**
+ * Where local mirrors live. There is no default: while `dir` is undefined,
+ * every call that needs a mirror (sync, read, snapshot, workspace, usage)
+ * rejects with `unavailable`.
+ */
 export interface MirrorSettings {
-  /** Absolute directory holding the mirrors; snapshots live under its `.snapshots/`. */
-  readonly dir: string
-  /** The directory used while none is chosen: `$DSH_HOME/dsh-repo/mirrors`. */
-  readonly defaultDir: string
+  /** Absolute directory holding the mirrors, with snapshots under its `.snapshots/`; undefined while none is chosen or the stored choice is unusable. */
+  readonly dir: string | undefined
+  /** Why the directory stored in the settings file is not in use (it broke the rules at load); absent otherwise. */
+  readonly problem?: string
 }
 
 /** Options of {@link DshRepoService.syncMirror}. */
@@ -931,15 +935,17 @@ export interface DshRepoService {
    */
   onHostsChange(listener: (change: HostsChange) => void): () => void
 
-  /** @returns where mirrors live. */
+  /** @returns where mirrors live, or that no directory is chosen. */
   mirrorSettings(): MirrorSettings
   /**
-   * Choose the mirror directory, or return to the default with undefined. The
+   * Choose the mirror directory, or clear the choice with undefined. The
    * choice is kept in the settings file. Existing mirrors are not moved: later
-   * syncs clone into the new directory, and held snapshots stay valid.
+   * syncs clone into the new directory, and held snapshots stay valid. The
+   * directory must not be, or lie inside, `$DSH_HOME`, the system temporary
+   * directory, or `/tmp`, compared after resolving symbolic links.
    * @param dir - absolute directory (`~` expands to the home directory); created when missing.
    * @returns the new settings.
-   * @throws `invalid` for a relative path or one that cannot be created or written, `unavailable` when the choice cannot be saved.
+   * @throws `invalid` for a relative or forbidden path or one that cannot be created or written, `unavailable` when the choice cannot be saved.
    */
   setMirrorDir(dir: string | undefined): Promise<MirrorSettings>
   /**

@@ -297,15 +297,6 @@ export function expandHome(path: string): string {
 }
 
 /**
- * The mirror directory used until one is chosen at run time.
- * @param env - process environment.
- * @returns `$DSH_HOME/dsh-repo/mirrors`.
- */
-export function defaultMirrorDir(env: NodeJS.ProcessEnv = process.env): string {
-  return join(resolveDshHome(env), 'dsh-repo', 'mirrors')
-}
-
-/**
  * The file watched PRs/MRs are kept in: `watches.json` next to the settings file.
  * @param settingsFile - absolute path of the settings file.
  * @returns absolute path.

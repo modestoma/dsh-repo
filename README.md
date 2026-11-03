@@ -46,7 +46,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | 标签页 | 设置 | 默认 | 保存方式 |
 |---|---|---|---|
 | 主机 | 添加（类型、地址、GitHub 接口地址、别名、令牌）、删除主机，保存或清除令牌 | 无 | 立即 |
-| 高级 | 镜像目录 | `$DSH_HOME/dsh-repo/mirrors` | 立即 |
+| 高级 | 镜像目录（必须设置；不能在 `$DSH_HOME` 或 `/tmp` 下） | 无 | 立即 |
 | 高级 | 镜像占用：镜像目录里每个仓库占用的空间和最近拉取时间，以及快照和其他文件的合计（只读） | — | — |
 | 访问范围 | `repos`：可访问的仓库，`主机/路径`，末段 `*` 匹配一层、`**` 匹配任意多层；空 = 主机上令牌能访问的全部仓库 | 空 | 保存条 |
 | 访问范围 | `mirror.otherHosts`：是否允许不带凭据镜像不在主机列表中的仓库 | 允许 | 保存条 |
@@ -188,12 +188,12 @@ GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支�
 import type { DshRepoService } from 'dsh-repo/contract'
 
 const repos = ctx.get('dshRepos') as DshRepoService | undefined
-if (repos?.version === 1) {
+if (repos?.version === 3) {
   const issue = await repos.getIssue('https://gitlab.example.com/team/orders', 12)
 }
 ```
 
-接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并、CI 运行与作业日志的读取和重试取消（`listCiRuns`、`getCiRun`、`ciJobLog`、`retryCi`、`cancelCi`，规则见[查看 CI](#查看-ci)），以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 2。`openWorkspace(url, { dir, baseBranch, commit, branch })` 在调用方给的目录（必须不存在）检出工作区，给出 `branch` 时接着这个已有分支修改，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session, trailers })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。`deleteMergedBranch(repo, branch)` 删除已经合并的分支，`createChange` / `mergeChange` 的 `deleteSourceBranch` 让源分支在合并后删除，规则见[合并后的分支](#合并后的分支)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
+接口覆盖仓库信息、分支、提交、目录、文件、issue 与 PR/MR 的读写和合并、CI 运行与作业日志的读取和重试取消（`listCiRuns`、`getCiRun`、`ciJobLog`、`retryCi`、`cancelCi`，规则见[查看 CI](#查看-ci)），以及主机管理、本地镜像和可写工作区，完整定义见 [`src/contract.ts`](src/contract.ts)。服务版本是 3（从 2 升到 3：`mirrorSettings().dir` 可以是 `undefined`，不再有 `defaultDir`；`setMirrorDir(undefined)` 改为清除选择）。`openWorkspace(url, { dir, baseBranch, commit, branch })` 在调用方给的目录（必须不存在）检出工作区，给出 `branch` 时接着这个已有分支修改，`workspaceChanges(dir)` 返回改动，`pushWorkspace(dir, { branch, message, author, session, trailers })` 提交并推送，规则见[改代码](#改代码)；调用方先用 `workspaceChanges` 检查改动范围再推送。`getBranch` 读取单个分支，分支不存在时返回 `undefined`。`deleteMergedBranch(repo, branch)` 删除已经合并的分支，`createChange` / `mergeChange` 的 `deleteSourceBranch` 让源分支在合并后删除，规则见[合并后的分支](#合并后的分支)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`。
 
 ### 提交尾注事件
 
@@ -224,8 +224,9 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 
 `syncMirror(url, { branch })` 把仓库拉取为只拉取、不检出的镜像，返回分支最新提交；`readMirrorFile`、`listMirrorTree` 直接从提交的 git 对象读文件和目录；`acquireSnapshot(url, commit)` 返回该提交的只读检出（`git worktree`），同一提交的持有者共用一份，全部 `release()` 且不再是最近一次同步的提交时删除。
 
-- 镜像目录默认是 `$DSH_HOME/dsh-repo/mirrors`，可以在「代码仓库」设置页手动输入或用系统目录选择框（本机 GUI 会话可用）换到别处，也可以由其他插件调用 `setMirrorDir`。所选目录保存在设置文件（默认 `$DSH_HOME/dsh-repo/hosts.json`）的 `mirrorDir` 字段，不写 cordis.yml；恢复默认时删除该字段。目录不存在时创建，无法创建或写入时拒绝。换目录后旧目录里的镜像不搬也不删，之后的同步在新目录重新克隆；已经持有的快照留在旧目录直到释放。每次换目录都经 `onHostsChange` 通知（`kind: 'mirror'`）。
-- 镜像和主机文件都在 DSH 主目录下，不在插件的安装目录里，升级、卸载或重装插件不会删除它们。
+- 镜像目录没有默认值，必须在「代码仓库」设置页的「高级」里手动输入或用系统目录选择框（本机 GUI 会话可用）设置，也可以由其他插件调用 `setMirrorDir`。未设置时，拉取镜像、读取提交、创建快照、打开工作区、统计占用和本地同步都以 `unavailable` 拒绝，错误说明去哪里设置；设置页显示红色提示。所选目录保存在设置文件（默认 `$DSH_HOME/dsh-repo/hosts.json`）的 `mirrorDir` 字段，不写 cordis.yml；「清除」删除该字段。目录不存在时创建，无法创建或写入时拒绝。换目录后旧目录里的镜像不搬也不删，之后的同步在新目录重新克隆；已经持有的快照留在旧目录直到释放。每次设置或清除都经 `onHostsChange` 通知（`kind: 'mirror'`，清除时 `dir` 为 `undefined`）。
+- 镜像目录不能是 `$DSH_HOME`、系统临时目录或 `/tmp`，也不能在它们下面（按解析符号链接后的真实路径比较）：`$DSH_HOME` 存放凭据与设置且 Agent 可读，Linux 沙箱会把 `/tmp` 换成空目录。设置时违反规则的目录以 `invalid` 拒绝；设置文件里已有的目录违反规则时插件照常加载，但镜像操作停用，设置页显示原因，重新设置或清除即可。也不要把镜像目录放在 Agent 可写的目录（例如会话工作区）里。
+- 从 0.x 早期版本升级：以前默认使用 `$DSH_HOME/dsh-repo/mirrors`，升级后它在禁止范围内，没有显式设置过镜像目录的部署在设置前所有镜像操作都被拒绝。把旧目录整体移到允许的位置后在设置页填入新路径即可继续使用已有镜像；留在旧目录里的镜像不会被删除，但旧目录里镜像的工作区不能再推送。主机文件仍在 DSH 主目录下，不在插件的安装目录里，升级、卸载或重装插件不会删除它。
 - 镜像位于 `<镜像目录>/<主机>/<路径>`，本地路径位于 `<镜像目录>/local/`；快照位于 `<镜像目录>/.snapshots/` 下对应位置。新地址先克隆到临时目录再改名；同一镜像的 clone/fetch 依次执行。进程内第一次同步某个镜像时清理上次运行遗留的快照。
 - 地址只接受 HTTPS URL、`file:` URL 或绝对路径；SSH 地址、`user@host:path`、`git://` 和 `http://` 以 `invalid` 拒绝，请改用仓库的 HTTPS 地址。属于已配置主机的地址受 `repos` 范围限制，并自动使用该主机的令牌（GitLab 用户名 `oauth2`，GitHub 用户名 `x-access-token`），令牌经只对这次 git 进程生效的凭据助手传入，不出现在命令行、`.git/config` 或输出里，Agent 也拿不到。其他主机上的仓库不带凭据拉取（适合公开仓库），设置页关闭「其他主机上的仓库」（`mirror.otherHosts`）时拒绝；本地路径不需要凭据。
 - 需要本机安装 `git`；git 不会弹出交互式提示。

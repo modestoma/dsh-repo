@@ -43,6 +43,7 @@ function setup(now?: () => number) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-sync-'))
   const hosts = hostStore(testConfig(), root, testSettings())
   const service = new RepoService({
+    forbiddenMirrorRoots: [],
     credentials: credentials({}),
     hosts,
     ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(1024 * 1024, 1000) })),

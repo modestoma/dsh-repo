@@ -26,6 +26,7 @@ import { mkdir, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import type { MirrorState, MirrorTreeEntry, SnapshotLease } from '../contract.ts'
 import { RepoError } from '../errors.ts'
+import { MIRROR_DIR_UNSET } from './root.ts'
 import type { MirrorUsage } from '../settings/contract.ts'
 import { GitError } from './git.ts'
 import type { GitRunner } from './git.ts'
@@ -35,8 +36,8 @@ import { forgetAbandonedWorkspaces } from './workspace.ts'
 /** Collaborators and limits of the store. */
 export interface MirrorStoreDeps {
   readonly git: GitRunner
-  /** Absolute directory holding the mirrors at start; {@link MirrorStore.setRoot} changes it. */
-  readonly root: string
+  /** Absolute directory holding the mirrors at start, or undefined while none is chosen; {@link MirrorStore.setRoot} changes it. */
+  readonly root: string | undefined
   /** Git command timeout and read limits, read on every use so saved settings apply to the next command. */
   readonly limits: () => MirrorLimits
 }
@@ -162,24 +163,25 @@ export class MirrorStore {
   private readonly cleared = new Map<string, Promise<void>>()
   /** Root each mirror directory was resolved under, so its snapshots stay beside it after a root change. */
   private readonly roots = new Map<string, string>()
-  private currentRoot: string
+  private currentRoot: string | undefined
 
   /** @param deps - git runner, root, and limits. */
   constructor(private readonly deps: MirrorStoreDeps) {
     this.currentRoot = deps.root
   }
 
-  /** @returns the mirror root. */
-  get root(): string {
+  /** @returns the mirror root, or undefined while none is chosen. */
+  get root(): string | undefined {
     return this.currentRoot
   }
 
   /**
-   * Resolve later addresses under another root. Existing mirrors and held
-   * snapshots stay where they are; a later sync clones into the new root.
-   * @param root - absolute directory.
+   * Resolve later addresses under another root, or under none. Existing
+   * mirrors and held snapshots stay where they are; a later sync clones into
+   * the new root.
+   * @param root - absolute directory, or undefined to refuse later operations until one is chosen.
    */
-  setRoot(root: string): void {
+  setRoot(root: string | undefined): void {
     this.currentRoot = root
   }
 
@@ -187,11 +189,11 @@ export class MirrorStore {
    * Absolute mirror directory of an address.
    * @param url - git address.
    * @returns the directory.
-   * @throws {RepoError} `invalid` for an unsupported address.
+   * @throws {RepoError} `invalid` for an unsupported address, `unavailable` while no root is chosen.
    */
   dirOf(url: string): string {
     if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${url}（只支持 https 地址、file URL 或绝对路径；SSH 地址请改用仓库的 https 地址）`)
-    const root = this.currentRoot
+    const root = this.requireRoot()
     const dir = join(root, ...mirrorPath(url).split('/'))
     this.roots.set(dir, root)
     return dir
@@ -319,11 +321,12 @@ export class MirrorStore {
   /**
    * Disk usage of the current mirror directory.
    * @returns each mirror with its address and last fetch, the snapshots, and the totals.
-   * @throws {RepoError} `unavailable` when the directory cannot be read.
+   * @throws {RepoError} `unavailable` while no root is chosen or when the directory cannot be read.
    */
   async usage(): Promise<MirrorUsage> {
+    const root = this.requireRoot()
     try {
-      return await measureMirrors(this.currentRoot, async (dir) => {
+      return await measureMirrors(root, async (dir) => {
         try {
           const url = (await this.git(['config', '--get', 'remote.origin.url'], dir, {})).trim()
           return url === '' ? undefined : url
@@ -333,7 +336,7 @@ export class MirrorStore {
         }
       })
     } catch (error) {
-      throw gitFailure(error, `统计镜像目录 ${this.currentRoot} 的占用`)
+      throw gitFailure(error, `统计镜像目录 ${root} 的占用`)
     }
   }
 
@@ -355,6 +358,7 @@ export class MirrorStore {
    */
   async owns(dir: string): Promise<boolean> {
     for (const root of new Set([this.currentRoot, ...this.roots.values()])) {
+      if (root === undefined) continue
       let real: string
       try {
         real = await realpath(root)
@@ -377,8 +381,13 @@ export class MirrorStore {
     return mirror
   }
 
+  private requireRoot(): string {
+    if (this.currentRoot === undefined) throw new RepoError('unavailable', MIRROR_DIR_UNSET)
+    return this.currentRoot
+  }
+
   private snapshotRoot(dir: string): string {
-    const root = this.roots.get(dir) ?? this.currentRoot
+    const root = this.roots.get(dir) ?? this.requireRoot()
     return join(root, '.snapshots', relative(root, dir))
   }
 

@@ -11,7 +11,8 @@
  * @module dsh-repo
  */
 
-import { defaultMirrorDir, hostsFile, resolveConfig, syncIndexDir, syncsFile, watchesFile } from './config.ts'
+import { hostsFile, resolveConfig, syncIndexDir, syncsFile, watchesFile } from './config.ts'
+import { forbiddenMirrorRoots } from './mirror/root.ts'
 import type { HostApproval, HostContext, WorkingDirectoryService } from './host.ts'
 import type { WatchDelivery } from './watch/delivery.ts'
 import { HostStore } from './hosts.ts'
@@ -33,7 +34,8 @@ import { RepoError } from './errors.ts'
 
 export type * from './contract.ts'
 export type { HostSpec, RepoConfig, RepoLimits, RepoSettings, SettingsOverrides } from './config.ts'
-export { DEFAULT_SETTINGS, apiBaseUrl, defaultMirrorDir, hostsFile, normalizeHostUrl, pluginConfigSchema, repoSettingsSchema, resolveConfig, resolveSettings, settingsOverrides } from './config.ts'
+export { DEFAULT_SETTINGS, apiBaseUrl, hostsFile, normalizeHostUrl, pluginConfigSchema, repoSettingsSchema, resolveConfig, resolveSettings, settingsOverrides } from './config.ts'
+export { MIRROR_DIR_UNSET, checkMirrorDir, forbiddenMirrorRoots } from './mirror/root.ts'
 export { RepoError, toRepoError } from './errors.ts'
 export { HostStore, addedTokenRef, isAcceptedToken } from './hosts.ts'
 export { GitError, credentialEnvironment, runGit } from './mirror/git.ts'
@@ -124,6 +126,8 @@ export interface RepoPluginOptions {
   readonly git?: GitRunner
   /** Environment `$DSH_HOME` is read from; default `process.env`. */
   readonly env?: NodeJS.ProcessEnv
+  /** Substitute the roots the mirror directory may not lie in; default `forbiddenMirrorRoots(env)`. */
+  readonly forbiddenMirrorRoots?: readonly string[]
   /** Substitute how activity reaches Sessions. */
   readonly delivery?: WatchDelivery
 }
@@ -147,7 +151,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   const git = options.git ?? runGit
   const mirrors = new MirrorStore({
     git,
-    root: hosts.mirrorDir() ?? defaultMirrorDir(env),
+    root: undefined,
     limits: () => {
       const { mirror, limits } = hosts.settings()
       return { timeoutMs: mirror.gitTimeoutMs, maxFileBytes: limits.maxFileBytes, maxTreeEntries: limits.maxTreeEntries }
@@ -166,7 +170,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     hosts,
     mirrors,
     workspaces,
-    defaultMirrorDir: defaultMirrorDir(env),
+    forbiddenMirrorRoots: options.forbiddenMirrorRoots ?? forbiddenMirrorRoots(env),
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
     ...options.providerFactory === undefined ? {} : { factory: options.providerFactory },
   })

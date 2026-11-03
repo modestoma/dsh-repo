@@ -46,6 +46,7 @@ function setup(tokens: Record<string, string> = {}, git: GitRunner = runGit) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-'))
   const config = testConfig()
   const make = () => new RepoService({
+    forbiddenMirrorRoots: [],
     credentials: credentials(tokens),
     hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
     ...withMirrors(new MirrorStore({ git, root: join(root, 'mirrors'), limits: mirrorLimits(1024, 100) }), git, 200),
