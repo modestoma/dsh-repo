@@ -5,50 +5,41 @@
  * pipeline:
  *
  * 1. validate the parameters;
- * 2. for a write made for an Agent (every tool call, and a service call with
- *    `agent`): refuse while writes are `off`, check the repository's catalog
- *    access, dispatch `access/authorize` for the Agent's Session, and while
- *    writes are `ask` show the approval card (declined → `declined`);
- * 3. run, including the steps after a write (PR/MR watching, own-comment
+ * 2. for a write to a code host, from any caller: the write policy
+ *    (`dsh-repo/policy`) refuses while writes are `off` and checks the
+ *    repository's catalog access;
+ * 3. for a write made for an Agent (every tool call, and a service call with
+ *    `agent`): refuse a catalog change while writes are `off`, dispatch
+ *    `access/authorize` for the Agent's Session, and while writes are `ask`
+ *    show the approval card (declined → `declined`);
+ * 4. run, including the steps after a write (PR/MR watching, own-comment
  *    memory, signature), so a service call behaves like the tool.
  *
- * A service write without `agent` skips step 2 except the catalog check: the
- * calling plugin answers for it.
+ * A service write without `agent` skips step 3: the calling plugin answers
+ * for it.
  *
  * @module dsh-repo/operations
  */
 
 import { z } from 'zod'
-import { basename, isAbsolute, resolve } from 'node:path'
-import type {
-  AuthorizeLevel, CallerAgent, CommitAuthor, MrInfo, MrSummary, RepoAccess, WorkspaceInfo, WorkspacePushResult,
-} from './contract.ts'
+import type { Caller, WatchHooks } from './calls.ts'
+import { requireAgent, sessionOf, watchMr, withSignature } from './calls.ts'
+import type { AuthorizeLevel, RepoAccess } from './contract.ts'
 import type { RepoSettings } from './config.ts'
 import { allows } from './catalog/entry.ts'
 import { RepoError } from './errors.ts'
 import { COMMIT_ID } from './refs.ts'
-import { authorize, collectDetails } from './events.ts'
+import { authorize } from './events.ts'
 import type { ParallelDispatch } from './events.ts'
 import type { Agent, HostApproval, WorkingDirectoryService } from './host.ts'
-import { freeDirectory, realPathOf, within } from './paths.ts'
-import { pushPrompt } from './push-prompt.ts'
+import type { ToolLeases } from './mirror/tool-leases.ts'
+import type { WriteLevel } from './policy.ts'
 import type { RepoService } from './service.ts'
-import type { WatchInfo } from './settings/contract.ts'
-import type { TrackRequest } from './watch/watcher.ts'
+import { createWorkspace, listWorkspaces, pushWorkspace, pushWorkspacePrompt, removeWorkspace, workspaceStatus } from './workspace/flow.ts'
 import type { WorkspaceManager } from './workspace/manager.ts'
-import { workspaceInfo } from './workspace/manager.ts'
 
 /** Which settings offer a tool: reads and watch always, writes unless `writes` is `off`, merge too; each also needs a catalog repository with that access. `admin` (adding repositories) needs no catalog entry. The plugin offers watch only while watching is active. */
 export type ToolAccess = 'read' | 'watch' | 'write' | 'merge' | 'admin'
-
-/** The PR/MR watcher as the operations use it. */
-export interface WatchHooks {
-  /** @returns whether watching is on and can start a turn of a Session. */
-  readonly active: boolean
-  track(request: TrackRequest): Promise<WatchInfo>
-  untrack(repo: string, number: number, session: string): Promise<boolean>
-  ownComment(repo: string, number: number, commentId: string): Promise<void>
-}
 
 /** Collaborators every operation may use. */
 export interface OperationDeps {
@@ -62,14 +53,8 @@ export interface OperationDeps {
   readonly parallel?: ParallelDispatch
   /** PR/MR watching; absent means requests are not watched. */
   readonly watch?: WatchHooks
-}
-
-/** Who calls and how. */
-export interface Caller {
-  readonly origin: 'tool' | 'service'
-  readonly agent?: CallerAgent
-  readonly callId?: string
-  readonly signal: AbortSignal
+  /** Snapshot leases held for tools. */
+  readonly leases: ToolLeases
 }
 
 /** Approval text. */
@@ -86,7 +71,7 @@ export type Gate = (prompt: Prompt) => Promise<void>
 /** A write's gate. */
 interface WriteSpec<A> {
   /** Catalog access the write needs on its repository; undefined for one outside the catalog (repoAdd). */
-  readonly level: RepoAccess | undefined
+  readonly level: WriteLevel | undefined
   readonly authorize: AuthorizeLevel
   /** The approval text; absent when `run` calls the gate itself. */
   readonly prompt?: (args: A, deps: OperationDeps, caller: Caller) => Prompt | Promise<Prompt>
@@ -132,44 +117,12 @@ const ciTarget = z.object({ repo, runId: runId.optional(), jobId: jobId.optional
 const mrBody = z.string().optional().describe('Description for reviewers: what changed and why, how it was verified, and anything risky or left undone. Keep it short; link issues instead of restating them; never paste conversation transcripts')
 const workspacePath = z.string().min(1).optional().describe('Workspace directory or a directory inside it; default: the current working directory')
 
-/** Tool snapshot leases are released after this long, or when the same Session acquires another snapshot of the repository. */
-const TOOL_LEASE_MS = 12 * 60 * 60 * 1000
-
 function define<S extends z.ZodType, R>(operation: Operation<S, R>): Operation<S, R> {
   return operation
 }
 
-function withSignature(body: string | undefined, signature: string): string | undefined {
-  if (body === undefined || signature === '') return body
-  return `${body}\n\n${signature}`
-}
-
-function sessionOf(caller: Caller): string | undefined {
-  return caller.agent?.session?.header.id
-}
-
-function requireAgent(caller: Caller, name: string): CallerAgent {
-  if (caller.agent === undefined) throw new RepoError('invalid', `${name} 需要由 Agent 调用`)
-  return caller.agent
-}
-
 function stateSuffix(state: string | undefined): string {
   return state === 'closed' ? '（关闭）' : state === 'open' ? '（重新打开）' : ''
-}
-
-/**
- * Watch a request for the calling Session while watching is active. The write
- * already succeeded, so a failure is reported in the result, not thrown.
- */
-async function watchMr(deps: OperationDeps, repoTarget: string, mr: MrInfo, caller: Caller, source: TrackRequest['source'], pushed?: string): Promise<{ watching: boolean; watchError?: string }> {
-  const session = sessionOf(caller)
-  if (deps.watch === undefined || !deps.watch.active || session === undefined || mr.state !== 'open') return { watching: false }
-  try {
-    await deps.watch.track({ repo: repoTarget, mr, session, source, ...pushed === undefined ? {} : { pushed } })
-    return { watching: true }
-  } catch (error) {
-    return { watching: false, watchError: error instanceof Error ? error.message : String(error) }
-  }
 }
 
 /** Keep watches from reporting a comment dsh-repo posted; the comment exists, so a failure only loses that. */
@@ -179,74 +132,6 @@ async function rememberComment(deps: OperationDeps, repoTarget: string, mr: numb
   } catch {
     // A failed store write: the watch may report this comment once; the comment itself was posted.
   }
-}
-
-/**
- * Open requests from a branch, following pages: a host may return a page with
- * every entry filtered out (GitLab drops fork MRs after fetching) and still
- * have more pages.
- */
-async function openMrsFrom(service: RepoService, repoTarget: string, branch: string, signal: AbortSignal): Promise<readonly MrInfo[]> {
-  const found: MrInfo[] = []
-  for (let next: number | undefined = 1; next !== undefined;) {
-    const result = await service.forge.listMrs(repoTarget, { state: 'open', sourceBranch: branch, page: next, perPage: 100, signal })
-    found.push(...result.items)
-    next = result.nextPage
-  }
-  return found
-}
-
-function summary(mr: MrInfo): MrSummary {
-  return { number: mr.number, title: mr.title, targetBranch: mr.targetBranch, webUrl: mr.webUrl }
-}
-
-/** The Agent's effective directory, or its Session's original directory without the working-directory service. */
-async function currentDirectory(deps: OperationDeps, agent: CallerAgent, signal: AbortSignal): Promise<string> {
-  const host = agent as Agent
-  const current = await deps.workingDirectory()?.ensure(host, signal) ?? host.session?.header.cwd
-  if (current === undefined) throw new RepoError('invalid', '当前会话没有工作目录')
-  return current
-}
-
-/** The directory a workspace call names: `path` as given (relative to the Agent's directory for a tool), or the Agent's directory. */
-async function workspaceTarget(deps: OperationDeps, path: string | undefined, caller: Caller, name: string): Promise<string> {
-  if (caller.origin === 'service') {
-    if (path === undefined || !isAbsolute(path)) throw new RepoError('invalid', `${name} 的 path 必须是绝对路径`)
-    return path
-  }
-  const agent = requireAgent(caller, name)
-  if (path !== undefined && isAbsolute(path)) return path
-  const current = await currentDirectory(deps, agent, caller.signal)
-  return path === undefined ? current : resolve(current, path)
-}
-
-/** The catalog address of a repository target. */
-function catalogUrl(service: RepoService, target: string, level: RepoAccess = 'read'): string {
-  return service.catalog.require(target, level).url
-}
-
-/** Snapshot leases taken by tools, one per Session and repository. */
-const toolLeases = new Map<string, { release(): void; timer: NodeJS.Timeout }>()
-
-function holdForTool(key: string, release: () => void): void {
-  toolLeases.get(key)?.release()
-  const timer = setTimeout(() => { held.release() }, TOOL_LEASE_MS)
-  timer.unref?.()
-  const held = {
-    timer,
-    release: () => {
-      clearTimeout(timer)
-      if (toolLeases.get(key) === held) toolLeases.delete(key)
-      release()
-    },
-  }
-  toolLeases.set(key, held)
-}
-
-/** The configured workspace commit identity, when both fields are set. */
-function configuredIdentity(settings: RepoSettings): CommitAuthor | undefined {
-  const { commitName, commitEmail } = settings.workspace
-  return commitName === '' || commitEmail === '' ? undefined : { name: commitName, email: commitEmail }
 }
 
 /** Every operation in tool order. */
@@ -438,7 +323,7 @@ export const OPERATIONS: readonly Operation[] = [
         deleteSourceBranch: service.settings.current.tools.deleteSourceBranch,
         signal: caller.signal,
       })
-      return { ...mr, ...await watchMr(deps, args.repo, mr, caller, 'created') }
+      return { ...mr, ...await watchMr(deps.watch, args.repo, mr, caller, 'created') }
     },
   }),
   define({
@@ -450,7 +335,7 @@ export const OPERATIONS: readonly Operation[] = [
     write: { level: 'write', authorize: 'code-write', prompt: args => ({ zh: `修改 ${args.repo} 的 PR/MR #${args.number}${stateSuffix(args.state)}`, en: `Update PR/MR #${args.number} in ${args.repo}` }) },
     run: async (args, deps, caller) => {
       const mr = await deps.service.forge.updateMr(args.repo, args.number, { ...args, signal: caller.signal })
-      return args.state === 'open' ? { ...mr, ...await watchMr(deps, args.repo, mr, caller, 'requested') } : mr
+      return args.state === 'open' ? { ...mr, ...await watchMr(deps.watch, args.repo, mr, caller, 'requested') } : mr
     },
   }),
   define({
@@ -597,14 +482,15 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Get a read-only local copy (plain files, no .git) of a repository at a branch, tag, or commit, fetched fresh from the remote, to search and read the whole code base with the ordinary file and shell tools. Snapshots of the same commit are shared; do not write into one. To change code, use repo_workspace_create instead.',
     schema: z.object({ repo, ref: z.string().min(1).optional().describe('Branch, tag, or full commit id; default: the branch the catalog follows, or the default branch') }).strict(),
-    run: async (args, { service }, caller) => {
+    run: async (args, deps, caller) => {
+      const { service } = deps
       const entry = service.catalog.require(args.repo, 'read')
       const branch = args.ref === undefined ? entry.branch : undefined
       const mirror = await service.mirrors.sync(entry.url, { ...branch === undefined ? {} : { branch }, signal: caller.signal })
       const target = args.ref === undefined ? mirror.commit : await service.mirrors.store.resolveRef(entry.url, args.ref, caller.signal)
       const lease = await service.mirrors.store.acquire(entry.url, target, caller.signal)
       if (caller.origin === 'service') return { repo: entry.url, commit: lease.commit, path: lease.dir, release: lease.release }
-      holdForTool(`${sessionOf(caller) ?? ''}\u0000${entry.url}`, lease.release)
+      deps.leases.hold(`${sessionOf(caller) ?? ''}\u0000${entry.url}`, lease.release)
       return { repo: entry.url, commit: lease.commit, path: lease.dir }
     },
   }),
@@ -620,39 +506,7 @@ export const OPERATIONS: readonly Operation[] = [
       commit: commit.optional().describe('Full commit id on `base` to start from, e.g. the commit a log analysis looked at'),
       branch: z.string().min(1).optional().describe('Branch to push to; an existing one is continued from its head. Default: dsh/<session id>'),
     }).strict(),
-    run: async (args, deps, caller) => {
-      const url = catalogUrl(deps.service, args.repo)
-      let path = args.path
-      let agent: CallerAgent | undefined
-      if (caller.origin === 'tool') {
-        agent = requireAgent(caller, 'repo_workspace_create')
-        const root = (agent as Agent).session?.header.cwd
-        const current = await currentDirectory(deps, agent, caller.signal)
-        const parent = root === undefined || within(root, current) ? current : root
-        path = path === undefined ? await freeDirectory(parent, basename(url.replace(/\/+$/, '').replace(/\.git$/, '')) || 'repo') : resolve(current, path)
-        // Compared also through real paths: a symbolic link inside the Session directory may lead outside it.
-        if (root !== undefined && (!within(root, path) || !within(await realPathOf(root), await realPathOf(path)))) throw new RepoError('invalid', `工作区目录必须在会话目录 ${root} 里面：${path}`)
-      } else if (path === undefined) {
-        throw new RepoError('invalid', 'workspaceCreate 的 path 必须给出')
-      }
-      const session = sessionOf(caller)
-      const info: WorkspaceInfo = await deps.workspaces.create({
-        repo: url,
-        path,
-        ...args.base === undefined ? {} : { base: args.base },
-        ...args.commit === undefined ? {} : { commit: args.commit },
-        ...args.branch === undefined ? {} : { branch: args.branch },
-        ...session === undefined ? {} : { session },
-      }, caller.signal)
-      if (agent === undefined) return info
-      const workingDirectory = deps.workingDirectory()
-      const current = workingDirectory === undefined ? undefined : await workingDirectory.set(agent as Agent, info.path, caller.signal)
-      return {
-        ...info,
-        workingDirectory: current ?? null,
-        next: `Work in ${info.path} with the ordinary tools and plain git; when done, call repo_workspace_push (with mr to open a PR/MR into ${info.base}). It pushes to branch ${info.branch}.`,
-      }
-    },
+    run: async (args, deps, caller) => await createWorkspace(deps, args, caller),
   }),
   define({
     tool: 'repo_workspace_list',
@@ -660,15 +514,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'List the workspaces created by repo_workspace_create that are inside this session\'s directory, with their repository, branch, and start point.',
     schema: z.object({ repo: repo.optional().describe('Only workspaces of this repository') }).strict(),
-    run: async (args, deps, caller) => {
-      const url = args.repo === undefined ? undefined : catalogUrl(deps.service, args.repo)
-      const records = await deps.workspaces.list(url)
-      if (caller.origin === 'service') return records.map(workspaceInfo)
-      const agent = requireAgent(caller, 'repo_workspace_list') as Agent
-      const root = agent.session?.header.cwd
-      const session = agent.session?.header.id
-      return records.filter(record => record.session === session || (root !== undefined && within(root, record.path))).map(workspaceInfo)
-    },
+    run: async (args, deps, caller) => await listWorkspaces(deps, args.repo, caller),
   }),
   define({
     tool: 'repo_workspace_status',
@@ -676,12 +522,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Show what a workspace changed since its start: files with line counts (uncommitted and untracked included), its commits, how many are not pushed yet, and the diff (cut at the configured size limit).',
     schema: z.object({ path: workspacePath }).strict(),
-    run: async (args, deps, caller) => {
-      const record = await deps.workspaces.locate(await workspaceTarget(deps, args.path, caller, 'workspaceStatus'))
-      deps.service.catalog.require(record.repo, 'read')
-      const settings = deps.service.settings.current
-      return await deps.workspaces.status(record, caller.signal, settings.limits.maxDiffBytes, settings.mirror.gitTimeoutMs)
-    },
+    run: async (args, deps, caller) => await workspaceStatus(deps, args.path, caller),
   }),
   define({
     tool: 'repo_workspace_push',
@@ -702,66 +543,9 @@ export const OPERATIONS: readonly Operation[] = [
     write: {
       level: 'write',
       authorize: 'code-write',
-      prompt: async (args, deps, caller) => {
-        const record = await deps.workspaces.locate(await workspaceTarget(deps, args.path, caller, 'workspacePush'))
-        deps.service.catalog.require(record.repo, 'write')
-        const settings = deps.service.settings.current
-        const status = await deps.workspaces.status(record, caller.signal, settings.limits.maxDiffBytes, settings.mirror.gitTimeoutMs)
-        const remote = (await deps.service.mirrors.store.resolveRef(record.repo, record.branch, caller.signal).catch(() => undefined)) === undefined
-        return { ...pushPrompt(status, args, remote), repo: record.repo }
-      },
+      prompt: async (args, deps, caller) => await pushWorkspacePrompt(deps, args, caller),
     },
-    run: async (args, deps, caller): Promise<WorkspacePushResult> => {
-      const { service, workspaces } = deps
-      const record = await workspaces.locate(await workspaceTarget(deps, args.path, caller, 'workspacePush'))
-      service.catalog.require(record.repo, 'write')
-      const settings = service.settings.current
-      const session = sessionOf(caller) ?? record.session
-      const details = session === undefined ? undefined : await collectDetails(deps.parallel, { session, path: record.path })
-      const trailers = details === undefined ? undefined : checkTrailers(details.trailers)
-      const committer = await service.hosts.tokenIdentity(record.repo, caller.signal)
-      const author = details?.author === undefined ? configuredIdentity(settings) ?? committer : checkAuthor(details.author)
-      const outcome = await workspaces.push(record, {
-        ...args.message === undefined ? {} : { message: args.message },
-        ...args.forceWithLease === undefined ? {} : { forceWithLease: args.forceWithLease },
-        ...author === undefined ? {} : { author },
-        ...committer === undefined ? {} : { committer },
-        ...session === undefined ? {} : { session },
-        ...trailers === undefined || trailers.length === 0 ? {} : { trailers },
-        signal: caller.signal,
-      }, settings.mirror.gitTimeoutMs)
-      const base = { repo: record.repo, path: record.path, branch: record.branch, base: record.base, ...outcome }
-      let open: readonly MrInfo[]
-      let createdMr: MrInfo | undefined
-      try {
-        open = await openMrsFrom(service, record.repo, record.branch, caller.signal)
-        if (args.mr !== undefined && open.length === 0) {
-          createdMr = await service.forge.createMr(record.repo, {
-            title: args.mr.title,
-            ...args.mr.body === undefined ? {} : { body: withSignature(args.mr.body, settings.tools.signature) ?? args.mr.body },
-            sourceBranch: record.branch,
-            targetBranch: args.mr.target ?? record.base,
-            draft: args.mr.draft === true,
-            deleteSourceBranch: settings.tools.deleteSourceBranch,
-            signal: caller.signal,
-          })
-          open = [createdMr]
-        }
-      } catch (error) {
-        // The push already succeeded; report the failed request step instead of failing the call.
-        return { ...base, openMrs: [], watching: false, mrError: error instanceof Error ? error.message : String(error) }
-      }
-      const watched = []
-      for (const mr of open) watched.push(await watchMr(deps, record.repo, mr, caller, mr === createdMr ? 'created' : 'pushed', outcome.commit))
-      const watchError = watched.find(entry => entry.watchError !== undefined)?.watchError
-      return {
-        ...base,
-        openMrs: open.map(summary),
-        ...createdMr === undefined ? {} : { createdMr: summary(createdMr) },
-        watching: watched.some(entry => entry.watching),
-        ...watchError === undefined ? {} : { watchError },
-      }
-    },
+    run: async (args, deps, caller) => await pushWorkspace(deps, args, caller),
   }),
   define({
     tool: 'repo_workspace_remove',
@@ -769,50 +553,9 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Delete a workspace directory created by repo_workspace_create. Refused while it has uncommitted changes or unpushed commits unless `force` is set.',
     schema: z.object({ path: z.string().min(1).describe('Workspace directory'), force: z.boolean().optional().describe('Delete even with unsaved work') }).strict(),
-    run: async (args, deps, caller) => {
-      const record = await deps.workspaces.locate(await workspaceTarget(deps, args.path, caller, 'workspaceRemove'))
-      if (caller.origin === 'tool') {
-        const root = (requireAgent(caller, 'repo_workspace_remove') as Agent).session?.header.cwd
-        if (root !== undefined && record.session !== sessionOf(caller) && !within(root, record.path)) throw new RepoError('forbidden', `${record.path} 不在当前会话的目录里，也不是当前会话创建的`)
-      }
-      const removed = await deps.workspaces.remove(record, args.force === true, caller.signal, deps.service.settings.current.mirror.gitTimeoutMs)
-      return { path: record.path, ...removed }
-    },
+    run: async (args, deps, caller) => await removeWorkspace(deps, args.path, args.force === true, caller),
   }),
 ]
-
-/** Most trailers one push may add besides `DSH-Session:`. */
-const MAX_TRAILERS = 20
-const TRAILER_TOKEN = /^[A-Za-z][A-Za-z0-9-]{0,63}$/
-
-/**
- * Validate commit trailers the `repo/commit-trailers` listeners added, trimming each value.
- * @param trailers - added trailers.
- * @returns the trimmed trailers.
- * @throws {RepoError} `invalid` naming the first bad trailer.
- */
-export function checkTrailers(trailers: readonly { readonly token: string; readonly value: string }[]): { token: string; value: string }[] {
-  if (trailers.length > MAX_TRAILERS) throw new RepoError('invalid', `提交尾注最多 ${MAX_TRAILERS} 条，收到 ${trailers.length} 条`)
-  return trailers.map(({ token, value }) => {
-    if (!TRAILER_TOKEN.test(token)) throw new RepoError('invalid', `提交尾注名只能是字母开头的字母、数字和 -，最长 64 个字符：${JSON.stringify(token)}`)
-    if (token.toLowerCase() === 'dsh-session') throw new RepoError('invalid', 'DSH-Session 尾注由 dsh-repo 自己写入，不能另外添加')
-    const trimmed = value.trim()
-    if (trimmed === '' || trimmed.length > 200 || /[\u0000-\u001f\u007f]/.test(trimmed)) throw new RepoError('invalid', `提交尾注 ${token} 的值不能为空、超过 200 个字符或包含换行等控制字符`)
-    return { token, value: trimmed }
-  })
-}
-
-/**
- * A commit author as given, trimmed.
- * @throws {RepoError} `invalid` for an empty name or one with `<`, `>`, or a newline, or an empty email or one with `<`, `>`, or whitespace.
- */
-function checkAuthor(author: CommitAuthor): CommitAuthor {
-  const name = author.name.trim()
-  const email = author.email.trim()
-  if (!/^[^<>\n]+$/.test(name)) throw new RepoError('invalid', '提交作者名不能为空，也不能包含 < > 或换行')
-  if (!/^[^<>\s]+$/.test(email)) throw new RepoError('invalid', '提交作者邮箱不能为空，也不能包含 < > 或空白')
-  return { name, email }
-}
 
 /**
  * Whether the tool settings and the catalog offer a tool to the model.
@@ -857,18 +600,18 @@ export async function execute(operation: Operation, raw: unknown, deps: Operatio
   return await operation.run(args, deps, caller, gate)
 }
 
-/** The gate of a write: catalog access, then for an Agent writes setting, `access/authorize`, and approval. */
+/** The gate of a write: the write policy, then for an Agent `access/authorize` and approval. */
 function gateOf(operation: Operation, args: unknown, deps: OperationDeps, caller: Caller): Gate {
   return async (prompt) => {
     const spec = operation.write
     if (spec === undefined) return
     const target = prompt.repo ?? (args as { repo?: unknown }).repo
-    if (spec.level !== undefined && typeof target === 'string') deps.service.catalog.require(target, spec.level)
+    const name = caller.origin === 'tool' ? operation.tool : operation.method
+    if (spec.level !== undefined && typeof target === 'string') deps.service.policy.requireWrite(target, spec.level, name)
     const gated = caller.origin === 'tool' || caller.agent !== undefined
     if (!gated) return
+    if (spec.level === undefined) deps.service.policy.requireWritesOn(name)
     const writes = deps.service.settings.current.tools.writes
-    const name = caller.origin === 'tool' ? operation.tool : operation.method
-    if (writes === 'off') throw new RepoError('forbidden', `dsh-repo 设置页已关闭写操作，${name} 不会执行`)
     const session = sessionOf(caller)
     if (session !== undefined) await authorize(deps.parallel, { session, level: spec.authorize, action: operation.method, summary: prompt.zh })
     if (writes !== 'ask') return

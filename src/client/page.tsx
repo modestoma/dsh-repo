@@ -311,7 +311,7 @@ function ToolsTab({ current, defaults, errors, busy, edit }: FormProps): JSX.Ele
       <Row label="提供代码仓库工具" summary="关闭后模型看不到 repo_* 工具，其他插件不受影响。">
         <Switch label="提供代码仓库工具" checked={current.enabled} disabled={busy} onChange={(value) => { edit({ enabled: value }) }} />
       </Row>
-      <Row label="写操作" summary="创建、修改、评论 issue 与 PR/MR，推送工作区，合并 PR/MR；只对仓库清单中权限允许的仓库生效。">
+      <Row label="写操作" summary="创建、修改、评论 issue 与 PR/MR，推送工作区，合并 PR/MR；只对仓库清单中权限允许的仓库生效。关闭后一律拒绝，包括工作区里的 git push 和其他插件的调用。">
         <ResetLink shown={current.writes !== defaults.writes} busy={busy} onReset={() => { edit({ writes: defaults.writes }) }} />
         <Segmented label="写操作" value={current.writes} options={WRITE_MODES} disabled={busy || off} onChange={(value) => { edit({ writes: value }) }} />
       </Row>

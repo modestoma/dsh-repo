@@ -7,7 +7,8 @@
  * - {@link RepoService.hosts}: hosts, their tokens, and their providers;
  * - {@link RepoService.catalog}: the repositories dsh-repo may reach;
  * - {@link RepoService.mirrors}: the mirror directory and catalog-checked mirror fetches;
- * - {@link RepoService.forge}: code host API calls, checked against the catalog.
+ * - {@link RepoService.forge}: code host API calls, checked against the catalog;
+ * - {@link RepoService.policy}: whether a write to a code host, including a push, may happen.
  *
  * Tokens are read through `ctx.credentials` and settings from the settings
  * file's store on every request, so a rotated token or a saved setting takes
@@ -23,6 +24,7 @@ import type { ProviderFactory } from './forge/hosts.ts'
 import type { HostCredentials, HostLogger } from './host.ts'
 import { Mirrors } from './mirror/access.ts'
 import type { MirrorStore } from './mirror/store.ts'
+import { WritePolicy } from './policy.ts'
 import { RuntimeSettings } from './settings/runtime.ts'
 import type { SettingsStore } from './settings/store.ts'
 
@@ -51,6 +53,7 @@ export class RepoService {
   readonly catalog: RepoCatalog
   readonly mirrors: Mirrors
   readonly forge: Forge
+  readonly policy: WritePolicy
 
   /** @param deps - credential store, settings file, mirror store, forbidden mirror roots, provider factory, and logger. */
   constructor(deps: RepoServiceDeps) {
@@ -62,5 +65,6 @@ export class RepoService {
     this.catalog = new RepoCatalog({ store: deps.store, mirrorDir: () => deps.mirrorStore.root, ...logger })
     this.mirrors = new Mirrors({ store: deps.mirrorStore, settings: deps.store, catalog: this.catalog, hosts: this.hosts, forbiddenRoots: deps.forbiddenMirrorRoots, ...logger })
     this.forge = new Forge({ hosts: this.hosts, catalog: this.catalog, settings: () => this.settings.current })
+    this.policy = new WritePolicy({ catalog: this.catalog, mirrors: this.mirrors, forge: this.forge, settings: () => this.settings.current })
   }
 }

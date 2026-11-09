@@ -213,6 +213,26 @@ describe('plain git through the proxy', () => {
     expect((await tryGit(bare, 'rev-parse', '--verify', '--quiet', 'refs/heads/release/1')).status).not.toBe(0)
   })
 
+  it('refuses every push while writes are off: plain git, workspace push, and API writes', async () => {
+    const { bare, manager, service, sessions, url, pushed } = await setup()
+    const path = join(sessions, 'app')
+    await manager.create({ repo: url, path, branch: 'fix/a' })
+    await service.settings.update({ tools: { writes: 'off' } })
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    await git(path, 'add', '.')
+    await git(path, '-c', 'user.name=x', '-c', 'user.email=x@example.com', 'commit', '--quiet', '-m', 'a')
+    const refused = await tryGit(path, 'push', 'origin', 'HEAD')
+    expect(refused.status).not.toBe(0)
+    expect(refused.output).toContain('已关闭写操作')
+    writeFileSync(join(path, 'b.txt'), 'b\n')
+    const record = await manager.locate(path)
+    await expect(manager.push(record, { message: 'b', committer: { name: 'bot', email: 'bot@example.com' } }, TIMEOUT)).rejects.toMatchObject({ message: expect.stringContaining('已关闭写操作') })
+    expect(await git(path, 'status', '--porcelain')).toContain('b.txt')
+    await expect(service.forge.createIssue(url, { title: 'x' })).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('已关闭写操作') })
+    expect((await tryGit(bare, 'rev-parse', '--verify', '--quiet', 'refs/heads/fix/a')).status).not.toBe(0)
+    expect(pushed).toEqual([])
+  })
+
   it('asks the remote for its default branch instead of trusting the mirror', async () => {
     const { bare, manager, sessions, url, seed } = await setup()
     const path = join(sessions, 'app')

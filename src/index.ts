@@ -23,6 +23,7 @@ import { SettingsStore } from './settings/store.ts'
 import { runCommand, runGit } from './mirror/git.ts'
 import type { GitRunner } from './mirror/git.ts'
 import { MirrorStore } from './mirror/store.ts'
+import { ToolLeases } from './mirror/tool-leases.ts'
 import type { OperationDeps } from './operations.ts'
 import { DSH_REPOS_SERVICE, RepoService } from './service.ts'
 import type { ProviderFactory } from './forge/hosts.ts'
@@ -150,8 +151,11 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
       void proxy.stop()
     }
   }, 'dsh-repo: local git proxy')
+  const leases = new ToolLeases()
+  ctx.effect(() => () => { leases.releaseAll() }, 'dsh-repo: tool snapshot leases')
   const operations: OperationDeps = {
     service,
+    leases,
     workspaces,
     approval: () => ctx.get?.('approval') as HostApproval | undefined,
     workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
