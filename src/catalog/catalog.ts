@@ -270,6 +270,10 @@ export class RepoCatalog {
         return 'key' in own && own.key === key
       })
       if (held !== undefined) {
+        // Another call may have stored the entry, on another branch, while this one was being authorized.
+        if (checked.branch !== undefined && checked.branch !== held.branch) {
+          throw new RepoError('conflict', `${shownKey(key)} 已在仓库清单中，跟随${held.branch === undefined ? '默认分支' : `分支 ${held.branch}`}；改分支请在「代码仓库 → 仓库」中操作`)
+        }
         const next: CatalogEntry = { ...held, features: [...new Set([...held.features, ...features])] }
         if (next.features.length === held.features.length) return { repos: current, result: { status: 'unchanged', entry: held } }
         if (next.features.length > MAX_REPO_FEATURES) throw new RepoError('invalid', `一个仓库最多打开 ${MAX_REPO_FEATURES} 个功能，${shownKey(key)} 已有 ${held.features.length} 个`)

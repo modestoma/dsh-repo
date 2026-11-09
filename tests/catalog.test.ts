@@ -127,6 +127,15 @@ describe('repository catalog', () => {
     await expect(service.addRepo('https://gitlab.com/a/c')).rejects.toMatchObject({ code: 'not-allowed' })
     expect(await service.addRepo('https://github.com/a/c', { branch: 'dev', access: 'write' })).toMatchObject({ status: 'added', repo: { branch: 'dev', access: 'write', features: [] } })
     expect(events).toHaveLength(3)
+    // Concurrent additions on different branches: the one stored second is refused instead of joining the first's branch.
+    const racing = await Promise.allSettled([
+      service.addRepo('https://github.com/a/race', { branch: 'main', features: ['x'], session: 's1' }),
+      service.addRepo('https://github.com/a/race', { branch: 'dev', features: ['y'], session: 's1' }),
+    ])
+    expect(racing.map(outcome => outcome.status)).toEqual(['fulfilled', 'rejected'])
+    expect(racing[1]).toMatchObject({ reason: { code: 'conflict' } })
+    expect(service.listRepos().find(repo => repo.url === 'https://github.com/a/race')).toMatchObject({ branch: 'main', features: ['x'] })
+    events.length = 0
     // The merged feature list stays within the limit the settings file accepts.
     const many = Array.from({ length: 20 }, (_, index) => `f${index}`)
     await service.addRepo('https://github.com/a/full', { features: many })
