@@ -17,7 +17,7 @@ import { resolveConfig } from '../src/config.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
 import { runGit } from '../src/mirror/git.ts'
 import type { Provider } from '../src/providers/types.ts'
-import type { ProviderFactory } from '../src/service.ts'
+import type { ProviderFactory } from '../src/forge/hosts.ts'
 
 /** Address of the stand-in host. */
 export const REMOTE_HOST = 'https://git.test'

@@ -124,8 +124,8 @@ export function createService(config: RepoConfig, tokens: Record<string, string>
   return new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials(tokens),
-    hosts: settingsStore(config, root, settings, repos),
-    mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
+    store: settingsStore(config, root, settings, repos),
+    mirrorStore: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
   })
 }
 

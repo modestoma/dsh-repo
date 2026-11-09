@@ -20,7 +20,7 @@
 
 import { randomBytes } from 'node:crypto'
 import type { HostSpec } from '../config.ts'
-import type { RepoAccess, RepoAddResult, RepoFeature, RepoTarget } from '../contract.ts'
+import type { CatalogRepo, RepoAccess, RepoAddResult, RepoFeature, RepoTarget } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import type { HostLogger } from '../host.ts'
 import type { SettingsStore } from '../settings/store.ts'
@@ -28,6 +28,7 @@ import { overlaps, realPathOf } from '../paths.ts'
 import { ACCESS_LEVELS, MAX_REPO_FEATURES, MAX_REPOS } from '../settings/contract.ts'
 import type { RepoInput } from '../settings/contract.ts'
 import { resolveTarget } from '../target.ts'
+import type { ResolvedTarget } from '../target.ts'
 import { requireBranch } from '../refs.ts'
 import { allows, checkFeature, checkFeatureIds, checkInput, publicRepo } from './entry.ts'
 import type { CatalogEntry, CheckedInput } from './entry.ts'
@@ -57,7 +58,21 @@ export function accessLabel(access: RepoAccess): string {
  * @throws {RepoError} `invalid` for an unreadable address, `not-allowed` when no configured host serves it.
  */
 export function catalogKey(url: string, hosts: readonly HostSpec[]): string {
-  return resolveTarget(url.trim(), hosts).webUrl.replace(/^https?:\/\//, '').toLowerCase()
+  return keyOfTarget(resolveTarget(url.trim(), hosts))
+}
+
+function keyOfTarget(target: ResolvedTarget): string {
+  return target.webUrl.replace(/^https?:\/\//, '').toLowerCase()
+}
+
+/** A repository the catalog allows a call on, resolved once. */
+export interface CatalogHandle {
+  /** The catalog entry holding the repository. */
+  readonly entry: CatalogEntry
+  /** Catalog key of the repository. */
+  readonly key: string
+  /** The repository resolved to its host. */
+  readonly target: ResolvedTarget
 }
 
 /** Repositories dsh-repo may reach, with their access, features, and local syncs. */
@@ -96,11 +111,25 @@ export class RepoCatalog {
    * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no configured host serves it.
    */
   find(target: RepoTarget): CatalogEntry | undefined {
-    const key = catalogKey(target, this.deps.store.all())
-    return this.entries().find((entry) => {
-      const own = this.keyOf(entry)
-      return 'key' in own && own.key === key
-    })
+    return this.withKey(catalogKey(target, this.deps.store.all()))
+  }
+
+  /**
+   * Resolve a repository and require it in the catalog with at least an access level.
+   * @param target - repository address, `host/path`, or PR/MR URL.
+   * @param needed - access the call needs.
+   * @returns the entry, the key, and the resolved target.
+   * @throws {RepoError} `not-allowed` without a configured host, when the catalog does not hold the repository, or when its access is lower; `invalid` for an unreadable target.
+   */
+  open(target: RepoTarget, needed: RepoAccess): CatalogHandle {
+    const resolved = resolveTarget(target.trim(), this.deps.store.all())
+    const key = keyOfTarget(resolved)
+    const entry = this.withKey(key)
+    if (entry === undefined) throw new RepoError('not-allowed', `${key} 不在 dsh-repo 的仓库清单中，不能访问；请管理员在「代码仓库 → 仓库」中添加`)
+    if (!allows(entry.access, needed)) {
+      throw new RepoError('not-allowed', `${key} 在仓库清单中的权限是「${accessLabel(entry.access)}」，这次操作需要「${accessLabel(needed)}」；请管理员在「代码仓库 → 仓库」中调整`)
+    }
+    return { entry, key, target: resolved }
   }
 
   /**
@@ -108,16 +137,20 @@ export class RepoCatalog {
    * @param target - repository address, `host/path`, or PR/MR URL.
    * @param needed - access the call needs.
    * @returns the entry.
-   * @throws {RepoError} `not-allowed` when the catalog does not hold the repository or its access is lower; `invalid` for an unreadable target.
+   * @throws {RepoError} see {@link open}.
    */
   require(target: RepoTarget, needed: RepoAccess): CatalogEntry {
-    const key = catalogKey(target, this.deps.store.all())
-    const entry = this.find(target)
-    if (entry === undefined) throw new RepoError('not-allowed', `${key} 不在 dsh-repo 的仓库清单中，不能访问；请管理员在「代码仓库 → 仓库」中添加`)
-    if (!allows(entry.access, needed)) {
-      throw new RepoError('not-allowed', `${key} 在仓库清单中的权限是「${accessLabel(entry.access)}」，这次操作需要「${accessLabel(needed)}」；请管理员在「代码仓库 → 仓库」中调整`)
-    }
-    return entry
+    return this.open(target, needed).entry
+  }
+
+  /**
+   * The public view of the entries.
+   * @param options - only the entries with this feature turned on.
+   * @returns the entries in catalog order.
+   */
+  list(options: { readonly feature?: string } = {}): readonly CatalogRepo[] {
+    const { feature } = options
+    return this.entries().filter(entry => feature === undefined || entry.features.includes(feature)).map(publicRepo)
   }
 
   /** @returns the highest access any reachable entry allows, or undefined for an empty catalog. */
@@ -268,6 +301,13 @@ export class RepoCatalog {
     })
     if (outcome.status !== 'unchanged') this.emit()
     return { status: outcome.status, repo: publicRepo(outcome.entry) }
+  }
+
+  private withKey(key: string): CatalogEntry | undefined {
+    return this.entries().find((entry) => {
+      const own = this.keyOf(entry)
+      return 'key' in own && own.key === key
+    })
   }
 
   private emit(): void {

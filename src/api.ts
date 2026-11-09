@@ -76,45 +76,45 @@ export class DshReposApi implements DshRepoService {
   workspaceRemove(params: WorkspaceRemoveParams & CallOptions): Promise<WorkspaceRemoveResult> { return this.call('workspaceRemove', params) }
 
   repoResolve(repo: RepoTarget): RepoRef {
-    return this.service.resolve(repo)
+    return this.service.forge.resolve(repo)
   }
 
   repoOnChange(listener: () => void): () => void {
-    return this.service.onReposChange(listener)
+    return this.service.catalog.onChange(listener)
   }
 
   hostList(): Promise<readonly HostInfo[]> {
-    return this.service.listHosts()
+    return this.service.hosts.list()
   }
 
   hostAdd(params: HostCreate): Promise<HostInfo> {
-    return this.service.addHost(params)
+    return this.service.hosts.add(params)
   }
 
   hostRemove(params: { readonly url: string }): Promise<void> {
-    return this.service.removeHost(params.url)
+    return this.service.hosts.remove(params.url)
   }
 
   hostSetToken(params: { readonly url: string; readonly token: string | null }): Promise<HostInfo> {
-    return this.service.setHostToken(params.url, params.token ?? undefined)
+    return this.service.hosts.setToken(params.url, params.token ?? undefined)
   }
 
   hostOnChange(listener: (change: HostsChange) => void): () => void {
-    return this.service.onHostsChange(listener)
+    return this.service.hosts.onChange(listener)
   }
 
   featureRegister(feature: RepoFeature): () => void {
-    return this.service.registerFeature(feature)
+    return this.service.catalog.registerFeature(feature)
   }
 
   settingsGet(): RepoPublicSettings {
-    const mirror = this.service.mirrorSettings()
-    const { workspace } = this.service.settings
+    const mirror = this.service.mirrors.settings()
+    const { workspace } = this.service.settings.current
     const listening = this.deps.proxyPort()
     return {
       mirrorDir: mirror.dir,
       ...mirror.problem === undefined ? {} : { mirrorProblem: mirror.problem },
-      workspaceDir: this.service.hosts.workspaceDir(),
+      workspaceDir: this.service.settings.workspaceDir(),
       proxyPort: workspace.proxyPort,
       ...listening === undefined ? {} : { proxyListening: listening },
       commitName: workspace.commitName,
@@ -123,11 +123,11 @@ export class DshReposApi implements DshRepoService {
   }
 
   async settingsUpdate(update: RepoSettingsUpdate): Promise<RepoPublicSettings> {
-    if (update.mirrorDir !== undefined) await this.service.setMirrorDir(update.mirrorDir ?? undefined)
-    if (update.workspaceDir !== undefined) await this.service.hosts.setWorkspaceDir(update.workspaceDir === null ? undefined : await usableDirectory(update.workspaceDir))
+    if (update.mirrorDir !== undefined) await this.service.mirrors.setDir(update.mirrorDir ?? undefined)
+    if (update.workspaceDir !== undefined) await this.service.settings.setWorkspaceDir(update.workspaceDir === null ? undefined : await usableDirectory(update.workspaceDir))
     if (update.proxyPort !== undefined || update.commitName !== undefined || update.commitEmail !== undefined) {
-      const current = this.service.settings
-      await this.service.updateSettings({
+      const current = this.service.settings.current
+      await this.service.settings.update({
         ...current,
         workspace: {
           proxyPort: update.proxyPort ?? current.workspace.proxyPort,

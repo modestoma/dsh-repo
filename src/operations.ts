@@ -165,7 +165,7 @@ async function watchMr(deps: OperationDeps, repoTarget: string, mr: MrInfo, call
   const session = sessionOf(caller)
   if (deps.watch === undefined || !deps.watch.active || session === undefined || mr.state !== 'open') return { watching: false }
   try {
-    await deps.watch.track({ repo: repoTarget, change: mr, session, source, ...pushed === undefined ? {} : { pushed } })
+    await deps.watch.track({ repo: repoTarget, mr, session, source, ...pushed === undefined ? {} : { pushed } })
     return { watching: true }
   } catch (error) {
     return { watching: false, watchError: error instanceof Error ? error.message : String(error) }
@@ -189,7 +189,7 @@ async function rememberComment(deps: OperationDeps, repoTarget: string, mr: numb
 async function openMrsFrom(service: RepoService, repoTarget: string, branch: string, signal: AbortSignal): Promise<readonly MrInfo[]> {
   const found: MrInfo[] = []
   for (let next: number | undefined = 1; next !== undefined;) {
-    const result = await service.listChanges(repoTarget, { state: 'open', sourceBranch: branch, page: next, perPage: 100, signal })
+    const result = await service.forge.listMrs(repoTarget, { state: 'open', sourceBranch: branch, page: next, perPage: 100, signal })
     found.push(...result.items)
     next = result.nextPage
   }
@@ -257,7 +257,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'List the repositories these tools can reach (the deployment\'s repository catalog) with the branch each follows and its access: `read` (read only, local workspaces and snapshots), `write` (also push, issues, PRs/MRs, comments, CI retry/cancel), or `merge` (also merge PRs/MRs). Every other repository is refused; an administrator adds repositories on the dsh-repo settings page.',
     schema: z.object({ feature: z.string().min(1).optional().describe('Only repositories with this feature turned on') }).strict(),
-    run: async (args, { service }) => service.listRepos(args.feature === undefined ? {} : { feature: args.feature }),
+    run: async (args, { service }) => service.catalog.list(args.feature === undefined ? {} : { feature: args.feature }),
   }),
   define({
     tool: 'repo_get',
@@ -265,7 +265,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Show a repository\'s default branch, visibility, description, and clone URL on GitHub or GitLab.',
     schema: z.object({ repo }).strict(),
-    run: (args, { service }, caller) => service.repoInfo(args.repo, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.repoInfo(args.repo, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_add',
@@ -281,7 +281,7 @@ export const OPERATIONS: readonly Operation[] = [
     write: { level: undefined, authorize: 'admin' },
     run: async (args, { service }, caller, gate) => {
       caller.signal.throwIfAborted()
-      return await service.addRepo(args.repo, {
+      return await service.catalog.ensure(args.repo, {
         ...args.branch === undefined ? {} : { branch: args.branch },
         ...args.access === undefined ? {} : { access: args.access },
         ...args.features === undefined ? {} : { features: args.features },
@@ -294,7 +294,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'List branches with their head commit and protection.',
     schema: z.object({ repo, search: z.string().optional().describe('Substring of the branch name'), page, perPage }).strict(),
-    run: (args, { service }, caller) => service.listBranches(args.repo, { ...args, signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.listBranches(args.repo, { ...args, signal: caller.signal }),
   }),
   define({
     tool: 'repo_branch_get',
@@ -302,7 +302,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read one branch: its head commit, whether it is protected, and whether it is the default branch; null when it does not exist.',
     schema: z.object({ repo, name: z.string().min(1).describe('Branch name') }).strict(),
-    run: async (args, { service }, caller) => await service.getBranch(args.repo, args.name, { signal: caller.signal }) ?? null,
+    run: async (args, { service }, caller) => await service.forge.getBranch(args.repo, args.name, { signal: caller.signal }) ?? null,
   }),
   define({
     tool: 'repo_branch_delete',
@@ -311,7 +311,7 @@ export const OPERATIONS: readonly Operation[] = [
     description: 'Delete a leftover branch whose work is already merged, e.g. after a PR/MR was merged on the web. Only deletes a branch whose head commit is the head of a merged PR/MR from this repository and that is not the source of an open PR/MR, the default branch, or protected; anything else is refused, so unmerged work is never lost. Find candidates with repo_mr_list (state merged). Requires user approval.',
     schema: z.object({ repo, branch: z.string().min(1).describe('Branch to delete') }).strict(),
     write: { level: 'write', authorize: 'code-write', prompt: args => ({ zh: `删除已合并的分支\n仓库：${args.repo}\n分支：${args.branch}`, en: `Delete a merged branch\nRepository: ${args.repo}\nBranch: ${args.branch}` }) },
-    run: (args, { service }, caller) => service.deleteMergedBranch(args.repo, args.branch, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.deleteMergedBranch(args.repo, args.branch, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_commit_list',
@@ -319,7 +319,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'List commits newest first, optionally on a branch/tag/SHA and touching a path.',
     schema: z.object({ repo, ref: z.string().optional(), path: z.string().optional(), page, perPage }).strict(),
-    run: (args, { service }, caller) => service.listCommits(args.repo, { ...args, signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.listCommits(args.repo, { ...args, signal: caller.signal }),
   }),
   define({
     tool: 'repo_tree_list',
@@ -327,7 +327,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'List files and directories under a path at a ref (default: repository root on the default branch), through the host API. For browsing a whole checkout, use repo_snapshot_acquire.',
     schema: z.object({ repo, path: z.string().optional(), ref: z.string().optional(), recursive: z.boolean().optional() }).strict(),
-    run: (args, { service }, caller) => service.listTree(args.repo, { ...args, signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.listTree(args.repo, { ...args, signal: caller.signal }),
   }),
   define({
     tool: 'repo_file_read',
@@ -335,7 +335,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read one text file at a ref (default: the default branch) through the host API. Long files are cut at the configured size limit.',
     schema: z.object({ repo, path: z.string().min(1), ref: z.string().optional() }).strict(),
-    run: (args, { service }, caller) => service.readFile(args.repo, args.path, { ...args.ref === undefined ? {} : { ref: args.ref }, signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.readFile(args.repo, args.path, { ...args.ref === undefined ? {} : { ref: args.ref }, signal: caller.signal }),
   }),
   define({
     tool: 'repo_issue_list',
@@ -343,7 +343,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'List issues (pull/merge requests excluded), optionally searching their title and description.',
     schema: z.object({ repo, state: z.enum(['open', 'closed', 'all']).optional(), labels, assignee: z.string().optional(), search: z.string().min(1).optional().describe('Words in the title or description'), page, perPage }).strict(),
-    run: (args, { service }, caller) => service.listIssues(args.repo, { ...args, signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.listIssues(args.repo, { ...args, signal: caller.signal }),
   }),
   define({
     tool: 'repo_issue_get',
@@ -351,7 +351,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read one issue with its comments.',
     schema: z.object({ repo, number }).strict(),
-    run: (args, { service }, caller) => service.getIssue(args.repo, args.number, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.getIssue(args.repo, args.number, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_issue_create',
@@ -360,7 +360,7 @@ export const OPERATIONS: readonly Operation[] = [
     description: 'Create an issue. Requires user approval.',
     schema: z.object({ repo, title: z.string().min(1), body: z.string().optional(), labels, assignees }).strict(),
     write: { level: 'write', authorize: 'code-write', prompt: args => ({ zh: `在 ${args.repo} 创建 issue：${args.title}`, en: `Create an issue in ${args.repo}: ${args.title}` }) },
-    run: (args, { service }, caller) => service.createIssue(args.repo, { ...args, ...args.body === undefined ? {} : { body: withSignature(args.body, service.settings.tools.signature) }, signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.createIssue(args.repo, { ...args, ...args.body === undefined ? {} : { body: withSignature(args.body, service.settings.current.tools.signature) }, signal: caller.signal }),
   }),
   define({
     tool: 'repo_issue_update',
@@ -369,7 +369,7 @@ export const OPERATIONS: readonly Operation[] = [
     description: 'Change an issue\'s title, body, labels, or assignees, or close/reopen it. Labels and assignees replace the current ones. Requires user approval.',
     schema: z.object({ repo, number, title: z.string().min(1).optional(), body: z.string().optional(), state: z.enum(['open', 'closed']).optional(), labels, assignees }).strict(),
     write: { level: 'write', authorize: 'code-write', prompt: args => ({ zh: `修改 ${args.repo} 的 issue #${args.number}${stateSuffix(args.state)}`, en: `Update issue #${args.number} in ${args.repo}` }) },
-    run: (args, { service }, caller) => service.updateIssue(args.repo, args.number, { ...args, signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.updateIssue(args.repo, args.number, { ...args, signal: caller.signal }),
   }),
   define({
     tool: 'repo_issue_comment',
@@ -379,7 +379,7 @@ export const OPERATIONS: readonly Operation[] = [
     schema: z.object({ repo, number, body: z.string().min(1) }).strict(),
     write: { level: 'write', authorize: 'code-write', prompt: args => ({ zh: `评论 ${args.repo} 的 issue #${args.number}`, en: `Comment on issue #${args.number} in ${args.repo}` }) },
     run: async (args, deps, caller) => {
-      const comment = await deps.service.commentIssue(args.repo, args.number, withSignature(args.body, deps.service.settings.tools.signature) ?? args.body, { signal: caller.signal })
+      const comment = await deps.service.forge.commentIssue(args.repo, args.number, withSignature(args.body, deps.service.settings.current.tools.signature) ?? args.body, { signal: caller.signal })
       await rememberComment(deps, args.repo, args.number, comment.id)
       return comment
     },
@@ -390,7 +390,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'List pull requests (GitHub) or merge requests (GitLab).',
     schema: z.object({ repo, state: z.enum(['open', 'closed', 'merged', 'all']).optional(), sourceBranch: z.string().optional().describe('Branch of this repository the PRs/MRs come from; ones from forks are left out'), targetBranch: z.string().optional(), page, perPage }).strict(),
-    run: (args, { service }, caller) => service.listChanges(args.repo, { ...args, signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.listMrs(args.repo, { ...args, signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_get',
@@ -398,7 +398,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read one pull/merge request with its conversation comments.',
     schema: z.object({ repo, number }).strict(),
-    run: (args, { service }, caller) => service.getChange(args.repo, args.number, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.getMr(args.repo, args.number, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_diff',
@@ -406,7 +406,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read the unified diff of a pull/merge request. Long diffs are cut at the configured size limit.',
     schema: z.object({ repo, number }).strict(),
-    run: (args, { service }, caller) => service.changeDiff(args.repo, args.number, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.mrDiff(args.repo, args.number, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_status',
@@ -414,7 +414,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read CI checks/pipeline and mergeability of a pull/merge request, with its head SHA.',
     schema: z.object({ repo, number }).strict(),
-    run: (args, { service }, caller) => service.changeStatus(args.repo, args.number, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.mrStatus(args.repo, args.number, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_create',
@@ -432,10 +432,10 @@ export const OPERATIONS: readonly Operation[] = [
     },
     run: async (args, deps, caller) => {
       const { service } = deps
-      const mr = await service.createChange(args.repo, {
+      const mr = await service.forge.createMr(args.repo, {
         ...args,
-        ...args.body === undefined ? {} : { body: withSignature(args.body, service.settings.tools.signature) },
-        deleteSourceBranch: service.settings.tools.deleteSourceBranch,
+        ...args.body === undefined ? {} : { body: withSignature(args.body, service.settings.current.tools.signature) },
+        deleteSourceBranch: service.settings.current.tools.deleteSourceBranch,
         signal: caller.signal,
       })
       return { ...mr, ...await watchMr(deps, args.repo, mr, caller, 'created') }
@@ -449,7 +449,7 @@ export const OPERATIONS: readonly Operation[] = [
     schema: z.object({ repo, number, title: z.string().min(1).optional(), body: mrBody, state: z.enum(['open', 'closed']).optional(), targetBranch: z.string().optional(), labels, assignees }).strict(),
     write: { level: 'write', authorize: 'code-write', prompt: args => ({ zh: `修改 ${args.repo} 的 PR/MR #${args.number}${stateSuffix(args.state)}`, en: `Update PR/MR #${args.number} in ${args.repo}` }) },
     run: async (args, deps, caller) => {
-      const mr = await deps.service.updateChange(args.repo, args.number, { ...args, signal: caller.signal })
+      const mr = await deps.service.forge.updateMr(args.repo, args.number, { ...args, signal: caller.signal })
       return args.state === 'open' ? { ...mr, ...await watchMr(deps, args.repo, mr, caller, 'requested') } : mr
     },
   }),
@@ -461,7 +461,7 @@ export const OPERATIONS: readonly Operation[] = [
     schema: z.object({ repo, number, body: z.string().min(1) }).strict(),
     write: { level: 'write', authorize: 'code-write', prompt: args => ({ zh: `评论 ${args.repo} 的 PR/MR #${args.number}`, en: `Comment on PR/MR #${args.number} in ${args.repo}` }) },
     run: async (args, deps, caller) => {
-      const comment = await deps.service.commentChange(args.repo, args.number, withSignature(args.body, deps.service.settings.tools.signature) ?? args.body, { signal: caller.signal })
+      const comment = await deps.service.forge.commentMr(args.repo, args.number, withSignature(args.body, deps.service.settings.current.tools.signature) ?? args.body, { signal: caller.signal })
       await rememberComment(deps, args.repo, args.number, comment.id)
       return comment
     },
@@ -476,17 +476,17 @@ export const OPERATIONS: readonly Operation[] = [
       level: 'merge',
       authorize: 'code-write',
       prompt: (args, { service }) => {
-        const drop = service.settings.tools.deleteSourceBranch
+        const drop = service.settings.current.tools.deleteSourceBranch
         return {
           zh: `合并 ${args.repo} 的 PR/MR #${args.number}（head ${args.headSha.slice(0, 12)}${args.method === undefined ? '' : `，方式 ${args.method}`}${drop ? '，合并后删除源分支' : ''}）`,
           en: `Merge PR/MR #${args.number} in ${args.repo} at ${args.headSha.slice(0, 12)}${drop ? ', then delete its source branch' : ''}`,
         }
       },
     },
-    run: (args, { service }, caller) => service.mergeChange(args.repo, args.number, {
+    run: (args, { service }, caller) => service.forge.mergeMr(args.repo, args.number, {
       headSha: args.headSha,
       ...args.method === undefined ? {} : { method: args.method },
-      deleteSourceBranch: service.settings.tools.deleteSourceBranch,
+      deleteSourceBranch: service.settings.current.tools.deleteSourceBranch,
       signal: caller.signal,
     }),
   }),
@@ -501,10 +501,10 @@ export const OPERATIONS: readonly Operation[] = [
       if (session === undefined) throw new RepoError('invalid', 'mrWatch 需要在会话中调用')
       if (deps.watch === undefined || !deps.watch.active) throw new RepoError('unavailable', 'PR/MR 跟踪没有开启，或当前 DSH 组合不能唤醒会话')
       if (args.watch === false) return { watching: false, stopped: await deps.watch.untrack(args.repo, args.number, session), number: args.number }
-      const mr = await deps.service.getChange(args.repo, args.number, { signal: caller.signal })
+      const mr = await deps.service.forge.getMr(args.repo, args.number, { signal: caller.signal })
       if (mr.state !== 'open') throw new RepoError('invalid', `PR/MR #${args.number} ${mr.state === 'merged' ? '已合并' : '已关闭'}，不需要跟踪`)
       const { comments: _comments, ...info } = mr
-      const watched = await deps.watch.track({ repo: args.repo, change: info, session, source: 'requested' })
+      const watched = await deps.watch.track({ repo: args.repo, mr: info, session, source: 'requested' })
       return { watching: true, number: watched.number, title: watched.title, webUrl: watched.webUrl }
     },
   }),
@@ -522,10 +522,10 @@ export const OPERATIONS: readonly Operation[] = [
       page,
       perPage,
     }).strict(),
-    run: (args, { service }, caller) => service.listCiRuns(args.repo, {
+    run: (args, { service }, caller) => service.forge.listCiRuns(args.repo, {
       ...args.ref === undefined ? {} : { ref: args.ref },
       ...args.sha === undefined ? {} : { sha: args.sha },
-      ...args.number === undefined ? {} : { change: args.number },
+      ...args.number === undefined ? {} : { mr: args.number },
       ...args.state === undefined ? {} : { state: args.state },
       ...args.page === undefined ? {} : { page: args.page },
       ...args.perPage === undefined ? {} : { perPage: args.perPage },
@@ -538,7 +538,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read one CI run with its jobs (stage, state, GitLab failure reason, duration, GitHub steps, GitLab child/downstream pipelines). For a failed run it also returns the failed test cases of the GitLab test report or the error annotations of the failed GitHub jobs, which often name the failing file and line. Then read a failed job\'s log with repo_ci_log.',
     schema: z.object({ repo, runId, onlyFailed: z.boolean().optional().describe('Return only failed jobs') }).strict(),
-    run: (args, { service }, caller) => service.getCiRun(args.repo, args.runId, { ...args.onlyFailed === undefined ? {} : { onlyFailed: args.onlyFailed }, signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.getCiRun(args.repo, args.runId, { ...args.onlyFailed === undefined ? {} : { onlyFailed: args.onlyFailed }, signal: caller.signal }),
   }),
   define({
     tool: 'repo_ci_log',
@@ -553,7 +553,7 @@ export const OPERATIONS: readonly Operation[] = [
       section: z.string().min(1).max(200).optional().describe('Only lines in sections whose title contains this text, e.g. step_script (GitLab) or "Run npm test" (GitHub)'),
       beforeLine: z.number().int().min(1).optional().describe('Without search: end before this line number, to read earlier lines'),
     }).strict(),
-    run: (args, { service }, caller) => service.ciJobLog(args.repo, args.jobId, {
+    run: (args, { service }, caller) => service.forge.ciJobLog(args.repo, args.jobId, {
       ...args.search === undefined ? {} : { search: args.search },
       ...args.context === undefined ? {} : { context: args.context },
       ...args.section === undefined ? {} : { section: args.section },
@@ -574,7 +574,7 @@ export const OPERATIONS: readonly Operation[] = [
         ? { zh: `重试 CI 作业\n仓库：${args.repo}\n作业：${args.jobId}`, en: `Retry a CI job\nRepository: ${args.repo}\nJob: ${args.jobId}` }
         : { zh: `重试 CI 流水线的失败作业\n仓库：${args.repo}\n流水线：${args.runId}`, en: `Retry the failed jobs of a CI run\nRepository: ${args.repo}\nRun: ${args.runId}` },
     },
-    run: (args, { service }, caller) => service.retryCi(args.repo, args.runId === undefined ? { jobId: args.jobId ?? 0 } : { runId: args.runId }, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.retryCi(args.repo, args.runId === undefined ? { jobId: args.jobId ?? 0 } : { runId: args.runId }, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_ci_cancel',
@@ -589,7 +589,7 @@ export const OPERATIONS: readonly Operation[] = [
         ? { zh: `取消 CI 作业\n仓库：${args.repo}\n作业：${args.jobId}`, en: `Cancel a CI job\nRepository: ${args.repo}\nJob: ${args.jobId}` }
         : { zh: `取消 CI 流水线\n仓库：${args.repo}\n流水线：${args.runId}`, en: `Cancel a CI run\nRepository: ${args.repo}\nRun: ${args.runId}` },
     },
-    run: (args, { service }, caller) => service.cancelCi(args.repo, args.runId === undefined ? { jobId: args.jobId ?? 0 } : { runId: args.runId }, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.forge.cancelCi(args.repo, args.runId === undefined ? { jobId: args.jobId ?? 0 } : { runId: args.runId }, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_snapshot_acquire',
@@ -600,9 +600,9 @@ export const OPERATIONS: readonly Operation[] = [
     run: async (args, { service }, caller) => {
       const entry = service.catalog.require(args.repo, 'read')
       const branch = args.ref === undefined ? entry.branch : undefined
-      const mirror = await service.syncMirror(entry.url, { ...branch === undefined ? {} : { branch }, signal: caller.signal })
-      const target = args.ref === undefined ? mirror.commit : await service.mirrors.resolveRef(entry.url, args.ref, caller.signal)
-      const lease = await service.mirrors.acquire(entry.url, target, caller.signal)
+      const mirror = await service.mirrors.sync(entry.url, { ...branch === undefined ? {} : { branch }, signal: caller.signal })
+      const target = args.ref === undefined ? mirror.commit : await service.mirrors.store.resolveRef(entry.url, args.ref, caller.signal)
+      const lease = await service.mirrors.store.acquire(entry.url, target, caller.signal)
       if (caller.origin === 'service') return { repo: entry.url, commit: lease.commit, path: lease.dir, release: lease.release }
       holdForTool(`${sessionOf(caller) ?? ''}\u0000${entry.url}`, lease.release)
       return { repo: entry.url, commit: lease.commit, path: lease.dir }
@@ -679,7 +679,7 @@ export const OPERATIONS: readonly Operation[] = [
     run: async (args, deps, caller) => {
       const record = await deps.workspaces.locate(await workspaceTarget(deps, args.path, caller, 'workspaceStatus'))
       deps.service.catalog.require(record.repo, 'read')
-      const settings = deps.service.settings
+      const settings = deps.service.settings.current
       return await deps.workspaces.status(record, caller.signal, settings.limits.maxDiffBytes, settings.mirror.gitTimeoutMs)
     },
   }),
@@ -705,9 +705,9 @@ export const OPERATIONS: readonly Operation[] = [
       prompt: async (args, deps, caller) => {
         const record = await deps.workspaces.locate(await workspaceTarget(deps, args.path, caller, 'workspacePush'))
         deps.service.catalog.require(record.repo, 'write')
-        const settings = deps.service.settings
+        const settings = deps.service.settings.current
         const status = await deps.workspaces.status(record, caller.signal, settings.limits.maxDiffBytes, settings.mirror.gitTimeoutMs)
-        const remote = (await deps.service.mirrors.resolveRef(record.repo, record.branch, caller.signal).catch(() => undefined)) === undefined
+        const remote = (await deps.service.mirrors.store.resolveRef(record.repo, record.branch, caller.signal).catch(() => undefined)) === undefined
         return { ...pushPrompt(status, args, remote), repo: record.repo }
       },
     },
@@ -715,11 +715,11 @@ export const OPERATIONS: readonly Operation[] = [
       const { service, workspaces } = deps
       const record = await workspaces.locate(await workspaceTarget(deps, args.path, caller, 'workspacePush'))
       service.catalog.require(record.repo, 'write')
-      const settings = service.settings
+      const settings = service.settings.current
       const session = sessionOf(caller) ?? record.session
       const details = session === undefined ? undefined : await collectDetails(deps.parallel, { session, path: record.path })
       const trailers = details === undefined ? undefined : checkTrailers(details.trailers)
-      const committer = await service.tokenIdentity(record.repo, caller.signal)
+      const committer = await service.hosts.tokenIdentity(record.repo, caller.signal)
       const author = details?.author === undefined ? configuredIdentity(settings) ?? committer : checkAuthor(details.author)
       const outcome = await workspaces.push(record, {
         ...args.message === undefined ? {} : { message: args.message },
@@ -736,7 +736,7 @@ export const OPERATIONS: readonly Operation[] = [
       try {
         open = await openMrsFrom(service, record.repo, record.branch, caller.signal)
         if (args.mr !== undefined && open.length === 0) {
-          createdMr = await service.createChange(record.repo, {
+          createdMr = await service.forge.createMr(record.repo, {
             title: args.mr.title,
             ...args.mr.body === undefined ? {} : { body: withSignature(args.mr.body, settings.tools.signature) ?? args.mr.body },
             sourceBranch: record.branch,
@@ -775,7 +775,7 @@ export const OPERATIONS: readonly Operation[] = [
         const root = (requireAgent(caller, 'repo_workspace_remove') as Agent).session?.header.cwd
         if (root !== undefined && record.session !== sessionOf(caller) && !within(root, record.path)) throw new RepoError('forbidden', `${record.path} 不在当前会话的目录里，也不是当前会话创建的`)
       }
-      const removed = await deps.workspaces.remove(record, args.force === true, caller.signal, deps.service.settings.mirror.gitTimeoutMs)
+      const removed = await deps.workspaces.remove(record, args.force === true, caller.signal, deps.service.settings.current.mirror.gitTimeoutMs)
       return { path: record.path, ...removed }
     },
   }),
@@ -866,7 +866,7 @@ function gateOf(operation: Operation, args: unknown, deps: OperationDeps, caller
     if (spec.level !== undefined && typeof target === 'string') deps.service.catalog.require(target, spec.level)
     const gated = caller.origin === 'tool' || caller.agent !== undefined
     if (!gated) return
-    const writes = deps.service.settings.tools.writes
+    const writes = deps.service.settings.current.tools.writes
     const name = caller.origin === 'tool' ? operation.tool : operation.method
     if (writes === 'off') throw new RepoError('forbidden', `dsh-repo 设置页已关闭写操作，${name} 不会执行`)
     const session = sessionOf(caller)

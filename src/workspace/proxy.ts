@@ -280,13 +280,13 @@ export class GitProxy {
 
   /** Fetch the mirror from the remote, then advertise its refs. */
   private async advertiseUpload(req: IncomingMessage, res: ServerResponse, record: WorkspaceRecord, query: string): Promise<void> {
-    const mirror = await this.deps.service.syncMirror(record.repo)
+    const mirror = await this.deps.service.mirrors.sync(record.repo)
     await this.backend(req, res, dirname(mirror.dir), `/${basename(mirror.dir)}/info/refs`, query)
   }
 
   private async upload(req: IncomingMessage, res: ServerResponse, record: WorkspaceRecord): Promise<void> {
     this.deps.service.catalog.require(record.repo, 'read')
-    const dir = this.deps.service.mirrors.dirOf(record.repo)
+    const dir = this.deps.service.mirrors.store.dirOf(record.repo)
     await this.backend(req, res, dirname(dir), `/${basename(dir)}/git-upload-pack`, '')
   }
 
@@ -331,7 +331,7 @@ export class GitProxy {
     this.deps.logger?.info?.('dsh-repo: 代理推送 %s %s（工作区 %s，会话 %s）：HTTP %d，远端接受 %s', record.repo, commands.map(command => command.ref.slice('refs/heads/'.length)).join(' '), record.path, record.session ?? '无', status, branches.join(' ') || '无')
     if (status === 200) {
       try {
-        await service.syncMirror(record.repo)
+        await service.mirrors.sync(record.repo)
       } catch (error) {
         this.deps.logger?.warn?.('dsh-repo: 推送后同步镜像 %s 失败：%s', record.repo, error instanceof Error ? error.message : String(error))
       }
@@ -352,7 +352,7 @@ export class GitProxy {
     let defaultBranch: string
     try {
       // Asked of the remote: the mirror's HEAD may predate a change of the default branch.
-      defaultBranch = await service.mirrors.remoteDefaultBranch(record.repo, await service.mirrorAuth(record.repo, true)) ?? await service.mirrors.defaultBranch(record.repo)
+      defaultBranch = await service.mirrors.store.remoteDefaultBranch(record.repo, await service.mirrors.auth(record.repo, true)) ?? await service.mirrors.store.defaultBranch(record.repo)
     } catch (error) {
       return `无法确认默认分支：${error instanceof Error ? error.message : String(error)}`
     }
@@ -362,7 +362,7 @@ export class GitProxy {
       if (ZERO.test(command.new)) return `不能删除远端分支 ${branch}`
       if (branch === defaultBranch) return `不能直接推送到默认分支 ${branch}；推送到别的分支后创建 PR/MR`
       try {
-        const remote = await service.getBranch(record.repo, branch)
+        const remote = await service.forge.getBranch(record.repo, branch)
         if (remote?.default === true) return `不能直接推送到默认分支 ${branch}；推送到别的分支后创建 PR/MR`
         if (remote?.protected === true) return `${branch} 是受保护分支，不能经工作区推送`
       } catch (error) {
@@ -381,7 +381,7 @@ export class GitProxy {
 
   /** Base URL and headers of a remote repository's smart HTTP endpoints, with the host's token. */
   private async upstream(url: string): Promise<{ base: string; headers: Record<string, string> }> {
-    const credentials = await this.deps.service.gitCredentials(url)
+    const credentials = await this.deps.service.hosts.gitCredentials(url)
     const trimmed = url.replace(/\/+$/, '')
     return {
       base: trimmed.endsWith('.git') ? trimmed : `${trimmed}.git`,

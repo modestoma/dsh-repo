@@ -266,7 +266,7 @@ if (repos?.version === 6) {
 
 从 5 升到 6：
 
-- 方法全部改名并改成一个参数对象，例如 `getIssue(repo, n)` → `issueGet({ repo, number })`、`createChange` → `mrCreate`、`listCiRuns` → `ciList`、`ciJobLog` → `ciLog`、`addRepo` → `repoAdd`、`listRepos` → `repoList`（现在返回 Promise）、`registerFeature` → `featureRegister`、`onReposChange` → `repoOnChange`、`listHosts` / `addHost` / `removeHost` / `setHostToken` → `hostList` / `hostAdd` / `hostRemove({ url })` / `hostSetToken({ url, token })`；类型里的 `Change*` 改为 `Mr*`。
+- 方法全部改名并改成一个参数对象，例如 `getIssue(repo, n)` → `issueGet({ repo, number })`、`createMr` → `mrCreate`、`listCiRuns` → `ciList`、`ciJobLog` → `ciLog`、`addRepo` → `repoAdd`、`listRepos` → `repoList`（现在返回 Promise）、`registerFeature` → `featureRegister`、`onReposChange` → `repoOnChange`、`listHosts` / `addHost` / `removeHost` / `setHostToken` → `hostList` / `hostAdd` / `hostRemove({ url })` / `hostSetToken({ url, token })`；类型里的 `Change*` 改为 `Mr*`。
 - 写操作的授权与审批跟随 `agent` 字段（以前是 `session` 字段，且不审批）。
 - 镜像和工作区方法换成 `snapshotAcquire`（返回 `{ repo, commit, path, release }`）和 `workspaceCreate` / `workspaceList` / `workspaceStatus` / `workspacePush` / `workspaceRemove`；`syncMirror`、`readMirrorFile`、`listMirrorTree`、`acquireSnapshot`、`openWorkspace`、`workspaceChanges`、`pushWorkspace` 和 `setMirrorDir` 移除（镜像目录用 `settingsUpdate({ mirrorDir })`）。
 - `repo/commit-trailers` 事件的 `dir` 改名为 `path`；`access/authorize` 的 `action` 是服务方法名（经代理的推送是 `git-push`）。

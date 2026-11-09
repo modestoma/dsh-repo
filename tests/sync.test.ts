@@ -58,13 +58,13 @@ function setup(now?: () => number) {
   const service = new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials(REMOTE_TOKENS),
-    hosts: settingsStore(remoteConfig(), root, testSettings()),
-    mirrors: new MirrorStore({ git: remote.git, root: join(root, 'mirrors'), limits: mirrorLimits() }),
+    store: settingsStore(remoteConfig(), root, testSettings()),
+    mirrorStore: new MirrorStore({ git: remote.git, root: join(root, 'mirrors'), limits: mirrorLimits() }),
   })
   const { catalog } = service
   const make = (): LocalSyncer => {
     const syncer = new LocalSyncer({
-      service,
+      mirrors: service.mirrors,
       records: () => syncRecords(catalog.entries()),
       ids: () => new Set(catalog.entries().map(entry => entry.id)),
       git: remote.git,
@@ -74,7 +74,7 @@ function setup(now?: () => number) {
       ...now === undefined ? {} : { now },
     })
     syncer.start()
-    const unlisten = service.onReposChange(() => { syncer.reconcile() })
+    const unlisten = service.catalog.onChange(() => { syncer.reconcile() })
     const stop = syncer.stop.bind(syncer)
     syncer.stop = async () => {
       unlisten()
@@ -276,7 +276,7 @@ describe('local syncs', () => {
     const { root, service, syncer, add } = setup()
     const dir = join(root, 'out')
     const { id } = await add(synced(repo.url, dir))
-    await service.setMirrorDir(join(dir, 'mirrors'))
+    await service.mirrors.setDir(join(dir, 'mirrors'))
     await syncer.syncNow(id)
     expect(syncer.status(id)?.error).toContain('镜像目录')
     expect(existsSync(join(dir, 'mirrors', 'local'))).toBe(false)

@@ -238,18 +238,18 @@ export class WorkspaceManager {
     if (request.base !== undefined) requireBranch(request.base, '合入分支名')
     const proxy = this.deps.proxy()
     if (proxy === undefined) throw new RepoError('unavailable', 'dsh-repo 的本机 git 代理没有运行，无法创建工作区；查看日志里代理启动失败的原因，或在设置页换一个代理端口')
-    const mirror = await service.syncMirror(url, { ...request.base === undefined ? {} : { branch: request.base }, signal })
+    const mirror = await service.mirrors.sync(url, { ...request.base === undefined ? {} : { branch: request.base }, signal })
     const branch = request.branch ?? `dsh/${request.session === undefined ? randomBytes(4).toString('hex') : request.session.replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toLowerCase() || randomBytes(4).toString('hex')}`
     requireBranch(branch, '分支名')
     if (branch === mirror.defaultBranch) throw new RepoError('invalid', `不能在默认分支 ${branch} 上工作；用 base 指定合入目标，推送到别的分支`)
     if (branch === mirror.branch) throw new RepoError('invalid', `分支 ${branch} 是合入目标，不能同时作为工作区的推送分支`)
-    const remote = await service.getBranch(url, branch, signal === undefined ? {} : { signal })
+    const remote = await service.forge.getBranch(url, branch, signal === undefined ? {} : { signal })
     if (remote?.protected === true) throw new RepoError('forbidden', `${branch} 是受保护分支，工作区不能推送到它`)
     const existing = await this.mirrorBranch(mirror.dir, branch, signal)
     if (existing !== undefined && request.commit !== undefined) throw new RepoError('invalid', `分支 ${branch} 已存在，工作区从它的最新提交开始，不能再指定 commit`)
     let start = existing ?? request.commit ?? mirror.commit
     if (existing === undefined && request.commit !== undefined) {
-      await service.mirrors.existing(url, request.commit, signal)
+      await service.mirrors.store.existing(url, request.commit, signal)
       try {
         await this.git(['merge-base', '--is-ancestor', request.commit, `refs/heads/${mirror.branch}`], mirror.dir, signal)
       } catch (error) {
@@ -397,7 +397,7 @@ export class WorkspaceManager {
     return await serialize(this.locks, record.id, async () => {
       const run = (args: readonly string[], env: Readonly<Record<string, string>> = {}) => this.inside(record, args, timeoutMs, request.signal, env)
       // A fresh fetch: a stale mirror could claim the remote branch already holds HEAD after someone deleted or rewound it.
-      const mirror = await this.deps.service.syncMirror(record.repo, request.signal === undefined ? {} : { signal: request.signal })
+      const mirror = await this.deps.service.mirrors.sync(record.repo, request.signal === undefined ? {} : { signal: request.signal })
       const remoteBefore = await this.mirrorBranch(mirror.dir, record.branch, request.signal)
       let committed = false
       const author = request.author ?? request.committer
@@ -555,7 +555,7 @@ export class WorkspaceManager {
   }
 
   private git(args: readonly string[], cwd: string | undefined, signal?: AbortSignal): Promise<string> {
-    return this.deps.git(args, { ...cwd === undefined ? {} : { cwd }, timeoutMs: this.deps.service.settings.mirror.gitTimeoutMs, env: {}, ...signal === undefined ? {} : { signal } })
+    return this.deps.git(args, { ...cwd === undefined ? {} : { cwd }, timeoutMs: this.deps.service.settings.current.mirror.gitTimeoutMs, env: {}, ...signal === undefined ? {} : { signal } })
   }
 
   /** The head of a branch in a mirror, or undefined when the mirror has no such branch. */
@@ -569,7 +569,7 @@ export class WorkspaceManager {
 
   /** Commit identity of new workspaces: each configured field, else the token account's; undefined when the account cannot be read and a field is not configured. */
   private async identity(url: string, signal?: AbortSignal): Promise<CommitAuthor | undefined> {
-    const { commitName, commitEmail } = this.deps.service.settings.workspace
+    const { commitName, commitEmail } = this.deps.service.settings.current.workspace
     const account = commitName !== '' && commitEmail !== '' ? undefined : await this.accountIdentity(url, signal)
     const name = commitName !== '' ? commitName : account?.name
     const email = commitEmail !== '' ? commitEmail : account?.email
@@ -578,7 +578,7 @@ export class WorkspaceManager {
 
   private async accountIdentity(url: string, signal?: AbortSignal): Promise<CommitAuthor | undefined> {
     try {
-      return await this.deps.service.tokenIdentity(url, signal)
+      return await this.deps.service.hosts.tokenIdentity(url, signal)
     } catch (error) {
       // Without the account's identity the Agent's git uses the machine's; pushes still go through the proxy.
       this.deps.logger?.warn?.('dsh-repo: 读取令牌账号的提交身份失败，新工作区不设置提交身份：%s', error instanceof Error ? error.message : String(error))
@@ -628,7 +628,7 @@ export class WorkspaceManager {
     if (outer !== undefined) throw new RepoError('invalid', `工作区目录 ${target} 在另一个工作区 ${outer.path} 里面`)
     const inner = this.deps.registry.list().find(record => within(real, record.path))
     if (inner !== undefined) throw new RepoError('invalid', `工作区目录 ${target} 里面已经有工作区 ${inner.path}`)
-    if (await this.deps.service.mirrors.owns(real)) throw new RepoError('invalid', `工作区目录 ${target} 在镜像目录里面`)
+    if (await this.deps.service.mirrors.store.owns(real)) throw new RepoError('invalid', `工作区目录 ${target} 在镜像目录里面`)
     return target
   }
 

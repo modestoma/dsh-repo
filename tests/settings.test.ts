@@ -57,7 +57,7 @@ async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {},
   plugin.apply(ctx, remote === undefined ? { hosts: [github] } : remoteConfig([github]), {
     env,
     forbiddenMirrorRoots: [env.DSH_HOME],
-    ...remote === undefined ? {} : { git: remote.git, providerFactory: stubProviders({ getBranch: async () => undefined, listChanges: async () => ({ items: [] }) }) },
+    ...remote === undefined ? {} : { git: remote.git, providerFactory: stubProviders({ getBranch: async () => undefined, listMrs: async () => ({ items: [] }) }) },
   })
   const http = createServer((req, res) => {
     const handler = routes.get(new URL(req.url ?? '/', 'http://x').pathname)
@@ -94,7 +94,7 @@ describe('settings routes', () => {
   it('adds, updates, and removes hosts, and reports each change', async () => {
     const { call, json, service } = await serve()
     const changes: string[] = []
-    service.onHostsChange((change) => { changes.push(change.kind) })
+    service.hosts.onChange((change) => { changes.push(change.kind) })
     let response = await call('/dsh-repo/hosts', json('POST', { kind: 'gitlab', url: 'https://git.example.com/', alias: 'git', token: 'abc' }))
     expect(response.status).toBe(200)
     expect((response.body.state as SettingsState).hosts[1]).toMatchObject({ url: 'https://git.example.com', alias: 'git', origin: 'added', token: { configured: true } })
@@ -130,7 +130,7 @@ describe('settings routes', () => {
   it('chooses the mirror directory, keeps the choice in hosts.json, refuses forbidden roots, and clears it', async () => {
     const { call, json, service, env } = await serve()
     const changes: (string | undefined)[] = []
-    service.onHostsChange((change) => { if (change.kind === 'mirror') changes.push(change.dir) })
+    service.hosts.onChange((change) => { if (change.kind === 'mirror') changes.push(change.dir) })
     const chosen = join(mkdtempSync(join(tmpdir(), 'dsh-repo-chosen-')), 'mirrors')
     let response = await call('/dsh-repo/mirror', json('PUT', { dir: chosen }))
     expect(response.status).toBe(200)
@@ -139,7 +139,7 @@ describe('settings routes', () => {
     expect(existsSync(chosen)).toBe(true)
 
     const reloaded = await serve(undefined, {}, env.DSH_HOME)
-    expect(reloaded.service.mirrorSettings().dir).toBe(chosen)
+    expect(reloaded.service.mirrors.settings().dir).toBe(chosen)
 
     expect((await call('/dsh-repo/mirror', json('PUT', { dir: 'relative/mirrors' }))).status).toBe(400)
     const forbidden = await call('/dsh-repo/mirror', json('PUT', { dir: join(env.DSH_HOME, 'dsh-repo', 'mirrors') }))
@@ -175,14 +175,14 @@ describe('settings routes', () => {
     let response = await call('/dsh-repo/settings', json('PUT', next))
     expect(response.status).toBe(200)
     expect((response.body.state as SettingsState).settings).toEqual(next)
-    expect(service.settings.tools.writes).toBe('off')
+    expect(service.settings.current.tools.writes).toBe('off')
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ hosts: [], settings: { tools: { writes: 'off' }, limits: { perPage: 20 } } })
 
-    expect((await serve(undefined, {}, env.DSH_HOME)).service.settings).toEqual(next)
+    expect((await serve(undefined, {}, env.DSH_HOME)).service.settings.current).toEqual(next)
 
     const invalid = await call('/dsh-repo/settings', json('PUT', { ...next, timeoutMs: 5 }))
     expect(invalid).toMatchObject({ status: 400, body: { ok: false, error: expect.stringContaining('timeoutMs') } })
-    expect(service.settings).toEqual(next)
+    expect(service.settings.current).toEqual(next)
     response = await call('/dsh-repo/settings', { method: 'DELETE' })
     expect((response.body.state as SettingsState).settings).toEqual(initial.defaults)
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ hosts: [] })
@@ -237,8 +237,8 @@ describe('settings routes', () => {
     const file = join(env.DSH_HOME, 'dsh-repo', 'hosts.json')
     const dir = join(env.DSH_HOME, 'shared-skills')
     const changes: number[] = []
-    service.onReposChange(() => { changes.push(service.listRepos().length) })
-    const dispose = service.registerFeature({ id: 'log-analysis', title: '日志分析' })
+    service.catalog.onChange(() => { changes.push(service.catalog.list().length) })
+    const dispose = service.catalog.registerFeature({ id: 'log-analysis', title: '日志分析' })
     expect(((await call('/dsh-repo/state')).body as unknown as SettingsState).features).toEqual([{ id: 'log-analysis', title: '日志分析' }])
 
     // Without a mirror directory the entry is stored but its first sync fails with the refusal.
@@ -257,7 +257,7 @@ describe('settings routes', () => {
     expect(readFileSync(join(dir, 'skill-a', 'SKILL.md'), 'utf8')).toBe('a\n')
     expect(JSON.parse(readFileSync(file, 'utf8')).repos).toEqual([expect.objectContaining({ id: row?.id, url: repo, access: 'write' })])
     expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'local-syncs.json'), 'utf8')).syncs).toHaveLength(1)
-    expect(service.listRepos({ feature: 'log-analysis' })).toEqual([{ id: row?.id, url: repo, access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir, intervalMinutes: 720 } }])
+    expect(service.catalog.list({ feature: 'log-analysis' })).toEqual([{ id: row?.id, url: repo, access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir, intervalMinutes: 720 } }])
 
     writeFileSync(join(origin, 'skill-a', 'SKILL.md'), 'a2\n')
     execFileSync('git', ['commit', '--quiet', '-am', 'two'], { cwd: origin, env: author })
@@ -265,7 +265,7 @@ describe('settings routes', () => {
     expect(readFileSync(join(dir, 'skill-a', 'SKILL.md'), 'utf8')).toBe('a2\n')
     response = await call('/dsh-repo/repos', json('PUT', { id: row?.id, url: repo, access: 'merge', features: [], localSync: { enabled: true, dir, intervalMinutes: 60 } }))
     expect((response.body.state as SettingsState).repos[0]).toMatchObject({ access: 'merge', features: [], localSync: { intervalMinutes: 60 } })
-    expect(service.listRepos({ feature: 'log-analysis' })).toEqual([])
+    expect(service.catalog.list({ feature: 'log-analysis' })).toEqual([])
 
     expect((await call('/dsh-repo/repos', json('POST', { url: repo, access: 'read', features: [] }))).status).toBe(409)
     expect((await call('/dsh-repo/repos', json('POST', { url: 'git@x:y.git', access: 'read', features: [] }))).status).toBe(400)
@@ -299,7 +299,7 @@ describe('settings routes', () => {
     const [row] = ((await call('/dsh-repo/state')).body as unknown as SettingsState).repos
     expect(row).toMatchObject({ id: entry.id, url: entry.url, features: ['old-feature'], problem: expect.stringContaining('gone.example.com') })
     expect(row?.key).toBeUndefined()
-    expect(() => service.resolve('https://gone.example.com/a/b')).toThrow(expect.objectContaining({ code: 'not-allowed' }))
+    expect(() => service.forge.resolve('https://gone.example.com/a/b')).toThrow(expect.objectContaining({ code: 'not-allowed' }))
   })
 
   it('creates workspaces in the chosen directory, lists them with their unsaved work, and removes them after confirmation', async () => {

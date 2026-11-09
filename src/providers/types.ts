@@ -24,11 +24,11 @@ export interface Paging {
   readonly perPage: number
 }
 
-/** Filters of a CI run listing after validation; `change` is a pull/merge request number. */
+/** Filters of a CI run listing after validation; `mr` is a pull/merge request number. */
 export interface CiRunQuery {
   readonly ref?: string
   readonly sha?: string
-  readonly change?: number
+  readonly mr?: number
   readonly state?: 'pending' | 'running' | 'success' | 'failure' | 'canceled'
 }
 
@@ -51,17 +51,17 @@ export interface Provider {
   updateIssue(ref: RepoRef, number: number, update: IssueFields & { readonly state?: IssueState }, call: Call): Promise<IssueInfo>
   commentIssue(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
 
-  listChanges(ref: RepoRef, query: Paging & { readonly state: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string }, call: Call): Promise<Page<MrInfo>>
-  getChange(ref: RepoRef, number: number, call: Call): Promise<MrDetail>
-  changeDiff(ref: RepoRef, number: number, call: Call): Promise<MrDiff>
-  changeStatus(ref: RepoRef, number: number, call: Call): Promise<MrStatus>
-  createChange(ref: RepoRef, change: IssueFields & { readonly title: string; readonly sourceBranch: string; readonly targetBranch: string; readonly draft: boolean; readonly deleteSourceBranch: boolean }, call: Call): Promise<MrInfo>
-  updateChange(ref: RepoRef, number: number, update: IssueFields & { readonly state?: 'open' | 'closed'; readonly targetBranch?: string }, call: Call): Promise<MrInfo>
-  commentChange(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
+  listMrs(ref: RepoRef, query: Paging & { readonly state: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string }, call: Call): Promise<Page<MrInfo>>
+  getMr(ref: RepoRef, number: number, call: Call): Promise<MrDetail>
+  mrDiff(ref: RepoRef, number: number, call: Call): Promise<MrDiff>
+  mrStatus(ref: RepoRef, number: number, call: Call): Promise<MrStatus>
+  createMr(ref: RepoRef, change: IssueFields & { readonly title: string; readonly sourceBranch: string; readonly targetBranch: string; readonly draft: boolean; readonly deleteSourceBranch: boolean }, call: Call): Promise<MrInfo>
+  updateMr(ref: RepoRef, number: number, update: IssueFields & { readonly state?: 'open' | 'closed'; readonly targetBranch?: string }, call: Call): Promise<MrInfo>
+  commentMr(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
   /** With `deleteSourceBranch`, the result reports the source branch; a failed deletion does not throw. */
-  mergeChange(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod; readonly deleteSourceBranch: boolean }, call: Call): Promise<MergeResult>
-  /** One poll for a watch: always the change request, CI and comments only as `request` asks. */
-  changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity>
+  mergeMr(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod; readonly deleteSourceBranch: boolean }, call: Call): Promise<MergeResult>
+  /** One poll for a watch: always the PR/MR, CI and comments only as `request` asks. */
+  mrActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<MrActivity>
 
   listRuns(ref: RepoRef, query: Paging & CiRunQuery, call: Call): Promise<Page<CiRun>>
   /** The run with every job; failures are read only for a failed run. */
@@ -124,9 +124,9 @@ export async function okBody(response: Response): Promise<ReadableStream<Uint8Ar
   return response.body
 }
 
-/** What a watch already knows about a change request, so a poll reads only what may have changed. */
+/** What a watch already knows about a PR/MR, so a poll reads only what may have changed. */
 export interface ActivityRequest {
-  /** `updatedAt` of the last poll; comments and reviews are read only when the change request's differs. */
+  /** `updatedAt` of the last poll; comments and reviews are read only when the PR/MR's differs. */
   readonly updatedAt?: string
   /** Whether CI is read: the head moved, CI was still running, or CI had not reported yet. */
   readonly withStatus: boolean
@@ -134,7 +134,7 @@ export interface ActivityRequest {
   readonly since: string
 }
 
-/** One comment, review comment, or review on a change request, in creation order. */
+/** One comment, review comment, or review on a PR/MR, in creation order. */
 export interface ActivityItem {
   readonly id: string
   /** `comment` covers conversation comments, code-line comments, and reviews that only comment. */
@@ -147,10 +147,10 @@ export interface ActivityItem {
   readonly path?: string
 }
 
-/** One poll of a change request. */
-export interface ChangeActivity {
-  readonly change: MrInfo
-  /** Whether the change request conflicts with its target branch. */
+/** One poll of a PR/MR. */
+export interface MrActivity {
+  readonly mr: MrInfo
+  /** Whether the PR/MR conflicts with its target branch. */
   readonly conflict: boolean
   /** Present when CI was read. */
   readonly status?: MrStatus
@@ -158,7 +158,7 @@ export interface ChangeActivity {
   readonly items?: readonly ActivityItem[]
 }
 
-/** Editable fields shared by issues and change requests. */
+/** Editable fields shared by issues and PRs/MRs. */
 export interface IssueFields {
   readonly title?: string
   readonly body?: string
