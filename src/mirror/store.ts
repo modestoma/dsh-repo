@@ -4,8 +4,7 @@
  * holder. The remote is the only source of truth: a mirror is fetched before
  * anything is served from it, and only dsh-repo writes it.
  *
- * - A mirror lives at `<root>/<host>/<path>.git` derived from its address;
- *   local paths go under `<root>/local/`. It is a bare repository whose
+ * - A mirror lives at `<root>/<host>/<path>.git` derived from its address. It is a bare repository whose
  *   `refs/heads/*` and `refs/tags/*` equal the remote's after each fetch, and
  *   whose `HEAD` names the remote's default branch, so workspaces can clone
  *   and fetch from it as if it were the remote. A new address is cloned into
@@ -26,6 +25,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { RepoError } from '../errors.ts'
+import { isCommitId, requireBranch, requireCommit } from '../refs.ts'
 import { MIRROR_DIR_UNSET } from './root.ts'
 import type { MirrorUsage } from '../settings/contract.ts'
 import { GitError } from './git.ts'
@@ -71,25 +71,21 @@ export interface MirrorSnapshot {
   release(): void
 }
 
-const URL_SCHEMES = new Set(['https:', 'file:'])
-const COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
-const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
 
 /**
- * Whether an address is one this store hands to `git clone`: an `https` or
- * `file` URL, or an absolute local path. SSH, scp-like `user@host:path`,
- * `git://`, plain `http`, and other transports (notably `ext::`) are refused,
- * so every remote address authenticates with a host token.
+ * Whether an address is one this store hands to `git clone`: an `https` URL.
+ * Local paths, `file:` URLs, SSH, scp-like `user@host:path`, `git://`, plain
+ * `http`, and other transports (notably `ext::`) are refused, so every
+ * address authenticates with a host token.
  * @param value - candidate address.
  * @returns whether it is accepted.
  */
 export function isAcceptedGitUrl(value: string): boolean {
   if (value === '' || value.startsWith('-') || /\s/.test(value)) return false
-  if (isAbsolute(value)) return true
   try {
-    return URL_SCHEMES.has(new URL(value).protocol)
+    return new URL(value).protocol === 'https:'
   } catch {
-    // Not a URL and not a local path: refused.
+    // Not a URL: refused.
     return false
   }
 }
@@ -113,21 +109,14 @@ function cleanSegments(path: string): string[] {
 
 /**
  * Mirror directory of an address, relative to the mirror root:
- * `<host>/<path>.git` for remote addresses (`host_port` when a port is given)
- * and `local/<name>-<hash>.git` for local paths and `file:` URLs.
+ * `<host>/<path>.git` (`host_port` when a port is given).
  * @param url - accepted git address.
  * @returns relative directory, `/`-separated.
  */
 export function mirrorPath(url: string): string {
-  if (!isAbsolute(url)) {
-    const parsed = new URL(url)
-    if (parsed.protocol !== 'file:') {
-      const host = parsed.host.toLowerCase().replace(':', '_').replace(/[^a-z0-9._-]/g, '-')
-      return `${[host, ...cleanSegments(decodeURIComponent(parsed.pathname))].join('/')}.git`
-    }
-  }
-  const name = cleanSegments(url).at(-1) ?? 'repo'
-  return `local/${name}-${createHash('sha1').update(url).digest('hex').slice(0, 8)}.git`
+  const parsed = new URL(url)
+  const host = parsed.host.toLowerCase().replace(':', '_').replace(/[^a-z0-9._-]/g, '-')
+  return `${[host, ...cleanSegments(decodeURIComponent(parsed.pathname))].join('/')}.git`
 }
 
 /**
@@ -218,7 +207,7 @@ export class MirrorStore {
    * @throws {RepoError} `invalid` for an unsupported address, `unavailable` while no root is chosen.
    */
   dirOf(url: string): string {
-    if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${url}（只支持 https 地址、file URL 或绝对路径；SSH 地址请改用仓库的 https 地址）`)
+    if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${url}（只支持 https 地址；SSH 地址请改用仓库的 https 地址）`)
     const root = this.requireRoot()
     const dir = join(root, ...mirrorPath(url).split('/'))
     this.roots.set(dir, root)
@@ -237,7 +226,7 @@ export class MirrorStore {
    */
   async sync(url: string, branch: string | undefined, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<MirrorState> {
     const dir = this.dirOf(url)
-    if (branch !== undefined && !BRANCH.test(branch)) throw new RepoError('invalid', `分支名不合法：${branch}`)
+    if (branch !== undefined) requireBranch(branch, '分支名')
     return await serialize(this.syncLocks, dir, async () => {
       try {
         await this.update(url, dir, env, signal)
@@ -265,8 +254,9 @@ export class MirrorStore {
    */
   async resolveRef(url: string, ref: string, signal?: AbortSignal): Promise<string> {
     const dir = this.dirOf(url)
-    if (COMMIT.test(ref)) return (await this.existing(url, ref, signal), ref)
-    if (!BRANCH.test(ref)) throw new RepoError('invalid', `ref 不合法：${ref}`)
+    if (isCommitId(ref)) return (await this.existing(url, ref, signal), ref)
+    // Tags follow the same naming rules as branches.
+    requireBranch(ref, 'ref ')
     for (const candidate of [`refs/heads/${ref}`, `refs/tags/${ref}`]) {
       try {
         return (await this.git(['rev-parse', '--verify', '--quiet', `${candidate}^{commit}`], dir, {}, signal)).trim()
@@ -379,7 +369,7 @@ export class MirrorStore {
    */
   async existing(url: string, commit: string, signal?: AbortSignal): Promise<string> {
     const dir = this.dirOf(url)
-    if (!COMMIT.test(commit)) throw new RepoError('invalid', `提交必须是完整的十六进制提交 id：${commit}`)
+    requireCommit(commit, '提交')
     if (await pathKind(join(dir, 'objects')) === 'missing') throw new RepoError('not-found', `${url} 还没有镜像，先同步`)
     try {
       await this.git(['cat-file', '-e', `${commit}^{commit}`], dir, {}, signal)

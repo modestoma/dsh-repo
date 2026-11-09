@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { catalogKey } from '../src/catalog/catalog.ts'
-import { HostStore } from '../src/hosts.ts'
+import { SettingsStore } from '../src/settings/store.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
 import { RepoError } from '../src/errors.ts'
@@ -16,7 +16,7 @@ function setup(seed?: unknown) {
   const file = join(root, 'hosts.json')
   if (seed !== undefined) writeFileSync(file, JSON.stringify(seed))
   const warnings: string[] = []
-  const hosts = new HostStore(testConfig().hosts, file, { warn: (message: string) => { warnings.push(message) } })
+  const hosts = new SettingsStore(testConfig().hosts, file, { warn: (message: string) => { warnings.push(message) } })
   const service = new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials({}),
@@ -27,7 +27,7 @@ function setup(seed?: unknown) {
 }
 
 describe('repository catalog', () => {
-  it('keys repositories by host and path in lowercase, and local repositories by absolute path', () => {
+  it('keys repositories by host and path in lowercase, and refuses local paths', () => {
     const { hosts } = testConfig()
     expect(catalogKey('https://GitHub.com/A/B.git', hosts)).toBe('github.com/a/b')
     expect(catalogKey('git@code.example.com:team/app.git', hosts)).toBe('code.example.com/gitlab/team/app')
@@ -36,8 +36,8 @@ describe('repository catalog', () => {
     expect(catalogKey('https://code.example.com/other/team/app', shared)).toBe('code.example.com/other/team/app')
     expect(catalogKey('https://code.example.com/gitlab/team/app', shared)).toBe('code.example.com/gitlab/team/app')
     expect(catalogKey('https://github.com/a/b/pull/3', hosts)).toBe('github.com/a/b')
-    expect(catalogKey('/srv/repos/x/../app', hosts)).toBe('local:/srv/repos/app')
-    expect(catalogKey(pathToFileURL('/srv/repos/app').href, hosts)).toBe('local:/srv/repos/app')
+    expect(() => catalogKey('/srv/repos/app', hosts)).toThrow(expect.objectContaining({ code: 'not-allowed' }))
+    expect(() => catalogKey(pathToFileURL('/srv/repos/app').href, hosts)).toThrow(expect.objectContaining({ code: 'invalid' }))
     expect(() => catalogKey('https://gitlab.com/a/b', hosts)).toThrow(expect.objectContaining({ code: 'not-allowed' }))
     expect(() => catalogKey('file://remote-host/x', hosts)).toThrow(expect.objectContaining({ code: 'invalid' }))
   })
@@ -155,5 +155,15 @@ describe('repository catalog', () => {
     expect(service.settings.mirror.gitTimeoutMs).toBe(60_000)
     await service.catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [] })
     expect(JSON.parse(readFileSync(file, 'utf8')).settings).toEqual({ mirror: { gitTimeoutMs: 60_000 } })
+  })
+
+  it('ignores catalog entries of local repositories with a warning and drops them on the next save', async () => {
+    const entry = { access: 'read', features: [], addedAt: '2026-11-01T00:00:00.000Z' }
+    const seed = { hosts: [], repos: [{ ...entry, id: '000000000001', url: '/srv/repos/app' }, { ...entry, id: '000000000002', url: 'file:///srv/repos/lib' }, { ...entry, id: '000000000003', url: 'https://github.com/a/b' }] }
+    const { warnings, service, file } = setup(seed)
+    expect(warnings).toEqual([expect.stringContaining('/srv/repos/app、file:///srv/repos/lib')])
+    expect(service.catalog.entries().map(item => item.url)).toEqual(['https://github.com/a/b'])
+    await service.catalog.add({ url: 'https://github.com/a/c', access: 'read', features: [] })
+    expect(JSON.parse(readFileSync(file, 'utf8')).repos.map((item: { url: string }) => item.url)).toEqual(['https://github.com/a/b', 'https://github.com/a/c'])
   })
 })

@@ -6,10 +6,8 @@
  * @module dsh-repo/watch/store
  */
 
-import { readFileSync, renameSync } from 'node:fs'
 import { z } from 'zod'
-import { RepoError } from '../errors.ts'
-import { writeJsonAtomic } from '../files.ts'
+import { JsonFile } from '../files.ts'
 import type { HostLogger } from '../host.ts'
 import { WATCH_EVENT_KINDS } from '../settings/contract.ts'
 import type { WatchRecord } from './activity.ts'
@@ -87,8 +85,7 @@ const fileSchema = z.object({ watches: z.array(recordSchema) }).strict()
 
 /** The watched PRs/MRs. */
 export class WatchStore {
-  private records: Map<string, WatchRecord>
-  private queue: Promise<unknown> = Promise.resolve()
+  private readonly json: JsonFile<readonly WatchRecord[]>
 
   /**
    * Read `watches.json`. A missing file means no watches; an unreadable or
@@ -98,39 +95,20 @@ export class WatchStore {
    * @param logger - reports a set-aside file.
    */
   constructor(readonly file: string, logger?: HostLogger) {
-    this.records = new Map(WatchStore.read(file, logger).map(record => [record.id, record]))
-  }
-
-  private static read(file: string, logger: HostLogger | undefined): WatchRecord[] {
-    let text: string
-    try {
-      text = readFileSync(file, 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
-      logger?.warn?.(`dsh-repo: 无法读取 PR/MR 跟踪记录 ${file}，本次不跟踪任何 PR/MR：${(error as Error).message}`)
-      return []
-    }
-    let reason: string
-    try {
-      const parsed = fileSchema.safeParse(JSON.parse(text))
-      if (parsed.success) return parsed.data.watches
-      reason = parsed.error.issues.map(issue => `${issue.path.join('.')}：${issue.message}`).join('；')
-    } catch (error) {
-      reason = `不是合法 JSON：${(error as Error).message}`
-    }
-    const aside = `${file}.invalid-${Date.now()}`
-    try {
-      renameSync(file, aside)
-      logger?.warn?.(`dsh-repo: PR/MR 跟踪记录 ${file} 内容不合法（${reason}），已移到 ${aside}，重新开始跟踪`)
-    } catch (error) {
-      logger?.warn?.(`dsh-repo: PR/MR 跟踪记录 ${file} 内容不合法（${reason}），也无法移开（${(error as Error).message}），保存新的跟踪记录时会覆盖它`)
-    }
-    return []
+    this.json = new JsonFile<readonly WatchRecord[]>({
+      file,
+      label: 'PR/MR 跟踪记录',
+      schema: fileSchema.transform(content => content.watches),
+      empty: [],
+      invalid: 'set-aside',
+      encode: watches => ({ watches }),
+      ...logger === undefined ? {} : { logger },
+    })
   }
 
   /** @returns every watch. */
   all(): readonly WatchRecord[] {
-    return [...this.records.values()]
+    return this.json.value
   }
 
   /**
@@ -138,7 +116,7 @@ export class WatchStore {
    * @returns the watch, or undefined.
    */
   get(id: string): WatchRecord | undefined {
-    return this.records.get(id)
+    return this.json.value.find(record => record.id === id)
   }
 
   /**
@@ -149,18 +127,9 @@ export class WatchStore {
    * @throws {RepoError} `unavailable` when the file cannot be written; nothing changes then.
    */
   update(change: (current: readonly WatchRecord[]) => readonly WatchRecord[]): Promise<readonly WatchRecord[]> {
-    const run = this.queue.then(async () => {
-      const next = change(this.all())
-      try {
-        await writeJsonAtomic(this.file, { watches: next })
-      } catch (error) {
-        throw new RepoError('unavailable', `无法写入 PR/MR 跟踪记录 ${this.file}：${(error as Error).message}`)
-      }
-      this.records = new Map(next.map(record => [record.id, record]))
-      return next
+    return this.json.update((current) => {
+      const value = change(current)
+      return { value, result: value }
     })
-    // The queue only orders work; callers observe the failure through `run`.
-    this.queue = run.then(() => undefined, () => undefined)
-    return run
   }
 }

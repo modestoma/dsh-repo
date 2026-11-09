@@ -17,6 +17,8 @@ const plugin = await import('../lib/index.js')
 const commonJs = Object.keys(createRequire(import.meta.url).cache)
 assert.deepEqual(commonJs, [], `host bundle must load no CommonJS module, loaded:\n${commonJs.join('\n')}`)
 
+// Other plugins reach dsh-repo only through the `dshRepos` service; the package exports the plugin surface alone.
+assert.deepEqual(Object.keys(plugin).sort(), ['Config', 'apply', 'inject', 'name'], 'host bundle must export only the Cordis plugin surface')
 assert.equal(plugin.name, 'dsh-repo', 'host bundle must export the Cordis plugin name')
 assert.equal(typeof plugin.apply, 'function', 'host bundle must export apply()')
 assert.deepEqual([...plugin.inject], ['tools', 'credentials'], 'unexpected inject list')

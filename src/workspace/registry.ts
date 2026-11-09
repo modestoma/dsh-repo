@@ -8,11 +8,10 @@
  * @module dsh-repo/workspace/registry
  */
 
-import { mkdirSync, readFileSync } from 'node:fs'
-import { rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { z } from 'zod'
-import { RepoError } from '../errors.ts'
+import { JsonFile } from '../files.ts'
+import { COMMIT_ID } from '../refs.ts'
 import type { HostLogger } from '../host.ts'
 import { within } from '../paths.ts'
 
@@ -39,7 +38,7 @@ const recordSchema = z.object({
   path: z.string().min(1),
   repo: z.string().min(1),
   base: z.string().min(1),
-  baseCommit: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+  baseCommit: z.string().regex(COMMIT_ID),
   branch: z.string().min(1),
   secret: z.string().regex(/^[0-9a-f]{32,}$/),
   session: z.string().min(1).optional(),
@@ -60,33 +59,38 @@ export function workspacesFile(settingsFile: string): string {
   return join(dirname(settingsFile), 'workspaces.json')
 }
 
+/** What `workspaces.json` holds. */
+interface Content {
+  readonly port?: number | undefined
+  readonly workspaces: readonly WorkspaceRecord[]
+}
+
 /** Workspace records and the proxy port, persisted on every change. */
 export class WorkspaceRegistry {
-  private records: WorkspaceRecord[]
-  private savedPort: number | undefined
-  private queue: Promise<unknown> = Promise.resolve()
+  private readonly json: JsonFile<Content>
 
   /**
-   * Read the file; a missing file means no workspaces and no port.
+   * Read the file. A missing file means no workspaces and no port; an
+   * unreadable or invalid one is renamed to `workspaces.json.invalid-<time>`
+   * and reported, so its records and secrets stay recoverable.
    * @param file - absolute path of `workspaces.json`.
-   * @param logger - reports an unreadable file, which is then treated as empty.
+   * @param logger - reports a set-aside file.
    */
   constructor(readonly file: string, logger?: HostLogger) {
-    let parsed: z.output<typeof fileSchema> = { workspaces: [] }
-    try {
-      const result = fileSchema.safeParse(JSON.parse(readFileSync(file, 'utf8')))
-      if (result.success) parsed = result.data
-      else logger?.error?.(`dsh-repo: 工作区记录 ${file} 内容不合法，已忽略：${result.error.issues.map(issue => `${issue.path.join('.')}：${issue.message}`).join('；')}`)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') logger?.error?.(`dsh-repo: 无法读取工作区记录 ${file}，已忽略：${error instanceof Error ? error.message : String(error)}`)
-    }
-    this.records = parsed.workspaces
-    this.savedPort = parsed.port
+    this.json = new JsonFile<Content>({
+      file,
+      label: '工作区记录',
+      schema: fileSchema,
+      empty: { workspaces: [] },
+      invalid: 'set-aside',
+      encode: content => ({ ...content.port === undefined ? {} : { port: content.port }, workspaces: content.workspaces }),
+      ...logger === undefined ? {} : { logger },
+    })
   }
 
   /** @returns every record, oldest first. */
   list(): readonly WorkspaceRecord[] {
-    return this.records
+    return this.json.value.workspaces
   }
 
   /**
@@ -94,7 +98,7 @@ export class WorkspaceRegistry {
    * @returns the record, or undefined.
    */
   get(id: string): WorkspaceRecord | undefined {
-    return this.records.find(record => record.id === id)
+    return this.list().find(record => record.id === id)
   }
 
   /**
@@ -103,12 +107,12 @@ export class WorkspaceRegistry {
    * @returns the record, or undefined.
    */
   containing(path: string): WorkspaceRecord | undefined {
-    return this.records.find(record => record.path === path || within(record.path, path))
+    return this.list().find(record => record.path === path || within(record.path, path))
   }
 
   /** @returns the port the proxy last listened on. */
   port(): number | undefined {
-    return this.savedPort
+    return this.json.value.port
   }
 
   /**
@@ -117,10 +121,7 @@ export class WorkspaceRegistry {
    * @throws {RepoError} `unavailable` when the file cannot be written.
    */
   setPort(port: number): Promise<void> {
-    return this.enqueue(async () => {
-      this.savedPort = port
-      await this.write()
-    })
+    return this.json.update(current => ({ value: { ...current, port }, result: undefined }))
   }
 
   /**
@@ -129,15 +130,7 @@ export class WorkspaceRegistry {
    * @throws {RepoError} `unavailable` when the file cannot be written; the record is not kept then.
    */
   add(record: WorkspaceRecord): Promise<void> {
-    return this.enqueue(async () => {
-      this.records = [...this.records, record]
-      try {
-        await this.write()
-      } catch (error) {
-        this.records = this.records.filter(entry => entry.id !== record.id)
-        throw error
-      }
-    })
+    return this.json.update(current => ({ value: { ...current, workspaces: [...current.workspaces, record] }, result: undefined }))
   }
 
   /**
@@ -146,29 +139,6 @@ export class WorkspaceRegistry {
    * @throws {RepoError} `unavailable` when the file cannot be written.
    */
   remove(ids: readonly string[]): Promise<void> {
-    return this.enqueue(async () => {
-      const next = this.records.filter(record => !ids.includes(record.id))
-      if (next.length === this.records.length) return
-      this.records = next
-      await this.write()
-    })
-  }
-
-  private enqueue<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(task)
-    // The queue only orders writes; callers observe failures through `run`.
-    this.queue = run.catch(() => undefined)
-    return run
-  }
-
-  private async write(): Promise<void> {
-    const temporary = `${this.file}.tmp-${process.pid}`
-    try {
-      mkdirSync(dirname(this.file), { recursive: true })
-      await writeFile(temporary, `${JSON.stringify({ ...this.savedPort === undefined ? {} : { port: this.savedPort }, workspaces: this.records }, null, 2)}\n`, { mode: 0o600 })
-      await rename(temporary, this.file)
-    } catch (error) {
-      throw new RepoError('unavailable', `无法保存工作区记录 ${this.file}：${error instanceof Error ? error.message : String(error)}`)
-    }
+    return this.json.update(current => ({ value: { ...current, workspaces: current.workspaces.filter(record => !ids.includes(record.id)) }, result: undefined }))
   }
 }

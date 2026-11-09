@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as plugin from '../src/index.ts'
 import { DshReposApi } from '../src/api.ts'
 import type { AuthorizeEvent } from '../src/contract.ts'
+import { ACCESS_AUTHORIZE_EVENT } from '../src/events.ts'
 import type { HostContext, ToolDefinition } from '../src/host.ts'
 import { RepoService } from '../src/service.ts'
 import { credentials } from './helpers.ts'
@@ -73,7 +74,7 @@ describe('plugin', () => {
     const seen: AuthorizeEvent[] = []
     const { outcome, create, events, approvals } = await createIssueWithListeners([event => { seen.push(event) }])
     expect(await outcome).toMatchObject({ number: 1 })
-    expect(events).toEqual([plugin.ACCESS_AUTHORIZE_EVENT])
+    expect(events).toEqual([ACCESS_AUTHORIZE_EVENT])
     expect(seen).toEqual([{ session: 's1', level: 'code-write', action: 'issueCreate', summary: '在 github.com/a/b 创建 issue：Bug' }])
     expect(approvals).toEqual(['repo_issue_create'])
     expect(create).toHaveBeenCalledTimes(1)
@@ -179,6 +180,6 @@ describe('plugin', () => {
     plugin.apply(second.ctx, undefined, { env: first.env })
     const hosts = await provided(second.provided).api.hostList()
     expect(hosts).toMatchObject([{ kind: 'gitlab', url: 'https://code.example.com', alias: '公司 GitLab', origin: 'added' }])
-    expect(() => plugin.apply(context().ctx, { hostsFile: join(first.env.DSH_HOME, 'dsh-repo') })).toThrow(/无法读取设置文件/)
+    expect(() => plugin.apply(context().ctx, { hostsFile: join(first.env.DSH_HOME, 'dsh-repo') })).toThrow(/设置文件 .* 无法读取/)
   })
 })

@@ -8,10 +8,8 @@
  * @module dsh-repo/sync/store
  */
 
-import { readFileSync, renameSync } from 'node:fs'
 import { z } from 'zod'
-import { RepoError } from '../errors.ts'
-import { writeJsonAtomic } from '../files.ts'
+import { JsonFile } from '../files.ts'
 import type { HostLogger } from '../host.ts'
 
 /** One repository's local sync progress. */
@@ -48,8 +46,7 @@ const fileSchema = z.object({ syncs: z.array(progressSchema) }).strict()
 
 /** Local sync progress of every catalog repository that synced. */
 export class SyncStore {
-  private records: readonly SyncProgress[]
-  private queue: Promise<unknown> = Promise.resolve()
+  private readonly json: JsonFile<readonly SyncProgress[]>
 
   /**
    * Read the file. A missing file means no progress; an unreadable or invalid
@@ -59,39 +56,20 @@ export class SyncStore {
    * @param logger - reports a set-aside file.
    */
   constructor(readonly file: string, logger?: HostLogger) {
-    this.records = SyncStore.read(file, logger)
-  }
-
-  private static read(file: string, logger: HostLogger | undefined): SyncProgress[] {
-    let text: string
-    try {
-      text = readFileSync(file, 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
-      logger?.warn?.(`dsh-repo: 无法读取本地同步进度 ${file}，每个本地同步都按第一次同步处理：${(error as Error).message}`)
-      return []
-    }
-    let reason: string
-    try {
-      const parsed = fileSchema.safeParse(JSON.parse(text))
-      if (parsed.success) return parsed.data.syncs
-      reason = parsed.error.issues.map(issue => `${issue.path.join('.')}：${issue.message}`).join('；')
-    } catch (error) {
-      reason = `不是合法 JSON：${(error as Error).message}`
-    }
-    const aside = `${file}.invalid-${Date.now()}`
-    try {
-      renameSync(file, aside)
-      logger?.warn?.(`dsh-repo: 本地同步进度 ${file} 内容不合法（${reason}），已移到 ${aside}，每个本地同步都按第一次同步处理`)
-    } catch (error) {
-      logger?.warn?.(`dsh-repo: 本地同步进度 ${file} 内容不合法（${reason}），也无法移开（${(error as Error).message}），保存新的进度时会覆盖它`)
-    }
-    return []
+    this.json = new JsonFile<readonly SyncProgress[]>({
+      file,
+      label: '本地同步进度',
+      schema: fileSchema.transform(content => content.syncs),
+      empty: [],
+      invalid: 'set-aside',
+      encode: syncs => ({ syncs }),
+      ...logger === undefined ? {} : { logger },
+    })
   }
 
   /** @returns the progress of every repository that has any. */
   all(): readonly SyncProgress[] {
-    return this.records
+    return this.json.value
   }
 
   /**
@@ -99,7 +77,7 @@ export class SyncStore {
    * @returns the progress, or undefined before the first attempt.
    */
   get(id: string): SyncProgress | undefined {
-    return this.records.find(record => record.id === id)
+    return this.json.value.find(record => record.id === id)
   }
 
   /**
@@ -109,18 +87,9 @@ export class SyncStore {
    * @throws {RepoError} `unavailable` when the file cannot be written; nothing changes then.
    */
   update(id: string, change: (current: SyncProgress | undefined) => SyncProgress | undefined): Promise<void> {
-    const run = this.queue.then(async () => {
-      const next = change(this.get(id))
-      const records = [...this.records.filter(record => record.id !== id), ...next === undefined ? [] : [next]]
-      try {
-        await writeJsonAtomic(this.file, { syncs: records })
-      } catch (error) {
-        throw new RepoError('unavailable', `无法写入本地同步进度 ${this.file}：${(error as Error).message}`)
-      }
-      this.records = records
+    return this.json.update((current) => {
+      const next = change(current.find(record => record.id === id))
+      return { value: [...current.filter(record => record.id !== id), ...next === undefined ? [] : [next]], result: undefined }
     })
-    // The queue only orders work; callers observe the failure through `run`.
-    this.queue = run.then(() => undefined, () => undefined)
-    return run
   }
 }

@@ -57,14 +57,13 @@ export async function treeSize(path: string): Promise<number> {
 function withoutCredentials(url: string): string {
   try {
     const parsed = new URL(url)
-    if (parsed.protocol === 'file:') return url
     parsed.username = ''
     parsed.password = ''
     parsed.search = ''
     parsed.hash = ''
     return parsed.href
   } catch {
-    // A local path has nothing to remove.
+    // Not a URL: shown as git reported it.
     return url
   }
 }

@@ -124,7 +124,7 @@ export function repoRows(service: RepoService, syncs: SyncList = NO_SYNCS): Repo
       features: [...entry.features],
       ...entry.localSync === undefined ? {} : { localSync: { ...entry.localSync } },
       addedAt: entry.addedAt,
-      ...'key' in own ? { key: own.key.startsWith('local:') ? own.key.slice('local:'.length) : own.key } : { problem: own.problem },
+      ...'key' in own ? { key: own.key } : { problem: own.problem },
       ...sync === undefined ? {} : { sync },
     }
   })

@@ -23,11 +23,11 @@ import { spawn } from 'node:child_process'
 import { timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
-import { basename, dirname, isAbsolute } from 'node:path'
+import { basename, dirname } from 'node:path'
 import { PassThrough, Readable } from 'node:stream'
-import { fileURLToPath } from 'node:url'
 import { createGunzip } from 'node:zlib'
 import { RepoError } from '../errors.ts'
+import { isBranchName } from '../refs.ts'
 import { authorize } from '../events.ts'
 import type { ParallelDispatch } from '../events.ts'
 import type { HostLogger } from '../host.ts'
@@ -44,6 +44,8 @@ export interface GitProxyDeps {
   /** Runs after the remote accepted a push, with the branches its report lists as updated. */
   readonly onPushed?: (record: WorkspaceRecord, branches: readonly string[]) => void
   readonly logger?: HostLogger
+  /** HTTP client of the requests forwarded to the remote; default: the global `fetch`. */
+  readonly fetch?: typeof fetch
 }
 
 /** One command of a push. */
@@ -56,7 +58,6 @@ interface PushCommand {
 /** Largest command section of a push read before the pack data. */
 const MAX_COMMAND_BYTES = 1024 * 1024
 const ZERO = /^0+$/
-const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
 
 function pktLine(payload: Buffer | string): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload
@@ -194,8 +195,12 @@ export class GitProxy {
   private server: Server | undefined
   private listening: number | undefined
 
-  /** @param deps - engine, registry, event dispatch, and the push hook. */
-  constructor(private readonly deps: GitProxyDeps) {}
+  private readonly fetch: typeof fetch
+
+  /** @param deps - engine, registry, event dispatch, the push hook, and the HTTP client. */
+  constructor(private readonly deps: GitProxyDeps) {
+    this.fetch = deps.fetch ?? (async (input, init) => await fetch(input, init))
+  }
 
   /** @returns the port the proxy listens on, or undefined while it is stopped. */
   get port(): number | undefined {
@@ -276,24 +281,19 @@ export class GitProxy {
   /** Fetch the mirror from the remote, then advertise its refs. */
   private async advertiseUpload(req: IncomingMessage, res: ServerResponse, record: WorkspaceRecord, query: string): Promise<void> {
     const mirror = await this.deps.service.syncMirror(record.repo)
-    await this.backend(req, res, dirname(mirror.dir), `/${basename(mirror.dir)}/info/refs`, query, false)
+    await this.backend(req, res, dirname(mirror.dir), `/${basename(mirror.dir)}/info/refs`, query)
   }
 
   private async upload(req: IncomingMessage, res: ServerResponse, record: WorkspaceRecord): Promise<void> {
     this.deps.service.catalog.require(record.repo, 'read')
     const dir = this.deps.service.mirrors.dirOf(record.repo)
-    await this.backend(req, res, dirname(dir), `/${basename(dir)}/git-upload-pack`, '', false)
+    await this.backend(req, res, dirname(dir), `/${basename(dir)}/git-upload-pack`, '')
   }
 
   private async advertiseReceive(req: IncomingMessage, res: ServerResponse, record: WorkspaceRecord, query: string): Promise<void> {
     this.deps.service.catalog.require(record.repo, 'write')
-    const local = this.localPath(record.repo)
-    if (local !== undefined) {
-      await this.backend(req, res, dirname(local), `/${basename(local)}/info/refs`, query, true)
-      return
-    }
     const upstream = await this.upstream(record.repo)
-    const answer = await fetch(`${upstream.base}/info/refs?${query}`, { headers: upstream.headers, redirect: 'follow' })
+    const answer = await this.fetch(`${upstream.base}/info/refs?${query}`, { headers: upstream.headers, redirect: 'follow' })
     res.writeHead(answer.status, { 'content-type': answer.headers.get('content-type') ?? 'application/octet-stream', 'cache-control': 'no-cache' })
     res.end(Buffer.from(await answer.arrayBuffer()))
   }
@@ -315,28 +315,17 @@ export class GitProxy {
     const input = new PassThrough()
     input.write(head)
     rest.pipe(input)
-    const local = this.localPath(record.repo)
-    let status: number
-    let type: string
-    let answer: Buffer
-    if (local !== undefined) {
-      const result = await this.cgi(req, dirname(local), `/${basename(local)}/git-receive-pack`, '', true, input)
-      status = result.status
-      type = result.headers['content-type'] ?? 'application/x-git-receive-pack-result'
-      answer = result.body
-    } else {
-      const upstream = await this.upstream(record.repo)
-      const response = await fetch(`${upstream.base}/git-receive-pack`, {
-        method: 'POST',
-        headers: { ...upstream.headers, 'content-type': 'application/x-git-receive-pack-request', accept: 'application/x-git-receive-pack-result' },
-        body: Readable.toWeb(input) as ReadableStream<Uint8Array>,
-        duplex: 'half',
-        redirect: 'follow',
-      } as RequestInit & { duplex: 'half' })
-      status = response.status
-      type = response.headers.get('content-type') ?? 'application/x-git-receive-pack-result'
-      answer = Buffer.from(await response.arrayBuffer())
-    }
+    const upstream = await this.upstream(record.repo)
+    const response = await this.fetch(`${upstream.base}/git-receive-pack`, {
+      method: 'POST',
+      headers: { ...upstream.headers, 'content-type': 'application/x-git-receive-pack-request', accept: 'application/x-git-receive-pack-result' },
+      body: Readable.toWeb(input) as ReadableStream<Uint8Array>,
+      duplex: 'half',
+      redirect: 'follow',
+    } as RequestInit & { duplex: 'half' })
+    const status = response.status
+    const type = response.headers.get('content-type') ?? 'application/x-git-receive-pack-result'
+    const answer = Buffer.from(await response.arrayBuffer())
     // The remote answers a refused update (a hook, a race) with HTTP 200 and `ng` in the report.
     const branches = status === 200 ? acceptedRefs(answer, commands, capabilities).map(ref => ref.slice('refs/heads/'.length)) : []
     this.deps.logger?.info?.('dsh-repo: 代理推送 %s %s（工作区 %s，会话 %s）：HTTP %d，远端接受 %s', record.repo, commands.map(command => command.ref.slice('refs/heads/'.length)).join(' '), record.path, record.session ?? '无', status, branches.join(' ') || '无')
@@ -368,18 +357,16 @@ export class GitProxy {
       return `无法确认默认分支：${error instanceof Error ? error.message : String(error)}`
     }
     for (const command of commands) {
-      if (!command.ref.startsWith('refs/heads/') || !BRANCH.test(command.ref.slice('refs/heads/'.length))) return `只能推送分支，不能推送 ${command.ref}（标签等其他引用不经工作区推送）`
+      if (!command.ref.startsWith('refs/heads/') || !isBranchName(command.ref.slice('refs/heads/'.length))) return `只能推送分支，不能推送 ${command.ref}（标签等其他引用不经工作区推送）`
       const branch = command.ref.slice('refs/heads/'.length)
       if (ZERO.test(command.new)) return `不能删除远端分支 ${branch}`
       if (branch === defaultBranch) return `不能直接推送到默认分支 ${branch}；推送到别的分支后创建 PR/MR`
-      if (service.gitHost(record.repo)) {
-        try {
-          const remote = await service.getBranch(record.repo, branch)
-          if (remote?.default === true) return `不能直接推送到默认分支 ${branch}；推送到别的分支后创建 PR/MR`
-          if (remote?.protected === true) return `${branch} 是受保护分支，不能经工作区推送`
-        } catch (error) {
-          return `无法确认分支 ${branch} 是否受保护：${error instanceof Error ? error.message : String(error)}`
-        }
+      try {
+        const remote = await service.getBranch(record.repo, branch)
+        if (remote?.default === true) return `不能直接推送到默认分支 ${branch}；推送到别的分支后创建 PR/MR`
+        if (remote?.protected === true) return `${branch} 是受保护分支，不能经工作区推送`
+      } catch (error) {
+        return `无法确认分支 ${branch} 是否受保护：${error instanceof Error ? error.message : String(error)}`
       }
     }
     if (record.session !== undefined) {
@@ -392,16 +379,9 @@ export class GitProxy {
     return undefined
   }
 
-  /** The repository directory of a local catalog address, or undefined for a remote one. */
-  private localPath(url: string): string | undefined {
-    if (isAbsolute(url)) return url
-    return url.startsWith('file:') ? fileURLToPath(url) : undefined
-  }
-
   /** Base URL and headers of a remote repository's smart HTTP endpoints, with the host's token. */
   private async upstream(url: string): Promise<{ base: string; headers: Record<string, string> }> {
     const credentials = await this.deps.service.gitCredentials(url)
-    if (credentials === undefined) throw new RepoError('not-allowed', `${url} 不是远端仓库`)
     const trimmed = url.replace(/\/+$/, '')
     return {
       base: trimmed.endsWith('.git') ? trimmed : `${trimmed}.git`,
@@ -410,8 +390,8 @@ export class GitProxy {
   }
 
   /** Serve a request with `git http-backend`, streaming its answer. */
-  private async backend(req: IncomingMessage, res: ServerResponse, root: string, pathInfo: string, query: string, receive: boolean): Promise<void> {
-    const child = spawn('git', ['http-backend'], { env: this.cgiEnv(req, root, pathInfo, query, receive, true), stdio: ['pipe', 'pipe', 'pipe'] })
+  private async backend(req: IncomingMessage, res: ServerResponse, root: string, pathInfo: string, query: string): Promise<void> {
+    const child = spawn('git', ['http-backend'], { env: this.cgiEnv(req, root, pathInfo, query), stdio: ['pipe', 'pipe', 'pipe'] })
     const stderr: Buffer[] = []
     child.stderr.on('data', (chunk: Buffer) => { if (stderr.length < 64) stderr.push(chunk) })
     req.pipe(child.stdin)
@@ -425,21 +405,8 @@ export class GitProxy {
     await new Promise(resolve => res.once('close', resolve))
   }
 
-  /** Run `git http-backend` on `input` and buffer its whole answer. */
-  private async cgi(req: IncomingMessage, root: string, pathInfo: string, query: string, receive: boolean, input: Readable): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> {
-    const child = spawn('git', ['http-backend'], { env: this.cgiEnv(req, root, pathInfo, query, receive, false), stdio: ['pipe', 'pipe', 'pipe'] })
-    input.pipe(child.stdin)
-    const out: Buffer[] = []
-    const err: Buffer[] = []
-    child.stdout.on('data', (chunk: Buffer) => { out.push(chunk) })
-    child.stderr.on('data', (chunk: Buffer) => { if (err.length < 64) err.push(chunk) })
-    const code = await new Promise<number | null>(resolve => child.once('close', resolve))
-    const parsed = splitCgi(Buffer.concat(out))
-    if (parsed === undefined) throw new RepoError('unavailable', `git http-backend 失败（${String(code)}）：${Buffer.concat(err).toString('utf8').trim()}`)
-    return parsed
-  }
-
-  private cgiEnv(req: IncomingMessage, root: string, pathInfo: string, query: string, receive: boolean, passEncoding: boolean): NodeJS.ProcessEnv {
+  /** CGI environment of `git http-backend` serving a fetch from the mirrors. */
+  private cgiEnv(req: IncomingMessage, root: string, pathInfo: string, query: string): NodeJS.ProcessEnv {
     const protocol = req.headers['git-protocol']
     const encoding = req.headers['content-encoding']
     return {
@@ -451,9 +418,8 @@ export class GitProxy {
       REQUEST_METHOD: req.method ?? 'GET',
       CONTENT_TYPE: req.headers['content-type'] ?? '',
       REMOTE_ADDR: '127.0.0.1',
-      ...receive ? { REMOTE_USER: 'dsh-repo' } : {},
       ...typeof protocol === 'string' ? { HTTP_GIT_PROTOCOL: protocol } : {},
-      ...passEncoding && typeof encoding === 'string' ? { HTTP_CONTENT_ENCODING: encoding } : {},
+      ...typeof encoding === 'string' ? { HTTP_CONTENT_ENCODING: encoding } : {},
     }
   }
 }

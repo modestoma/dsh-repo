@@ -16,12 +16,12 @@
 
 import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
-import { isAbsolute } from 'node:path'
 import type {
   CallOptions, CatalogRepo, CiActionResult, CiJob, CiJobLog, CommitAuthor, HostCreate, HostInfo, HostsChange, MergedBranchDeletion, MergeMethod, MrInfo, MrState, Page, RepoAccess,
   RepoAddResult, RepoFeature, RepoRef, RepoTarget, TokenStatus,
 } from './contract.ts'
 import { readLog } from './ci/log.ts'
+import { requireBranch, requireCommit } from './refs.ts'
 import { RepoCatalog } from './catalog/catalog.ts'
 import { publicRepo } from './catalog/entry.ts'
 import { apiBaseUrl, DEFAULT_SETTINGS, resolveSettings } from './config.ts'
@@ -29,7 +29,7 @@ import type { HostSpec, RepoSettings } from './config.ts'
 import type { MirrorSettings, MirrorUsage } from './settings/contract.ts'
 import { RepoError, toRepoError } from './errors.ts'
 import type { HostCredentials, HostLogger } from './host.ts'
-import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
+import { SettingsStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './settings/store.ts'
 import { credentialEnvironment } from './mirror/git.ts'
 import { checkMirrorDir } from './mirror/root.ts'
 import type { MirrorState, MirrorStore } from './mirror/store.ts'
@@ -49,8 +49,6 @@ export type ProviderFactory = (spec: HostSpec, token: () => Promise<string>, tim
 export const defaultProviderFactory: ProviderFactory = (spec, token, timeoutMs) => spec.kind === 'github'
   ? new GithubProvider(apiBaseUrl(spec), token)
   : new GitlabProvider(apiBaseUrl(spec), token, timeoutMs)
-
-const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
 
 /** Paging as list calls pass it. */
 export interface PageOptions extends CallOptions {
@@ -148,10 +146,6 @@ async function allChangesFrom(provider: Provider, ref: RepoRef, branch: string, 
   return found
 }
 
-function requireBranch(value: string, label: string): void {
-  if (!BRANCH.test(value) || value.startsWith('/') || value === '@') throw new RepoError('invalid', `${label}不合法：${value}`)
-}
-
 function requireRepoPath(value: string, label: string): void {
   const segments = value.split('/')
   if (value === '' || value.startsWith('/') || segments.some(segment => segment === '' || segment === '.' || segment === '..') || /[\u0000-\u001f\u007f]/.test(value)) {
@@ -171,7 +165,6 @@ function requireId(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new RepoError('invalid', `${label}必须是正整数：${value}`)
 }
 
-const COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 /** Most search texts of one job log call. */
 const MAX_LOG_SEARCH = 20
 /** Longest search text or section filter. */
@@ -206,7 +199,7 @@ export interface RepoServiceDeps {
   /** DSH credential store; tokens are resolved per request. */
   readonly credentials: HostCredentials
   /** Configured and added hosts, the mirror directory, and the run-time settings. */
-  readonly hosts: HostStore
+  readonly hosts: SettingsStore
   /** Local mirrors. */
   readonly mirrors: MirrorStore
   readonly factory?: ProviderFactory
@@ -225,7 +218,7 @@ export class RepoService {
   /** The repository catalog every call is checked against. */
   readonly catalog: RepoCatalog
   /** Configured and added hosts, the stored directories, and the run-time settings. */
-  readonly hosts: HostStore
+  readonly hosts: SettingsStore
   /** Local mirrors. */
   readonly mirrors: MirrorStore
   private readonly providers = new Map<string, Provider>()
@@ -458,7 +451,7 @@ export class RepoService {
 
   async listCiRuns(repo: RepoTarget, options: CiRunListOptions = {}) {
     if (options.ref !== undefined) requireBranch(options.ref, 'ref')
-    if (options.sha !== undefined && !COMMIT.test(options.sha)) throw new RepoError('invalid', `sha 必须是完整的提交 id：${options.sha}`)
+    if (options.sha !== undefined) requireCommit(options.sha, 'sha ')
     if (options.change !== undefined) {
       requireNumber(options.change)
       if (options.ref !== undefined || options.sha !== undefined) throw new RepoError('invalid', '按 PR/MR 列出时不能再给 ref 或 sha')
@@ -555,7 +548,7 @@ export class RepoService {
 
   async mergeChange(repo: RepoTarget, number: number, options: MergeFields) {
     requireNumber(number)
-    if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(options.headSha)) throw new RepoError('invalid', `headSha 必须是完整的提交号：${options.headSha}`)
+    requireCommit(options.headSha.toLowerCase(), 'headSha ')
     const request = { headSha: options.headSha, ...options.method === undefined ? {} : { method: options.method }, deleteSourceBranch: options.deleteSourceBranch === true }
     return await this.run(repo, options, `合并 PR/MR #${number}`, 'merge', (provider, ref, call) => provider.mergeChange(ref, number, request, call))
   }
@@ -683,30 +676,20 @@ export class RepoService {
   }
 
   /**
-   * Whether an address is served by a configured host, so its API is reachable.
-   * @param url - accepted git address.
-   * @returns false for local paths, `file:` URLs, and unconfigured hosts.
-   */
-  gitHost(url: string): boolean {
-    return !isAbsolute(url) && !url.startsWith('file:') && hostOf(url, this.hosts.all()) !== undefined
-  }
-
-  /**
    * Credentials git uses to reach a catalog address under a configured host.
    * @param url - accepted git address in the catalog.
-   * @returns the credentials, or undefined for a local path or `file:` URL.
+   * @returns the credentials.
    * @throws {RepoError} `not-allowed` without a configured host, `unauthenticated` without a token.
    */
-  async gitCredentials(url: string): Promise<HostGitCredentials | undefined> {
-    if (isAbsolute(url) || url.startsWith('file:')) return undefined
+  async gitCredentials(url: string): Promise<HostGitCredentials> {
     const spec = hostOf(url, this.hosts.all())
     if (spec === undefined) throw new RepoError('not-allowed', `${url} 不属于已配置的主机`)
     return { hostUrl: spec.url, username: gitUsername(spec.kind), token: await this.token(spec) }
   }
 
   /**
-   * Environment of a mirror's or workspace's network commands: the host's
-   * token for an address under a configured host, nothing for a local path.
+   * Environment of a mirror's network commands: the host's token, handed to
+   * git through a credential helper that only this command sees.
    * @param url - accepted git address.
    * @param push - whether the command writes, which needs `write` access.
    * @throws {RepoError} `invalid` for an unsupported address, `not-allowed` outside the catalog or below the access the command needs, `unauthenticated` when the host's token is unset.
@@ -715,7 +698,7 @@ export class RepoService {
     this.mirrors.dirOf(url)
     this.catalog.require(url, push ? 'write' : 'read')
     const credentials = await this.gitCredentials(url)
-    return credentials === undefined ? {} : credentialEnvironment(credentials.hostUrl, credentials.username, credentials.token)
+    return credentialEnvironment(credentials.hostUrl, credentials.username, credentials.token)
   }
 
   /**
@@ -723,12 +706,12 @@ export class RepoService {
    * once per token value.
    * @param url - accepted git address under a configured host.
    * @param signal - caller cancellation of the wait.
-   * @returns the identity, or `undefined` for a local address.
-   * @throws {RepoError} classified failure of the host's current-user API.
+   * @returns the identity.
+   * @throws {RepoError} `not-allowed` without a configured host, and the classified failure of the host's current-user API.
    */
-  async tokenIdentity(url: string, signal: AbortSignal | undefined): Promise<CommitAuthor | undefined> {
+  async tokenIdentity(url: string, signal: AbortSignal | undefined): Promise<CommitAuthor> {
     const spec = hostOf(url, this.hosts.all())
-    if (spec === undefined) return undefined
+    if (spec === undefined) throw new RepoError('not-allowed', `${url} 不属于已配置的主机`)
     const token = await this.token(spec)
     let entry = this.identities.get(spec.url)
     if (entry?.token !== token) {

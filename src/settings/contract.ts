@@ -162,7 +162,7 @@ export interface WatchInfo {
 
 /** A catalog repository as the settings page submits it. */
 export interface RepoInput {
-  /** HTTPS address on a configured host, `file:` URL, or absolute path of the repository. */
+  /** HTTPS address of the repository on a configured host. */
   url: string
   /** Branch to follow; missing or empty follows the remote's default branch. */
   branch?: string
@@ -203,7 +203,7 @@ export interface RepoRow {
   features: string[]
   localSync?: LocalSyncSpec
   addedAt: string
-  /** `host/path`, or the local path; absent with {@link problem}. */
+  /** `host/path`; absent with {@link problem}. */
   key?: string
   /** Why the repository cannot be reached now, e.g. its host was removed. */
   problem?: string
@@ -261,7 +261,7 @@ export interface WorkspaceRow {
   id: string
   /** Catalog address of the repository. */
   url: string
-  /** `host/path`, or the local path. */
+  /** `host/path` of the repository, or its stored address when that no longer resolves. */
   repo: string
   /** Absolute directory. */
   path: string
@@ -280,7 +280,7 @@ export interface WorkspaceRow {
   unpushed?: number
   /** Latest git activity; absent when the state could not be read. */
   activityAt?: string
-  /** Open PRs/MRs from {@link branch}; absent for a local repository or when the host could not be asked. */
+  /** Open PRs/MRs from {@link branch}; absent when the repository is no longer in the catalog or the host could not be asked. */
   mrs?: WorkspaceMr[]
   /** Why the state or the PRs/MRs could not be read. */
   error?: string
