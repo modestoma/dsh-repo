@@ -121,7 +121,9 @@ describe('plugin', () => {
     const taken = (blocker.address() as AddressInfo).port
     await expect(api.settingsUpdate({ proxyPort: taken })).rejects.toMatchObject({ code: 'unavailable', message: expect.stringContaining('设置已保存') })
     expect(api.settingsGet()).toMatchObject({ proxyPort: taken, proxyListening: port })
-    blocker.close()
+    // Once the port is free, saving the same settings again starts the proxy there.
+    await new Promise<void>((resolve) => { blocker.close(() => { resolve() }) })
+    expect(await api.settingsUpdate({ proxyPort: taken })).toMatchObject({ proxyPort: taken, proxyListening: taken })
   })
 
   it('offers no tools before a host and a repository are added, and fails loudly on bad config', async () => {

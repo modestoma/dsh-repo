@@ -201,7 +201,9 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   ctx.effect(() => {
     startProxy().catch((error: unknown) => { ctx.logger?.error?.('dsh-repo: %s', error instanceof Error ? error.message : String(error)) })
     const unlisten = service.onSettingsChange(async (next, previous) => {
-      if (next.workspace.proxyPort !== previous.workspace.proxyPort) await startProxy()
+      // Also when the proxy is not where the settings want it, so saving again retries a port that failed earlier.
+      const wanted = next.workspace.proxyPort
+      if (wanted !== previous.workspace.proxyPort || proxy.port === undefined || (wanted !== 0 && proxy.port !== wanted)) await startProxy()
     })
     return () => {
       unlisten()
