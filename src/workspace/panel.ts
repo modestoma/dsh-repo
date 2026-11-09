@@ -81,7 +81,7 @@ export async function usableDirectory(dir: string): Promise<string> {
  */
 export function workspacePanel(service: RepoService, manager: WorkspaceManager, proxyPort: () => number | undefined): WorkspacePanel {
   const row = async (record: WorkspaceRecord): Promise<WorkspaceRow> => {
-    const timeoutMs = service.settings.mirror.gitTimeoutMs
+    const timeoutMs = service.settings.current.mirror.gitTimeoutMs
     let entry: CatalogEntry | undefined
     try {
       entry = service.catalog.find(record.repo)
@@ -105,7 +105,7 @@ export function workspacePanel(service: RepoService, manager: WorkspaceManager, 
       manager.summary(record, timeoutMs).catch((error: unknown) => { errors.push(error instanceof Error ? error.message : String(error)) }),
       entry === undefined
         ? undefined
-        : service.listMrs(record.repo, { state: 'open', sourceBranch: record.branch, page: 1, perPage: MAX_LISTED_MRS }).then(
+        : service.forge.listMrs(record.repo, { state: 'open', sourceBranch: record.branch, page: 1, perPage: MAX_LISTED_MRS }).then(
             (page): WorkspaceMr[] => page.items.map(mr => ({ number: mr.number, title: mr.title, webUrl: mr.webUrl })),
             (error: unknown) => { errors.push(`无法读取 PR/MR：${error instanceof Error ? error.message : String(error)}`) },
           ),
@@ -118,14 +118,14 @@ export function workspacePanel(service: RepoService, manager: WorkspaceManager, 
     }
   }
   return {
-    dir: () => service.hosts.workspaceDir(),
-    setDir: async (dir) => { await service.hosts.setWorkspaceDir(dir === undefined ? undefined : await usableDirectory(dir)) },
+    dir: () => service.settings.workspaceDir(),
+    setDir: async (dir) => { await service.settings.setWorkspaceDir(dir === undefined ? undefined : await usableDirectory(dir)) },
     proxyPort,
     rows: async () => await Promise.all((await manager.list()).map(row)),
     create: async (input) => {
       const entry = service.catalog.entries().find(item => item.id === input.repo)
       if (entry === undefined) throw new RepoError('not-found', '仓库清单中没有这个仓库，可能已经删除')
-      const parent = service.hosts.workspaceDir()
+      const parent = service.settings.workspaceDir()
       if (parent === undefined) throw new RepoError('invalid', '还没有设置工作区目录；先在「高级 → 工作区」里设置')
       const name = input.name?.trim() ?? ''
       if (name !== '' && (name === '.' || name === '..' || /[/\\\0]/.test(name))) throw new RepoError('invalid', `目录名只能是一级名称：${name}`)
@@ -140,7 +140,7 @@ export function workspacePanel(service: RepoService, manager: WorkspaceManager, 
     remove: async (id, force) => {
       const record = (await manager.list()).find(item => item.id === id)
       if (record === undefined) throw new RepoError('not-found', '没有这个工作区，可能已经删除')
-      await manager.remove(record, force, undefined, service.settings.mirror.gitTimeoutMs)
+      await manager.remove(record, force, undefined, service.settings.current.mirror.gitTimeoutMs)
     },
   }
 }

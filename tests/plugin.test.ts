@@ -9,7 +9,8 @@ import { DshReposApi } from '../src/api.ts'
 import type { AuthorizeEvent } from '../src/contract.ts'
 import { ACCESS_AUTHORIZE_EVENT } from '../src/events.ts'
 import type { HostContext, ToolDefinition } from '../src/host.ts'
-import { RepoService } from '../src/service.ts'
+import { Forge } from '../src/forge/forge.ts'
+import type { RepoService } from '../src/service.ts'
 import { credentials } from './helpers.ts'
 
 /** Disposers of every effect a test context ran; the tests stop them so the proxy and timers end. */
@@ -43,7 +44,7 @@ function provided(map: Map<string, unknown>): { api: DshReposApi; engine: RepoSe
 /** Run the plugin's issue tool for Session `s1` with the given `access/authorize` listeners, the engine's call mocked. */
 async function createIssueWithListeners(listeners: Array<(event: AuthorizeEvent) => void | Promise<void>>) {
   const { ctx, registered, provided: map, env } = context()
-  const create = vi.spyOn(RepoService.prototype, 'createIssue').mockResolvedValue({ number: 1, title: 'Bug', body: '', state: 'open', author: { username: 'bot' }, labels: [], assignees: [], webUrl: 'u', createdAt: 'c', updatedAt: 'u' })
+  const create = vi.spyOn(Forge.prototype, 'createIssue').mockResolvedValue({ number: 1, title: 'Bug', body: '', state: 'open', author: { username: 'bot' }, labels: [], assignees: [], webUrl: 'u', createdAt: 'c', updatedAt: 'u' })
   const events: unknown[] = []
   const approvals: string[] = []
   const withEvents: HostContext = {
@@ -152,9 +153,9 @@ describe('plugin', () => {
     expect([await offered('repo_get'), await offered('repo_workspace_push'), await offered('repo_mr_merge')]).toEqual([true, true, false])
     await service.catalog.update(entry.id, { url: entry.url, access: 'merge', features: [] })
     expect(await offered('repo_mr_merge')).toBe(true)
-    await service.updateSettings({ tools: { writes: 'off' } })
+    await service.settings.update({ tools: { writes: 'off' } })
     expect([await offered('repo_get'), await offered('repo_workspace_push'), await offered('repo_mr_merge'), await offered('repo_add')]).toEqual([true, false, false, false])
-    await service.updateSettings({ tools: { enabled: false } })
+    await service.settings.update({ tools: { enabled: false } })
     expect(await offered('repo_get')).toBe(false)
   })
 
@@ -168,7 +169,7 @@ describe('plugin', () => {
     expect(await offered()).toBe(false)
     services.sessionController = { resolveAgent: async () => ({ error: new Error('unused') }) }
     expect(await offered()).toBe(true)
-    await engine.updateSettings({ watch: { enabled: false } })
+    await engine.settings.update({ watch: { enabled: false } })
     expect(await offered()).toBe(false)
   })
 

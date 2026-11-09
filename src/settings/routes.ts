@@ -250,11 +250,11 @@ export async function settingsState(service: RepoService, picker: DirectoryPicke
   const dir = workspaces.dir()
   const listening = workspaces.proxyPort()
   return {
-    hosts: await service.listHosts(),
-    mirror: service.mirrorSettings(),
-    settings: service.settings,
-    defaults: service.defaultSettings,
-    file: service.settingsFile,
+    hosts: await service.hosts.list(),
+    mirror: service.mirrors.settings(),
+    settings: service.settings.current,
+    defaults: service.settings.defaults,
+    file: service.settings.file,
     pickerAvailable: picker.available,
     watches: watches.list(),
     watchAvailable: watches.active,
@@ -293,10 +293,10 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       path: HOSTS_ROUTE,
       handler: guarded(gate, ['POST', 'DELETE'], async (req, res) => {
         if (req.method?.toUpperCase() === 'DELETE') {
-          await service.removeHost((await readJsonBody(req, hostUrlSchema)).url)
+          await service.hosts.remove((await readJsonBody(req, hostUrlSchema)).url)
         } else {
           const { kind, url, apiUrl, alias, token } = await readJsonBody(req, hostAddSchema)
-          await service.addHost({ url, ...kind === undefined ? {} : { kind }, ...apiUrl === undefined ? {} : { apiUrl }, ...alias === undefined ? {} : { alias }, ...token === undefined ? {} : { token } })
+          await service.hosts.add({ url, ...kind === undefined ? {} : { kind }, ...apiUrl === undefined ? {} : { apiUrl }, ...alias === undefined ? {} : { alias }, ...token === undefined ? {} : { token } })
         }
         await reply(res)
       }),
@@ -306,10 +306,10 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       path: HOST_TOKEN_ROUTE,
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
         if (req.method?.toUpperCase() === 'DELETE') {
-          await service.setHostToken((await readJsonBody(req, hostUrlSchema)).url, undefined)
+          await service.hosts.setToken((await readJsonBody(req, hostUrlSchema)).url, undefined)
         } else {
           const { url, value } = await readJsonBody(req, hostTokenSchema)
-          await service.setHostToken(url, value)
+          await service.hosts.setToken(url, value)
         }
         await reply(res)
       }),
@@ -318,7 +318,7 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       kind: 'exact',
       path: MIRROR_ROUTE,
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
-        await service.setMirrorDir(req.method?.toUpperCase() === 'DELETE' ? undefined : (await readJsonBody(req, mirrorSchema)).dir)
+        await service.mirrors.setDir(req.method?.toUpperCase() === 'DELETE' ? undefined : (await readJsonBody(req, mirrorSchema)).dir)
         await reply(res)
       }),
     }),
@@ -326,7 +326,7 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       kind: 'exact',
       path: SETTINGS_ROUTE,
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
-        await service.updateSettings(req.method?.toUpperCase() === 'DELETE' ? undefined : await readJsonBody(req, settingsBodySchema))
+        await service.settings.update(req.method?.toUpperCase() === 'DELETE' ? undefined : await readJsonBody(req, settingsBodySchema))
         await reply(res)
       }),
     }),
@@ -394,7 +394,7 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
     server.register({
       kind: 'exact',
       path: MIRROR_USAGE_ROUTE,
-      handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await service.mirrorUsage()) }),
+      handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await service.mirrors.usage()) }),
     }),
     server.register({
       kind: 'exact',

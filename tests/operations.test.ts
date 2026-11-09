@@ -36,11 +36,27 @@ function catalog(granted: RepoAccess = 'merge') {
   }
 }
 
-/** An engine whose unlisted members reject; `settings` is read on every access. */
-function fakeService(overrides: Record<string, unknown> = {}, settings: () => RepoSettings = () => testSettings(), granted: RepoAccess = 'merge'): RepoService {
+/** Members of the engine's parts a test implements. */
+interface FakeParts {
+  readonly forge?: Record<string, unknown>
+  readonly catalog?: Record<string, unknown>
+  readonly hosts?: Record<string, unknown>
+  readonly mirrors?: Record<string, unknown>
+  readonly mirrorStore?: Record<string, unknown>
+}
+
+/** An engine whose unlisted members reject; `settings.current` is read on every access. */
+function fakeService(parts: FakeParts = {}, settings: () => RepoSettings = () => testSettings(), granted: RepoAccess = 'merge'): RepoService {
   const notUsed = async () => { throw new Error('not used') }
-  const base: Record<string, unknown> = { catalog: catalog(granted), gitHost: () => true, ...overrides }
-  return new Proxy({} as RepoService, { get: (_target, key) => key === 'settings' ? settings() : base[String(key)] ?? notUsed })
+  const part = (members: Record<string, unknown>): object => new Proxy({}, { get: (_target, key) => members[String(key)] ?? notUsed })
+  const engine: Record<string, unknown> = {
+    settings: new Proxy({}, { get: (_target, key) => key === 'current' ? settings() : notUsed }),
+    catalog: part({ ...catalog(granted), ...parts.catalog }),
+    forge: part(parts.forge ?? {}),
+    hosts: part(parts.hosts ?? {}),
+    mirrors: part({ ...parts.mirrors, store: part(parts.mirrorStore ?? {}) }),
+  }
+  return new Proxy({} as RepoService, { get: (_target, key) => engine[String(key)] })
 }
 
 function fakeWorkspaces(overrides: Record<string, unknown> = {}): WorkspaceManager {
@@ -118,7 +134,7 @@ describe('operation registry', () => {
   })
 
   it('exposes JSON Schema parameters and renders values as JSON text', async () => {
-    const all = tools(fakeService({ repoInfo: async () => ({ defaultBranch: 'main' }) }))
+    const all = tools(fakeService({ forge: { repoInfo: async () => ({ defaultBranch: 'main' }) } }))
     const parameters = all.get('repo_mr_create')!.parameters
     expect(parameters).toMatchObject({ type: 'object', required: ['repo', 'title', 'sourceBranch'], additionalProperties: false })
     expect(parameters.$schema).toBeUndefined()
@@ -132,7 +148,7 @@ describe('operation registry', () => {
 
   it('rejects invalid arguments and surfaces RepoError codes', async () => {
     const getIssue = vi.fn(async () => { throw new RepoError('not-found', '读取 issue #9 失败') })
-    const tool = tools(fakeService({ getIssue })).get('repo_issue_get')!
+    const tool = tools(fakeService({ forge: { getIssue } })).get('repo_issue_get')!
     await expect(tool.execute({ repo: 'github.com/a/b', number: 0 }, exec)).rejects.toThrow(/^\[invalid\] repo_issue_get 参数不合法/)
     await expect(tool.execute({ repo: 'github.com/a/b', number: 1, extra: true }, exec)).rejects.toThrow(/^\[invalid\]/)
     await expect(tool.execute({ repo: 'github.com/a/b', number: 9 }, exec)).rejects.toThrow('[not-found] 读取 issue #9 失败')
@@ -146,7 +162,7 @@ describe('write gate for tools', () => {
     const request = vi.fn(async () => { order.push('approve'); return 'allowed-once' as const })
     const parallel = vi.fn(async (name: string) => { order.push(name) })
     const { exec: run } = session()
-    const all = tools(fakeService({ createIssue, mergeMr: vi.fn() }, () => testSettings(), 'write'), { approval: { request }, parallel })
+    const all = tools(fakeService({ forge: { createIssue, mergeMr: vi.fn() } }, () => testSettings(), 'write'), { approval: { request }, parallel })
     expect(await all.get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'T' }, run)).toEqual({ number: 1 })
     expect(parallel).toHaveBeenCalledWith('access/authorize', { session: 'session-1', level: 'code-write', action: 'issueCreate', summary: '在 github.com/a/b 创建 issue：T' })
     expect(order).toEqual(['access/authorize', 'approve'])
@@ -165,7 +181,7 @@ describe('write gate for tools', () => {
     let settings = testSettings()
     const createIssue = vi.fn(async () => ({ number: 1 }))
     const request = vi.fn(async () => 'rejected' as const)
-    const service = fakeService({ createIssue }, () => settings)
+    const service = fakeService({ forge: { createIssue } }, () => settings)
     const create = tools(service, { approval: { request } }).get('repo_issue_create')!
     expect(await create.execute({ repo: 'github.com/a/b', title: 'Bug' }, exec)).toEqual({ status: 'declined', outcome: 'rejected' })
     expect(createIssue).not.toHaveBeenCalled()
@@ -188,7 +204,7 @@ describe('write gate for tools', () => {
     const cancelCi = vi.fn(async () => ({ jobId: 2 }))
     const getCiRun = vi.fn(async () => ({ id: 42 }))
     const request = vi.fn(async (_request: { readonly reason?: string }) => 'allowed-once' as const)
-    const all = tools(fakeService({ createMr, mergeMr, commentMr, retryCi, cancelCi, getCiRun }, () => settings), { approval: { request } })
+    const all = tools(fakeService({ forge: { createMr, mergeMr, commentMr, retryCi, cancelCi, getCiRun } }, () => settings), { approval: { request } })
     await all.get('repo_mr_comment')!.execute({ repo: 'github.com/a/b', number: 3, body: 'LGTM' }, exec)
     expect(commentMr).toHaveBeenCalledWith('github.com/a/b', 3, 'LGTM\n\n_via DSH_', { signal: exec.signal })
     await all.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'T', sourceBranch: 'f', body: 'B' }, exec)
@@ -220,7 +236,7 @@ describe('write gate for tools', () => {
     const parallel = vi.fn(async () => {})
     const request = vi.fn(async () => 'allowed-once' as const)
     const { exec: run } = session()
-    expect(await tools(fakeService({ addRepo }), { approval: { request }, parallel }).get('repo_add')!.execute({ repo: 'https://github.com/a/b' }, run)).toEqual({ status: 'added' })
+    expect(await tools(fakeService({ catalog: { ensure: addRepo } }), { approval: { request }, parallel }).get('repo_add')!.execute({ repo: 'https://github.com/a/b' }, run)).toEqual({ status: 'added' })
     expect(parallel).toHaveBeenCalledWith('access/authorize', { session: 'session-1', level: 'admin', action: 'repoAdd', summary: '把 github.com/a/b 加入 dsh-repo 仓库清单（权限：只读）' })
     expect(request).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'repo_add', displayReason: { zh: '把 github.com/a/b 加入 dsh-repo 仓库清单（权限：只读）', en: 'Change the dsh-repo repository catalog: https://github.com/a/b' } }))
   })
@@ -231,7 +247,7 @@ describe('service calls', () => {
     const createIssue = vi.fn(async () => ({ number: 1 }))
     const request = vi.fn(async () => 'allowed-once' as const)
     const parallel = vi.fn(async () => {})
-    const service = fakeService({ createIssue }, () => testSettings({ tools: { writes: 'off' } }), 'write')
+    const service = fakeService({ forge: { createIssue } }, () => testSettings({ tools: { writes: 'off' } }), 'write')
     const repos = api(service, { approval: { request }, parallel })
     expect(await repos.issueCreate({ repo: 'github.com/a/b', title: 'T', signal: exec.signal })).toEqual({ number: 1 })
     expect(request).not.toHaveBeenCalled()
@@ -247,7 +263,7 @@ describe('service calls', () => {
     const request = vi.fn(async () => 'rejected' as const)
     const parallel = vi.fn(async () => {})
     const { agent } = session()
-    const repos = api(fakeService({ createIssue }, () => settings), { approval: { request }, parallel })
+    const repos = api(fakeService({ forge: { createIssue } }, () => settings), { approval: { request }, parallel })
     const failure = await repos.issueCreate({ repo: 'github.com/a/b', title: 'T', agent, callId: 'c9' }).catch((error: unknown) => error)
     expect(failure).toBeInstanceOf(DeclinedError)
     expect(failure).toMatchObject({ code: 'declined', outcome: 'rejected' })
@@ -261,9 +277,9 @@ describe('service calls', () => {
   it('classify unexpected failures and hand snapshot leases back with their release', async () => {
     const release = vi.fn()
     const service = fakeService({
-      repoInfo: async () => { throw new Error('boom') },
-      syncMirror: async () => ({ commit: 'c'.repeat(40) }),
-      mirrors: { acquire: async () => ({ commit: 'c'.repeat(40), dir: '/snap', release }), resolveRef: async () => 'd'.repeat(40) },
+      forge: { repoInfo: async () => { throw new Error('boom') } },
+      mirrors: { sync: async () => ({ commit: 'c'.repeat(40) }) },
+      mirrorStore: { acquire: async () => ({ commit: 'c'.repeat(40), dir: '/snap', release }), resolveRef: async () => 'd'.repeat(40) },
     })
     const repos = api(service)
     await expect(repos.repoGet({ repo: 'github.com/a/b' })).rejects.toMatchObject({ name: 'RepoError', code: 'unavailable' })
@@ -335,9 +351,9 @@ describe('workspace operations', () => {
     const listMrs = vi.fn(async () => ({ items: [] }))
     const createMr = vi.fn(async () => mr)
     const service = fakeService({
-      listMrs, createMr,
-      tokenIdentity: async () => ({ name: 'bot', email: 'bot@example.com' }),
-      mirrors: { resolveRef: async () => { throw new RepoError('not-found', 'no branch') } },
+      forge: { listMrs, createMr },
+      hosts: { tokenIdentity: async () => ({ name: 'bot', email: 'bot@example.com' }) },
+      mirrorStore: { resolveRef: async () => { throw new RepoError('not-found', 'no branch') } },
     })
     const request = vi.fn(async (_request: { readonly reason?: string }) => 'allowed-once' as const)
     const parallel = vi.fn(async (name: string, ...args: unknown[]) => {
@@ -377,7 +393,7 @@ describe('PR/MR watching', () => {
   it('watches requests opened or reopened for the calling Session, and remembers comments it posts', async () => {
     const { exec: run } = session()
     const mr = { number: 7, title: 'Fix a', targetBranch: 'main', webUrl: 'https://github.com/a/b/pull/7', state: 'open' }
-    const service = fakeService({ createMr: async () => mr, updateMr: async () => mr, commentMr: async () => ({ id: '55' }), commentIssue: async () => ({ id: '56' }) }, () => testSettings({ tools: { writes: 'allow' } }))
+    const service = fakeService({ forge: { createMr: async () => mr, updateMr: async () => mr, commentMr: async () => ({ id: '55' }), commentIssue: async () => ({ id: '56' }) } }, () => testSettings({ tools: { writes: 'allow' } }))
     const track = vi.fn(async () => ({}) as WatchInfo)
     const ownComment = vi.fn(async () => {})
     const watch = { active: true, track, untrack: vi.fn(async () => true), ownComment }
@@ -401,7 +417,7 @@ describe('PR/MR watching', () => {
     const getMr = vi.fn(async () => ({ number: 7, title: 'Fix a', state: 'open', webUrl: 'https://github.com/a/b/pull/7', comments: [{ id: '1' }] }))
     const track = vi.fn(async () => ({ number: 7, title: 'Fix a', webUrl: 'https://github.com/a/b/pull/7' }) as WatchInfo)
     const watch = { active: true, track, untrack: vi.fn(async () => true), ownComment: vi.fn(async () => {}) }
-    const tool = tools(fakeService({ getMr }), { watch }).get('repo_mr_watch')!
+    const tool = tools(fakeService({ forge: { getMr } }), { watch }).get('repo_mr_watch')!
     expect(await tool.execute({ repo: 'github.com/a/b', number: 7 }, run)).toEqual({ watching: true, number: 7, title: 'Fix a', webUrl: 'https://github.com/a/b/pull/7' })
     expect(track).toHaveBeenCalledWith({ repo: 'github.com/a/b', mr: { number: 7, title: 'Fix a', state: 'open', webUrl: 'https://github.com/a/b/pull/7' }, session: 'session-1', source: 'requested' })
     expect(await tool.execute({ repo: 'github.com/a/b', number: 7, watch: false }, run)).toEqual({ watching: false, stopped: true, number: 7 })

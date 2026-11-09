@@ -25,7 +25,7 @@ import type { GitRunner } from './mirror/git.ts'
 import { MirrorStore } from './mirror/store.ts'
 import type { OperationDeps } from './operations.ts'
 import { DSH_REPOS_SERVICE, RepoService } from './service.ts'
-import type { ProviderFactory } from './service.ts'
+import type { ProviderFactory } from './forge/hosts.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
 import { createTools, toolOffered } from './tools.ts'
 import { hostDelivery } from './watch/delivery.ts'
@@ -89,16 +89,16 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   const parallel: ParallelDispatch | undefined = ctx.parallel === undefined ? undefined : (name, ...args) => ctx.parallel!(name, ...args)
   const service = new RepoService({
     credentials: ctx.credentials,
-    hosts,
-    mirrors,
+    store: hosts,
+    mirrorStore: mirrors,
     forbiddenMirrorRoots: options.forbiddenMirrorRoots ?? forbiddenMirrorRoots(env),
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
     ...options.providerFactory === undefined ? {} : { factory: options.providerFactory },
   })
   const watcher = new MrWatcher({
-    service,
+    service: service.forge,
     store: new WatchStore(watchesFile(hosts.file), ctx.logger),
-    settings: () => service.settings.watch,
+    settings: () => service.settings.current.watch,
     delivery: options.delivery ?? hostDelivery(ctx),
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
   })
@@ -125,7 +125,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
   })
   const startProxy = async (): Promise<void> => {
-    const configured = service.settings.workspace.proxyPort
+    const configured = service.settings.current.workspace.proxyPort
     const saved = registry.port()
     let port: number
     try {
@@ -140,7 +140,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   }
   ctx.effect(() => {
     startProxy().catch((error: unknown) => { ctx.logger?.error?.('dsh-repo: %s', error instanceof Error ? error.message : String(error)) })
-    const unlisten = service.onSettingsChange(async (next, previous) => {
+    const unlisten = service.settings.onChange(async (next, previous) => {
       // Also when the proxy is not where the settings want it, so saving again retries a port that failed earlier.
       const wanted = next.workspace.proxyPort
       if (wanted !== previous.workspace.proxyPort || proxy.port === undefined || (wanted !== 0 && proxy.port !== wanted)) await startProxy()
@@ -164,18 +164,18 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     return () => { void watcher.stop() }
   }, 'dsh-repo: PR/MR watcher')
   const syncer = new LocalSyncer({
-    service,
+    mirrors: service.mirrors,
     records: () => syncRecords(service.catalog.entries()),
     ids: () => new Set(service.catalog.entries().map(entry => entry.id)),
     git,
     store: new SyncStore(syncsFile(hosts.file), ctx.logger),
     indexDir: syncIndexDir(hosts.file),
-    timeoutMs: () => service.settings.mirror.gitTimeoutMs,
+    timeoutMs: () => service.settings.current.mirror.gitTimeoutMs,
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
   })
   ctx.effect(() => {
     syncer.start()
-    const unlisten = service.onReposChange(() => { syncer.reconcile() })
+    const unlisten = service.catalog.onChange(() => { syncer.reconcile() })
     return () => {
       unlisten()
       void syncer.stop()
@@ -185,7 +185,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   if (service.catalog.entries().length === 0) ctx.logger?.info?.('dsh-repo: 仓库清单为空，代码仓库工具在「代码仓库 → 仓库」添加仓库后提供')
   for (const { definition, access } of createTools(operations)) {
     ctx.effect(() => ctx.tools.register(definition, {
-      when: () => toolOffered(access, service.settings.tools, service.catalog.highestAccess()) && (access !== 'watch' || watcher.active),
+      when: () => toolOffered(access, service.settings.current.tools, service.catalog.highestAccess()) && (access !== 'watch' || watcher.active),
     }), `dsh-repo: ${definition.name}`)
   }
 }
@@ -195,7 +195,7 @@ async function watchPushed(service: RepoService, watcher: MrWatcher, record: Wor
   if (record.session === undefined || !watcher.active) return
   for (const branch of branches) {
     try {
-      const open = await service.listMrs(record.repo, { state: 'open', sourceBranch: branch, perPage: 20 })
+      const open = await service.forge.listMrs(record.repo, { state: 'open', sourceBranch: branch, perPage: 20 })
       for (const mr of open.items) await watcher.track({ repo: record.repo, mr, session: record.session, source: 'pushed', pushed: mr.headSha })
     } catch {
       // Watching is a convenience: the push succeeded, and the model can still watch with repo_mr_watch.

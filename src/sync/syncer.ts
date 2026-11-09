@@ -68,17 +68,17 @@ export function syncRecords(entries: readonly CatalogEntry[]): SyncRecord[] {
     : [])
 }
 
-/** The service calls a sync makes. */
-export interface SyncService {
+/** The mirror calls a sync makes. */
+export interface SyncMirrors {
   /** Clone or fetch the mirror of `url` and resolve `branch` (default: the remote's default branch). */
-  syncMirror(url: string, options?: { readonly branch?: string; readonly signal?: AbortSignal }): Promise<MirrorState>
+  sync(url: string, options?: { readonly branch?: string; readonly signal?: AbortSignal }): Promise<MirrorState>
   /** @returns the mirror directory now in use, or undefined while none is chosen; sync directories must stay outside it. */
-  mirrorSettings(): { readonly dir: string | undefined }
+  settings(): { readonly dir: string | undefined }
 }
 
 /** Collaborators of the syncer. */
 export interface SyncerDeps {
-  readonly service: SyncService
+  readonly mirrors: SyncMirrors
   /** The enabled local syncs of the catalog, read on every use. */
   readonly records: () => readonly SyncRecord[]
   /** Ids of every catalog entry, enabled or not; progress of other ids is deleted. */
@@ -131,7 +131,7 @@ export class LocalSyncer {
   private stopped = false
   private readonly now: () => number
 
-  /** @param deps - service, catalog view, git, store, index directory, and limits. */
+  /** @param deps - mirrors, catalog view, git, store, index directory, and limits. */
   constructor(private readonly deps: SyncerDeps) {
     this.now = deps.now ?? Date.now
   }
@@ -364,14 +364,14 @@ export class LocalSyncer {
    */
   private async expand(record: SyncRecord, signal: AbortSignal): Promise<void> {
     // The mirror directory can change after the sync was configured, so the overlap is checked again here; an unset directory fails the mirror sync itself.
-    const mirrors = this.deps.service.mirrorSettings().dir
+    const mirrors = this.deps.mirrors.settings().dir
     if (mirrors !== undefined) {
       const real = new Map([[record.dir, await realPathOf(record.dir)], [mirrors, await realPathOf(mirrors)]])
       if (overlaps(mirrors, record.dir, real)) {
         throw new RepoError('conflict', `本地目录 ${record.dir} 与镜像目录 ${mirrors} 重叠，没有同步；请把本地同步或镜像目录换到不重叠的位置`)
       }
     }
-    const mirror = await this.deps.service.syncMirror(record.url, { ...record.branch === undefined ? {} : { branch: record.branch }, signal })
+    const mirror = await this.deps.mirrors.sync(record.url, { ...record.branch === undefined ? {} : { branch: record.branch }, signal })
     const index = this.indexFile(record.id, record.dir)
     const progress = this.deps.store.get(record.id)
     if (progress?.last?.dir !== record.dir && progress?.claimedDir !== record.dir) {

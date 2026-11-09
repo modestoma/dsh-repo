@@ -63,8 +63,8 @@ async function setup(options: { parallel?: (name: string, ...args: unknown[]) =>
   const service = new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials(REMOTE_TOKENS),
-    hosts: settingsStore(remoteConfig(), root, testSettings(), catalogEntries([url], 'write')),
-    mirrors: new MirrorStore({ git: remote.git, root: join(root, 'mirrors'), limits: mirrorLimits() }),
+    store: settingsStore(remoteConfig(), root, testSettings(), catalogEntries([url], 'write')),
+    mirrorStore: new MirrorStore({ git: remote.git, root: join(root, 'mirrors'), limits: mirrorLimits() }),
     factory: stubProviders({ getBranch: async (_ref, name) => PROTECTED.has(name) ? { name, commit: '0'.repeat(40), protected: true, default: false } : undefined }),
   })
   const registry = new WorkspaceRegistry(join(root, 'workspaces.json'))
