@@ -19,7 +19,7 @@ import { forbiddenMirrorRoots } from './mirror/root.ts'
 import { DshReposApi } from './api.ts'
 import type { HostApproval, HostContext, SandboxConfiner, WorkingDirectoryService } from './host.ts'
 import type { WatchDelivery } from './watch/delivery.ts'
-import { HostStore } from './hosts.ts'
+import { SettingsStore } from './settings/store.ts'
 import { runCommand, runGit } from './mirror/git.ts'
 import type { GitRunner } from './mirror/git.ts'
 import { MirrorStore } from './mirror/store.ts'
@@ -46,7 +46,7 @@ export type { HostSpec, RepoConfig, RepoLimits, RepoSettings, SettingsOverrides 
 export { DEFAULT_SETTINGS, apiBaseUrl, hostsFile, normalizeHostUrl, pluginConfigSchema, repoSettingsSchema, resolveConfig, resolveSettings, settingsOverrides } from './config.ts'
 export { MIRROR_DIR_UNSET, checkMirrorDir, forbiddenMirrorRoots } from './mirror/root.ts'
 export { RepoError, toRepoError } from './errors.ts'
-export { HostStore, addedTokenRef, isAcceptedToken } from './hosts.ts'
+export { SettingsStore, addedTokenRef, isAcceptedToken } from './settings/store.ts'
 export { GitError, credentialEnvironment, runCommand, runGit } from './mirror/git.ts'
 export type { GitRunOptions, GitRunner } from './mirror/git.ts'
 export { MirrorStore, isAcceptedGitUrl, mirrorPath } from './mirror/store.ts'
@@ -145,7 +145,7 @@ export interface RepoPluginOptions {
 export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOptions = {}): void {
   const resolved = resolveConfig(config)
   const env = options.env ?? process.env
-  const hosts = new HostStore(resolved.hosts, hostsFile(resolved, env), ctx.logger)
+  const hosts = new SettingsStore(resolved.hosts, hostsFile(resolved, env), ctx.logger)
   const git = options.git ?? runGit
   const mirrors = new MirrorStore({ git, root: undefined, limits: () => ({ timeoutMs: hosts.settings().mirror.gitTimeoutMs }) })
   const parallel: ParallelDispatch | undefined = ctx.parallel === undefined ? undefined : (name, ...args) => ctx.parallel!(name, ...args)

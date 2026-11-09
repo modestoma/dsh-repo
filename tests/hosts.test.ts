@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { HostStore, addedTokenRef } from '../src/hosts.ts'
+import { SettingsStore, addedTokenRef } from '../src/settings/store.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
 import { credentials, mirrorLimits, testConfig } from './helpers.ts'
@@ -11,7 +11,7 @@ function setup(tokens: Record<string, string> = {}) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-hosts-'))
   const config = testConfig()
   const store = credentials(tokens)
-  const hosts = new HostStore(config.hosts, join(root, 'hosts.json'))
+  const hosts = new SettingsStore(config.hosts, join(root, 'hosts.json'))
   const errors: unknown[] = []
   const service = new RepoService({
     forbiddenMirrorRoots: [],

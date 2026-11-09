@@ -26,7 +26,7 @@ import type { HostSpec } from '../config.ts'
 import type { RepoAccess, RepoAddResult, RepoFeature, RepoTarget } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import type { HostLogger } from '../host.ts'
-import type { HostStore } from '../hosts.ts'
+import type { SettingsStore } from '../settings/store.ts'
 import { overlaps, realPathOf } from '../paths.ts'
 import { ACCESS_LEVELS, MAX_REPO_FEATURES, MAX_REPOS } from '../settings/contract.ts'
 import type { RepoInput } from '../settings/contract.ts'
@@ -38,7 +38,7 @@ import type { CatalogEntry, CheckedInput } from './entry.ts'
 /** Collaborators of the catalog. */
 export interface CatalogDeps {
   /** Settings file holding the catalog and the hosts. */
-  readonly store: HostStore
+  readonly store: SettingsStore
   /** @returns the mirror directory now in use; local sync directories must stay outside it. */
   readonly mirrorDir: () => string | undefined
   /** Reports a throwing change listener. */

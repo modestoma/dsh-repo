@@ -30,7 +30,7 @@ import type { HostSpec, RepoSettings } from './config.ts'
 import type { MirrorSettings, MirrorUsage } from './settings/contract.ts'
 import { RepoError, toRepoError } from './errors.ts'
 import type { HostCredentials, HostLogger } from './host.ts'
-import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
+import { SettingsStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './settings/store.ts'
 import { credentialEnvironment } from './mirror/git.ts'
 import { checkMirrorDir } from './mirror/root.ts'
 import type { MirrorState, MirrorStore } from './mirror/store.ts'
@@ -200,7 +200,7 @@ export interface RepoServiceDeps {
   /** DSH credential store; tokens are resolved per request. */
   readonly credentials: HostCredentials
   /** Configured and added hosts, the mirror directory, and the run-time settings. */
-  readonly hosts: HostStore
+  readonly hosts: SettingsStore
   /** Local mirrors. */
   readonly mirrors: MirrorStore
   readonly factory?: ProviderFactory
@@ -219,7 +219,7 @@ export class RepoService {
   /** The repository catalog every call is checked against. */
   readonly catalog: RepoCatalog
   /** Configured and added hosts, the stored directories, and the run-time settings. */
-  readonly hosts: HostStore
+  readonly hosts: SettingsStore
   /** Local mirrors. */
   readonly mirrors: MirrorStore
   private readonly providers = new Map<string, Provider>()

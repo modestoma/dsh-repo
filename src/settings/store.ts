@@ -5,21 +5,20 @@
  * tokens under generated credential references; settings are stored as the
  * fields that differ from the defaults.
  *
- * @module dsh-repo/hosts
+ * @module dsh-repo/settings/store
  */
 
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
-import type { HostCreate } from './contract.ts'
-import { DEFAULT_SETTINGS, hostSpecSchema, normalizeHostUrl, repoSettingsSchema, settingsOverrides } from './config.ts'
-import type { HostSpec, RepoSettings } from './config.ts'
-import { RepoError } from './errors.ts'
-import { writeJsonAtomic } from './files.ts'
-import { catalogEntrySchema } from './catalog/entry.ts'
-import type { CatalogEntry } from './catalog/entry.ts'
-import type { HostLogger } from './host.ts'
+import type { HostCreate } from '../contract.ts'
+import { DEFAULT_SETTINGS, hostSpecSchema, normalizeHostUrl, repoSettingsSchema, settingsOverrides } from '../config.ts'
+import type { HostSpec, RepoSettings } from '../config.ts'
+import { RepoError } from '../errors.ts'
+import { JsonFile } from '../files.ts'
+import { catalogEntrySchema } from '../catalog/entry.ts'
+import type { CatalogEntry } from '../catalog/entry.ts'
+import type { HostLogger } from '../host.ts'
 
 /** Longest accepted token; personal access tokens are far shorter. */
 export const MAX_TOKEN_LENGTH = 4096
@@ -87,11 +86,9 @@ export function addedTokenRef(url: string): string {
   return `DSH_REPO_HOST_${createHash('sha1').update(url).digest('hex').slice(0, 12).toUpperCase()}`
 }
 
-/** Configured and added hosts, the mirror directory, and the run-time settings. */
-export class HostStore {
-  private stored: Stored
-  /** Tail of the queue that runs additions and removals one at a time. */
-  private queue: Promise<unknown> = Promise.resolve()
+/** Configured and added hosts, the mirror and workspace directories, the repository catalog, and the run-time settings. */
+export class SettingsStore {
+  private readonly json: JsonFile<Stored>
 
   /**
    * Read the settings file. A missing file means no added hosts, no mirror
@@ -102,35 +99,38 @@ export class HostStore {
    * @throws when the file exists but cannot be read or is invalid.
    */
   constructor(private readonly configured: readonly HostSpec[], readonly file: string, logger?: HostLogger) {
-    const stored = HostStore.read(file, logger)
-    this.stored = {
-      hosts: stored.hosts.filter(host => !configured.some(spec => spec.url === host.url)),
-      mirrorDir: stored.mirrorDir,
-      workspaceDir: stored.workspaceDir,
-      repos: stored.repos,
-      settings: stored.settings ?? DEFAULT_SETTINGS,
-    }
+    this.json = new JsonFile<Stored>({
+      file,
+      label: '设置文件',
+      schema: fileSchema.transform(content => ({
+        hosts: content.hosts.filter(host => !configured.some(spec => spec.url === host.url)),
+        mirrorDir: content.mirrorDir,
+        workspaceDir: content.workspaceDir,
+        repos: content.repos,
+        settings: content.settings ?? DEFAULT_SETTINGS,
+      })),
+      empty: { hosts: [], mirrorDir: undefined, workspaceDir: undefined, repos: [], settings: DEFAULT_SETTINGS },
+      invalid: 'fail',
+      prepare: (raw) => {
+        const dropped = dropRetired(raw)
+        return dropped.length === 0 ? [] : [`${dropped.join('、')} 已由仓库清单取代，已忽略，下次保存时删除；可访问的仓库和每个仓库的权限请在「代码仓库 → 仓库」中配置`]
+      },
+      encode: (next) => {
+        const overrides = settingsOverrides(next.settings)
+        return {
+          hosts: next.hosts,
+          ...next.mirrorDir === undefined ? {} : { mirrorDir: next.mirrorDir },
+          ...next.workspaceDir === undefined ? {} : { workspaceDir: next.workspaceDir },
+          ...next.repos.length === 0 ? {} : { repos: next.repos },
+          ...Object.keys(overrides).length === 0 ? {} : { settings: overrides },
+        }
+      },
+      ...logger === undefined ? {} : { logger },
+    })
   }
 
-  private static read(file: string, logger: HostLogger | undefined): z.output<typeof fileSchema> {
-    let text: string
-    try {
-      text = readFileSync(file, 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { hosts: [], repos: [] }
-      throw new Error(`dsh-repo 无法读取设置文件 ${file}：${(error as Error).message}`)
-    }
-    let raw: unknown
-    try {
-      raw = JSON.parse(text)
-    } catch (error) {
-      throw new Error(`dsh-repo 设置文件 ${file} 不是合法 JSON：${(error as Error).message}`)
-    }
-    const dropped = dropRetired(raw)
-    if (dropped.length > 0) logger?.warn?.(`dsh-repo: 设置文件 ${file} 中的 ${dropped.join('、')} 已由仓库清单取代，已忽略，下次保存时删除；可访问的仓库和每个仓库的权限请在「代码仓库 → 仓库」中配置`)
-    const parsed = fileSchema.safeParse(raw)
-    if (!parsed.success) throw new Error(`dsh-repo 设置文件 ${file} 内容不合法：${parsed.error.issues.map(issue => `${issue.path.join('.')}：${issue.message}`).join('；')}`)
-    return parsed.data
+  private get stored(): Stored {
+    return this.json.value
   }
 
   /** @returns the mirror directory stored in the settings file, or undefined while none is chosen. */
@@ -144,7 +144,7 @@ export class HostStore {
    * @throws {RepoError} `unavailable` when the file cannot be written.
    */
   setMirrorDir(dir: string | undefined): Promise<void> {
-    return this.enqueue(() => this.write({ ...this.stored, mirrorDir: dir }))
+    return this.json.update(current => ({ value: { ...current, mirrorDir: dir }, result: undefined }))
   }
 
   /** @returns the directory the settings page creates workspaces in, or undefined while none is chosen. */
@@ -158,7 +158,7 @@ export class HostStore {
    * @throws {RepoError} `unavailable` when the file cannot be written.
    */
   setWorkspaceDir(dir: string | undefined): Promise<void> {
-    return this.enqueue(() => this.write({ ...this.stored, workspaceDir: dir }))
+    return this.json.update(current => ({ value: { ...current, workspaceDir: dir }, result: undefined }))
   }
 
   /** @returns the repository catalog in order. */
@@ -174,10 +174,9 @@ export class HostStore {
    * @throws {RepoError} `unavailable` when the file cannot be written; whatever `change` throws. Nothing changes then.
    */
   updateRepos<T>(change: (current: readonly CatalogEntry[]) => { readonly repos: readonly CatalogEntry[]; readonly result: T }): Promise<T> {
-    return this.enqueue(async () => {
-      const { repos, result } = change(this.stored.repos)
-      await this.write({ ...this.stored, repos })
-      return result
+    return this.json.update((current) => {
+      const { repos, result } = change(current.repos)
+      return { value: { ...current, repos }, result }
     })
   }
 
@@ -192,7 +191,7 @@ export class HostStore {
    * @throws {RepoError} `unavailable` when the file cannot be written.
    */
   setSettings(settings: RepoSettings): Promise<void> {
-    return this.enqueue(() => this.write({ ...this.stored, settings }))
+    return this.json.update(current => ({ value: { ...current, settings }, result: undefined }))
   }
 
   /** @returns every host, configured ones first. */
@@ -229,10 +228,14 @@ export class HostStore {
    * @throws {RepoError} `invalid` for a bad address, API address, or alias, `conflict` when the address is taken, `unavailable` when the file cannot be written.
    */
   add(create: HostCreate): Promise<HostSpec> {
-    return this.enqueue(() => this.addNow(create))
+    return this.json.update((current) => {
+      const host = this.newHost(create)
+      return { value: { ...current, hosts: [...current.hosts, host] }, result: host }
+    })
   }
 
-  private async addNow(create: HostCreate): Promise<HostSpec> {
+  /** Validate a new host against the hosts now known. */
+  private newHost(create: HostCreate): HostSpec {
     const url = normalizeHostUrl(create.url.trim())
     if (url === undefined) throw new RepoError('invalid', `主机地址不合法：${create.url}（填 https://主机[:端口][/路径]，不含用户名、查询参数或片段）`)
     const alias = create.alias?.trim()
@@ -246,9 +249,7 @@ export class HostStore {
       if (apiUrl === undefined) throw new RepoError('invalid', `接口地址不合法：${apiInput}（填 https://主机[:端口][/路径]，不含用户名、查询参数或片段）`)
     }
     if (this.all().some(host => host.url === url)) throw new RepoError('conflict', `主机 ${url} 已存在`)
-    const host: HostSpec = { kind, url, ...apiUrl === undefined ? {} : { apiUrl }, tokenRef: addedTokenRef(url), ...alias === undefined || alias === '' ? {} : { alias } }
-    await this.write({ ...this.stored, hosts: [...this.stored.hosts, host] })
-    return host
+    return { kind, url, ...apiUrl === undefined ? {} : { apiUrl }, tokenRef: addedTokenRef(url), ...alias === undefined || alias === '' ? {} : { alias } }
   }
 
   /**
@@ -258,38 +259,10 @@ export class HostStore {
    * @throws {RepoError} `not-found`, `forbidden` for a configured host, `unavailable` when the file cannot be written.
    */
   remove(url: string): Promise<HostSpec> {
-    return this.enqueue(() => this.removeNow(url))
-  }
-
-  private async removeNow(url: string): Promise<HostSpec> {
-    const host = this.find(url)
-    if (!this.isAdded(host.url)) throw new RepoError('forbidden', `${host.url} 配置在 cordis.yml 中，不能在运行时删除`)
-    await this.write({ ...this.stored, hosts: this.stored.hosts.filter(spec => spec.url !== host.url) })
-    return host
-  }
-
-  /** Run a read-modify-write after every one queued before it. */
-  private enqueue<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(task)
-    // The queue only orders work; callers observe the failure through `run`.
-    this.queue = run.then(() => undefined, () => undefined)
-    return run
-  }
-
-  private async write(next: Stored): Promise<void> {
-    const overrides = settingsOverrides(next.settings)
-    const content = {
-      hosts: next.hosts,
-      ...next.mirrorDir === undefined ? {} : { mirrorDir: next.mirrorDir },
-      ...next.workspaceDir === undefined ? {} : { workspaceDir: next.workspaceDir },
-      ...next.repos.length === 0 ? {} : { repos: next.repos },
-      ...Object.keys(overrides).length === 0 ? {} : { settings: overrides },
-    }
-    try {
-      await writeJsonAtomic(this.file, content)
-    } catch (error) {
-      throw new RepoError('unavailable', `无法写入设置文件 ${this.file}：${(error as Error).message}`)
-    }
-    this.stored = next
+    return this.json.update((current) => {
+      const host = this.find(url)
+      if (!this.isAdded(host.url)) throw new RepoError('forbidden', `${host.url} 配置在 cordis.yml 中，不能在运行时删除`)
+      return { value: { ...current, hosts: current.hosts.filter(spec => spec.url !== host.url) }, result: host }
+    })
   }
 }

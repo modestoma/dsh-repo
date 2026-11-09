@@ -179,6 +179,6 @@ describe('plugin', () => {
     plugin.apply(second.ctx, undefined, { env: first.env })
     const hosts = await provided(second.provided).api.hostList()
     expect(hosts).toMatchObject([{ kind: 'gitlab', url: 'https://code.example.com', alias: '公司 GitLab', origin: 'added' }])
-    expect(() => plugin.apply(context().ctx, { hostsFile: join(first.env.DSH_HOME, 'dsh-repo') })).toThrow(/无法读取设置文件/)
+    expect(() => plugin.apply(context().ctx, { hostsFile: join(first.env.DSH_HOME, 'dsh-repo') })).toThrow(/设置文件 .* 无法读取/)
   })
 })

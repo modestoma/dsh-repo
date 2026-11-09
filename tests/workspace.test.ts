@@ -16,7 +16,7 @@ import { WorkspaceManager } from '../src/workspace/manager.ts'
 import type { WorkspaceGit } from '../src/workspace/manager.ts'
 import { GitProxy } from '../src/workspace/proxy.ts'
 import { WorkspaceRegistry } from '../src/workspace/registry.ts'
-import { catalogEntries, credentials, hostStore, mirrorLimits, testConfig, testSettings } from './helpers.ts'
+import { catalogEntries, credentials, settingsStore, mirrorLimits, testConfig, testSettings } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 const TIMEOUT = 30_000
@@ -72,7 +72,7 @@ async function setup(options: { parallel?: (name: string, ...args: unknown[]) =>
   const service = new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials({}),
-    hosts: hostStore(testConfig(), root, testSettings(), catalogEntries([bare], 'write')),
+    hosts: settingsStore(testConfig(), root, testSettings(), catalogEntries([bare], 'write')),
     mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
   })
   const registry = new WorkspaceRegistry(join(root, 'workspaces.json'))

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { catalogKey } from '../src/catalog/catalog.ts'
-import { HostStore } from '../src/hosts.ts'
+import { SettingsStore } from '../src/settings/store.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
 import { RepoError } from '../src/errors.ts'
@@ -16,7 +16,7 @@ function setup(seed?: unknown) {
   const file = join(root, 'hosts.json')
   if (seed !== undefined) writeFileSync(file, JSON.stringify(seed))
   const warnings: string[] = []
-  const hosts = new HostStore(testConfig().hosts, file, { warn: (message: string) => { warnings.push(message) } })
+  const hosts = new SettingsStore(testConfig().hosts, file, { warn: (message: string) => { warnings.push(message) } })
   const service = new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials({}),

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { DEFAULT_SETTINGS, resolveConfig, resolveSettings, settingsOverrides } from '../src/config.ts'
 import type { RepoConfig, RepoSettings } from '../src/config.ts'
 import type { HostCredentials } from '../src/host.ts'
-import { HostStore } from '../src/hosts.ts'
+import { SettingsStore } from '../src/settings/store.ts'
 import { runGit } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import type { MirrorLimits } from '../src/mirror/store.ts'
@@ -95,12 +95,12 @@ export function catalogEntries(urls: readonly string[], access: RepoAccess = 'me
  * with `settings` and the catalog `repos` (default: no file, so default
  * settings and an empty catalog).
  */
-export function hostStore(config: RepoConfig, root: string, settings?: RepoSettings, repos?: readonly CatalogEntry[]): HostStore {
+export function settingsStore(config: RepoConfig, root: string, settings?: RepoSettings, repos?: readonly CatalogEntry[]): SettingsStore {
   const file = join(root, 'hosts.json')
   if (settings !== undefined || repos !== undefined) {
     writeFileSync(file, `${JSON.stringify({ hosts: [], ...repos === undefined ? {} : { repos }, ...settings === undefined ? {} : { settings: settingsOverrides(settings) } })}\n`)
   }
-  return new HostStore(config.hosts, file)
+  return new SettingsStore(config.hosts, file)
 }
 
 /**
@@ -124,7 +124,7 @@ export function createService(config: RepoConfig, tokens: Record<string, string>
   return new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials(tokens),
-    hosts: hostStore(config, root, settings, repos),
+    hosts: settingsStore(config, root, settings, repos),
     mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
   })
 }

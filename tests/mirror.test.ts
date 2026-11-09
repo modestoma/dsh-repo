@@ -3,12 +3,12 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { HostStore } from '../src/hosts.ts'
+import { SettingsStore } from '../src/settings/store.ts'
 import { credentialEnvironment, runGit } from '../src/mirror/git.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
 import { isAcceptedGitUrl, mirrorPath, MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import { allow, catalogEntries, credentials, hostStore, mirrorLimits, testConfig, testSettings } from './helpers.ts'
+import { allow, catalogEntries, credentials, settingsStore, mirrorLimits, testConfig, testSettings } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 
@@ -35,7 +35,7 @@ function setup(options: { git?: GitRunner; tokens?: Record<string, string> } = {
   const service = new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials(options.tokens ?? {}),
-    hosts: hostStore(config, root, testSettings(), catalogEntries(['https://code.example.com/gitlab/team/app', 'https://github.com/modestoma/app'])),
+    hosts: settingsStore(config, root, testSettings(), catalogEntries(['https://code.example.com/gitlab/team/app', 'https://github.com/modestoma/app'])),
     mirrors: new MirrorStore({ git: options.git ?? runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
   })
   return { root, service }
@@ -146,7 +146,7 @@ describe('mirror store', () => {
     const make = () => new RepoService({
       forbiddenMirrorRoots: [],
       credentials: credentials({}),
-      hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
+      hosts: new SettingsStore(config.hosts, join(root, 'hosts.json')),
       mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
     })
     const before = make()
@@ -223,7 +223,7 @@ describe('mirror directory changes', () => {
     const service = new RepoService({
       forbiddenMirrorRoots: [home, '/tmp/surely-missing-root'],
       credentials: credentials({}),
-      hosts: new HostStore(testConfig().hosts, join(root, 'hosts.json')),
+      hosts: new SettingsStore(testConfig().hosts, join(root, 'hosts.json')),
       mirrors: new MirrorStore({ git: runGit, root: undefined, limits: mirrorLimits() }),
     })
     for (const dir of [home, join(home, 'dsh-repo', 'mirrors'), join(home, '..mirrors'), join(root, 'home-link', 'mirrors'), '/tmp/surely-missing-root/x']) {
@@ -244,7 +244,7 @@ describe('mirror directory changes', () => {
       forbiddenMirrorRoots: [home],
       credentials: credentials({}),
       logger: { error: (_message, ...args) => { errors.push(...args) } },
-      hosts: new HostStore(testConfig().hosts, join(root, 'hosts.json')),
+      hosts: new SettingsStore(testConfig().hosts, join(root, 'hosts.json')),
       mirrors: new MirrorStore({ git: runGit, root: undefined, limits: mirrorLimits() }),
     })
     expect(service.mirrorSettings()).toEqual({ dir: undefined, problem: expect.stringContaining(join(home, 'mirrors')) })
