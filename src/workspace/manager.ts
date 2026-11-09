@@ -243,10 +243,8 @@ export class WorkspaceManager {
     requireBranch(branch, '分支名')
     if (branch === mirror.defaultBranch) throw new RepoError('invalid', `不能在默认分支 ${branch} 上工作；用 base 指定合入目标，推送到别的分支`)
     if (branch === mirror.branch) throw new RepoError('invalid', `分支 ${branch} 是合入目标，不能同时作为工作区的推送分支`)
-    if (service.gitHost(url)) {
-      const remote = await service.getBranch(url, branch, signal === undefined ? {} : { signal })
-      if (remote?.protected === true) throw new RepoError('forbidden', `${branch} 是受保护分支，工作区不能推送到它`)
-    }
+    const remote = await service.getBranch(url, branch, signal === undefined ? {} : { signal })
+    if (remote?.protected === true) throw new RepoError('forbidden', `${branch} 是受保护分支，工作区不能推送到它`)
     const existing = await this.mirrorBranch(mirror.dir, branch, signal)
     if (existing !== undefined && request.commit !== undefined) throw new RepoError('invalid', `分支 ${branch} 已存在，工作区从它的最新提交开始，不能再指定 commit`)
     let start = existing ?? request.commit ?? mirror.commit
@@ -569,7 +567,7 @@ export class WorkspaceManager {
     return commit === undefined || commit === '' || ZERO.test(commit) ? undefined : commit
   }
 
-  /** Commit identity of new workspaces: the configured one, else the token account's; undefined for a local repository without configuration. */
+  /** Commit identity of new workspaces: each configured field, else the token account's; undefined when the account cannot be read and a field is not configured. */
   private async identity(url: string, signal?: AbortSignal): Promise<CommitAuthor | undefined> {
     const { commitName, commitEmail } = this.deps.service.settings.workspace
     const account = commitName !== '' && commitEmail !== '' ? undefined : await this.accountIdentity(url, signal)

@@ -11,6 +11,8 @@ import * as plugin from '../src/index.ts'
 import type { RepoService } from '../src/service.ts'
 import type { MirrorUsage, SettingsState, WorkspaceRow } from '../src/settings/contract.ts'
 import { credentials } from './helpers.ts'
+import { fileRemote, REMOTE_TOKENS, remoteConfig, stubProviders } from './remote.ts'
+import type { Remote } from './remote.ts'
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -23,7 +25,7 @@ afterEach(() => {
 })
 
 /** Apply the plugin with a Web server whose routes are served on a real port. */
-async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {}, home?: string) {
+async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {}, home?: string, remote?: Remote) {
   const routes = new Map<string, Handler>()
   const webServer: HostWebServer = {
     register: (route) => {
@@ -36,7 +38,7 @@ async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {},
   const disposers: (() => void)[] = []
   const ctx: HostContext = {
     tools: { register: () => () => {} },
-    credentials: credentials({ GITHUB_TOKEN: 'gh' }),
+    credentials: credentials({ GITHUB_TOKEN: 'gh', ...remote === undefined ? {} : REMOTE_TOKENS }),
     provide: (name, value) => { provided.set(name, value) },
     get: name => services[name],
     effect: (callback) => {
@@ -51,7 +53,12 @@ async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {},
   }
   const env = { DSH_HOME: home ?? mkdtempSync(join(tmpdir(), 'dsh-repo-settings-')) }
   // Test directories live under the system temporary directory, so only `$DSH_HOME` stays forbidden here.
-  plugin.apply(ctx, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env, forbiddenMirrorRoots: [env.DSH_HOME] })
+  const github = { kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }
+  plugin.apply(ctx, remote === undefined ? { hosts: [github] } : remoteConfig([github]), {
+    env,
+    forbiddenMirrorRoots: [env.DSH_HOME],
+    ...remote === undefined ? {} : { git: remote.git, providerFactory: stubProviders({ getBranch: async () => undefined, listChanges: async () => ({ items: [] }) }) },
+  })
   const http = createServer((req, res) => {
     const handler = routes.get(new URL(req.url ?? '/', 'http://x').pathname)
     if (handler === undefined) {
@@ -223,14 +230,10 @@ describe('settings routes', () => {
   })
 
   it('adds, changes, syncs, and removes catalog repositories with their local syncs, and measures the mirror directory', async () => {
-    const repo = mkdtempSync(join(tmpdir(), 'dsh-repo-settings-origin-'))
+    const remote = fileRemote()
+    const { url: repo, dir: origin } = remote.repo('team/skills', { 'skill-a/SKILL.md': 'a\n' })
     const author = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
-    execFileSync('git', ['init', '--quiet', '--initial-branch=main'], { cwd: repo })
-    mkdirSync(join(repo, 'skill-a'))
-    writeFileSync(join(repo, 'skill-a', 'SKILL.md'), 'a\n')
-    execFileSync('git', ['add', '.'], { cwd: repo })
-    execFileSync('git', ['commit', '--quiet', '-m', 'init'], { cwd: repo, env: author })
-    const { call, json, env, service } = await serve()
+    const { call, json, env, service } = await serve(undefined, {}, undefined, remote)
     const file = join(env.DSH_HOME, 'dsh-repo', 'hosts.json')
     const dir = join(env.DSH_HOME, 'shared-skills')
     const changes: number[] = []
@@ -242,7 +245,7 @@ describe('settings routes', () => {
     let response = await call('/dsh-repo/repos', json('POST', { url: repo, access: 'read', features: [], localSync: { enabled: true, dir } }))
     expect(response.status).toBe(200)
     let [row] = (response.body.state as SettingsState).repos
-    expect(row).toMatchObject({ url: repo, access: 'read', key: repo, sync: { state: 'idle', error: expect.stringContaining('镜像目录未设置') } })
+    expect(row).toMatchObject({ url: repo, access: 'read', key: 'git.test/team/skills', sync: { state: 'idle', error: expect.stringContaining('镜像目录未设置') } })
     expect((await call('/dsh-repo/repos', json('DELETE', { id: row?.id }))).status).toBe(200)
     const mirrors = join(mkdtempSync(join(tmpdir(), 'dsh-repo-settings-mirrors-')), 'mirrors')
     expect((await call('/dsh-repo/mirror', json('PUT', { dir: mirrors }))).status).toBe(200)
@@ -256,8 +259,8 @@ describe('settings routes', () => {
     expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'local-syncs.json'), 'utf8')).syncs).toHaveLength(1)
     expect(service.listRepos({ feature: 'log-analysis' })).toEqual([{ id: row?.id, url: repo, access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir, intervalMinutes: 720 } }])
 
-    writeFileSync(join(repo, 'skill-a', 'SKILL.md'), 'a2\n')
-    execFileSync('git', ['commit', '--quiet', '-am', 'two'], { cwd: repo, env: author })
+    writeFileSync(join(origin, 'skill-a', 'SKILL.md'), 'a2\n')
+    execFileSync('git', ['commit', '--quiet', '-am', 'two'], { cwd: origin, env: author })
     await call('/dsh-repo/repos/sync', json('POST', { id: row?.id }))
     expect(readFileSync(join(dir, 'skill-a', 'SKILL.md'), 'utf8')).toBe('a2\n')
     response = await call('/dsh-repo/repos', json('PUT', { id: row?.id, url: repo, access: 'merge', features: [], localSync: { enabled: true, dir, intervalMinutes: 60 } }))
@@ -273,7 +276,7 @@ describe('settings routes', () => {
     const usage = (await call('/dsh-repo/mirror-usage')).body as unknown as MirrorUsage
     expect(usage.root).toBe(mirrors)
     expect(usage.mirrors).toHaveLength(1)
-    expect(usage.mirrors[0]).toMatchObject({ path: expect.stringMatching(/^local\//), url: repo })
+    expect(usage.mirrors[0]).toMatchObject({ path: 'git.test/team/skills.git', url: repo })
     expect(usage.mirrors[0]?.bytes).toBeGreaterThan(0)
     expect(usage.totalBytes).toBeGreaterThanOrEqual(usage.mirrors[0]?.bytes ?? 0)
 
@@ -300,13 +303,9 @@ describe('settings routes', () => {
   })
 
   it('creates workspaces in the chosen directory, lists them with their unsaved work, and removes them after confirmation', async () => {
-    const repo = mkdtempSync(join(tmpdir(), 'dsh-repo-settings-origin-'))
-    const author = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
-    execFileSync('git', ['init', '--quiet', '--initial-branch=main'], { cwd: repo })
-    writeFileSync(join(repo, 'README.md'), 'hello\n')
-    execFileSync('git', ['add', '.'], { cwd: repo })
-    execFileSync('git', ['commit', '--quiet', '-m', 'init'], { cwd: repo, env: author })
-    const { call, json } = await serve()
+    const remote = fileRemote()
+    const { url: repo } = remote.repo('team/app')
+    const { call, json } = await serve(undefined, {}, undefined, remote)
     const state = async () => (await call('/dsh-repo/state')).body as unknown as SettingsState
     await vi.waitFor(async () => { expect((await state()).workspace.proxyListening).toBeGreaterThan(0) })
     expect((await state()).workspace).toMatchObject({ available: true })
@@ -328,10 +327,9 @@ describe('settings routes', () => {
     const created = await call('/dsh-repo/workspaces', json('POST', { repo: id, branch: 'fix/a' }))
     expect(created.status).toBe(200)
     const row = created.body.workspace as WorkspaceRow
-    const name = repo.split('/').pop()!
-    expect(row).toMatchObject({ url: repo, repo, path: join(parent, name), base: 'main', branch: 'fix/a', currentBranch: 'fix/a', uncommittedFiles: 0, unpushed: 0 })
+    const name = 'app'
+    expect(row).toMatchObject({ url: repo, repo: 'git.test/team/app', path: join(parent, name), base: 'main', branch: 'fix/a', currentBranch: 'fix/a', uncommittedFiles: 0, unpushed: 0, mrs: [] })
     expect(row).not.toHaveProperty('session')
-    expect(row).not.toHaveProperty('mrs')
     expect(readFileSync(join(row.path, 'README.md'), 'utf8')).toBe('hello\n')
     // The default name is taken now, so the next one is numbered.
     const second = (await call('/dsh-repo/workspaces', json('POST', { repo: id }))).body.workspace as WorkspaceRow

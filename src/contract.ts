@@ -616,7 +616,7 @@ export interface LocalSyncSpec {
 export interface CatalogRepo {
   /** Stable id, 12 lowercase hex characters. */
   readonly id: string
-  /** HTTPS address on a configured host, `file:` URL, or absolute local path. */
+  /** HTTPS address on a configured host. */
   readonly url: string
   /** Branch consumers and the local sync follow; absent follows the remote's default branch. */
   readonly branch?: string
@@ -693,7 +693,7 @@ export interface RepoListParams {
 
 /** Parameters of {@link DshRepoService.repoAdd}. */
 export interface RepoAddParams {
-  /** HTTPS address on a configured host, `file:` URL, or absolute local path. */
+  /** HTTPS address on a configured host. */
   readonly repo: string
   /** Branch of a new entry; for an existing entry it must equal the entry's branch. */
   readonly branch?: string

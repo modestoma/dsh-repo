@@ -10,6 +10,7 @@
 import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { basename, isAbsolute, join } from 'node:path'
+import type { CatalogEntry } from '../catalog/entry.ts'
 import { expandHome } from '../config.ts'
 import { RepoError } from '../errors.ts'
 import { freeDirectory } from '../paths.ts'
@@ -81,12 +82,18 @@ export async function usableDirectory(dir: string): Promise<string> {
 export function workspacePanel(service: RepoService, manager: WorkspaceManager, proxyPort: () => number | undefined): WorkspacePanel {
   const row = async (record: WorkspaceRecord): Promise<WorkspaceRow> => {
     const timeoutMs = service.settings.mirror.gitTimeoutMs
-    const entry = service.catalog.find(record.repo)
+    let entry: CatalogEntry | undefined
+    try {
+      entry = service.catalog.find(record.repo)
+    } catch {
+      // The address no longer resolves (its host was removed, or a local path older versions accepted): shown as stored, without PRs/MRs.
+      entry = undefined
+    }
     const key = entry === undefined ? undefined : service.catalog.keyOf(entry)
     const base: WorkspaceRow = {
       id: record.id,
       url: record.repo,
-      repo: key !== undefined && 'key' in key ? key.key.replace(/^local:/, '') : record.repo,
+      repo: key !== undefined && 'key' in key ? key.key : record.repo,
       path: record.path,
       base: record.base,
       branch: record.branch,
@@ -96,7 +103,7 @@ export function workspacePanel(service: RepoService, manager: WorkspaceManager, 
     const errors: string[] = []
     const [summary, mrs] = await Promise.all([
       manager.summary(record, timeoutMs).catch((error: unknown) => { errors.push(error instanceof Error ? error.message : String(error)) }),
-      entry === undefined || !service.gitHost(record.repo)
+      entry === undefined
         ? undefined
         : service.listChanges(record.repo, { state: 'open', sourceBranch: record.branch, page: 1, perPage: MAX_LISTED_MRS }).then(
             (page): WorkspaceMr[] => page.items.map(mr => ({ number: mr.number, title: mr.title, webUrl: mr.webUrl })),

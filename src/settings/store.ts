@@ -58,6 +58,26 @@ function dropRetired(raw: unknown): string[] {
   return dropped
 }
 
+/**
+ * Remove catalog entries of local repositories (an absolute path or a `file:`
+ * URL), which earlier versions accepted, from a parsed file in place.
+ * @returns the addresses removed.
+ */
+function dropLocalRepos(raw: unknown): string[] {
+  if (typeof raw !== 'object' || raw === null) return []
+  const repos = (raw as { repos?: unknown }).repos
+  if (!Array.isArray(repos)) return []
+  const dropped: string[] = []
+  const kept = repos.filter((entry: unknown) => {
+    const url = typeof entry === 'object' && entry !== null ? (entry as { url?: unknown }).url : undefined
+    if (typeof url !== 'string' || !(isAbsolute(url) || url.startsWith('file:'))) return true
+    dropped.push(url)
+    return false
+  })
+  ;(raw as { repos: unknown[] }).repos = kept
+  return dropped
+}
+
 /** Everything the settings file holds. */
 interface Stored {
   readonly hosts: readonly HostSpec[]
@@ -112,8 +132,12 @@ export class SettingsStore {
       empty: { hosts: [], mirrorDir: undefined, workspaceDir: undefined, repos: [], settings: DEFAULT_SETTINGS },
       invalid: 'fail',
       prepare: (raw) => {
-        const dropped = dropRetired(raw)
-        return dropped.length === 0 ? [] : [`${dropped.join('、')} 已由仓库清单取代，已忽略，下次保存时删除；可访问的仓库和每个仓库的权限请在「代码仓库 → 仓库」中配置`]
+        const retired = dropRetired(raw)
+        const local = dropLocalRepos(raw)
+        return [
+          ...retired.length === 0 ? [] : [`${retired.join('、')} 已由仓库清单取代，已忽略，下次保存时删除；可访问的仓库和每个仓库的权限请在「代码仓库 → 仓库」中配置`],
+          ...local.length === 0 ? [] : [`仓库清单里的本地仓库 ${local.join('、')} 已不再支持，已忽略，下次保存时删除；请改用代码托管主机上的 https 地址`],
+        ]
       },
       encode: (next) => {
         const overrides = settingsOverrides(next.settings)

@@ -4,8 +4,7 @@
  * holder. The remote is the only source of truth: a mirror is fetched before
  * anything is served from it, and only dsh-repo writes it.
  *
- * - A mirror lives at `<root>/<host>/<path>.git` derived from its address;
- *   local paths go under `<root>/local/`. It is a bare repository whose
+ * - A mirror lives at `<root>/<host>/<path>.git` derived from its address. It is a bare repository whose
  *   `refs/heads/*` and `refs/tags/*` equal the remote's after each fetch, and
  *   whose `HEAD` names the remote's default branch, so workspaces can clone
  *   and fetch from it as if it were the remote. A new address is cloned into
@@ -72,23 +71,21 @@ export interface MirrorSnapshot {
   release(): void
 }
 
-const URL_SCHEMES = new Set(['https:', 'file:'])
 
 /**
- * Whether an address is one this store hands to `git clone`: an `https` or
- * `file` URL, or an absolute local path. SSH, scp-like `user@host:path`,
- * `git://`, plain `http`, and other transports (notably `ext::`) are refused,
- * so every remote address authenticates with a host token.
+ * Whether an address is one this store hands to `git clone`: an `https` URL.
+ * Local paths, `file:` URLs, SSH, scp-like `user@host:path`, `git://`, plain
+ * `http`, and other transports (notably `ext::`) are refused, so every
+ * address authenticates with a host token.
  * @param value - candidate address.
  * @returns whether it is accepted.
  */
 export function isAcceptedGitUrl(value: string): boolean {
   if (value === '' || value.startsWith('-') || /\s/.test(value)) return false
-  if (isAbsolute(value)) return true
   try {
-    return URL_SCHEMES.has(new URL(value).protocol)
+    return new URL(value).protocol === 'https:'
   } catch {
-    // Not a URL and not a local path: refused.
+    // Not a URL: refused.
     return false
   }
 }
@@ -112,21 +109,14 @@ function cleanSegments(path: string): string[] {
 
 /**
  * Mirror directory of an address, relative to the mirror root:
- * `<host>/<path>.git` for remote addresses (`host_port` when a port is given)
- * and `local/<name>-<hash>.git` for local paths and `file:` URLs.
+ * `<host>/<path>.git` (`host_port` when a port is given).
  * @param url - accepted git address.
  * @returns relative directory, `/`-separated.
  */
 export function mirrorPath(url: string): string {
-  if (!isAbsolute(url)) {
-    const parsed = new URL(url)
-    if (parsed.protocol !== 'file:') {
-      const host = parsed.host.toLowerCase().replace(':', '_').replace(/[^a-z0-9._-]/g, '-')
-      return `${[host, ...cleanSegments(decodeURIComponent(parsed.pathname))].join('/')}.git`
-    }
-  }
-  const name = cleanSegments(url).at(-1) ?? 'repo'
-  return `local/${name}-${createHash('sha1').update(url).digest('hex').slice(0, 8)}.git`
+  const parsed = new URL(url)
+  const host = parsed.host.toLowerCase().replace(':', '_').replace(/[^a-z0-9._-]/g, '-')
+  return `${[host, ...cleanSegments(decodeURIComponent(parsed.pathname))].join('/')}.git`
 }
 
 /**
@@ -217,7 +207,7 @@ export class MirrorStore {
    * @throws {RepoError} `invalid` for an unsupported address, `unavailable` while no root is chosen.
    */
   dirOf(url: string): string {
-    if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${url}（只支持 https 地址、file URL 或绝对路径；SSH 地址请改用仓库的 https 地址）`)
+    if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${url}（只支持 https 地址；SSH 地址请改用仓库的 https 地址）`)
     const root = this.requireRoot()
     const dir = join(root, ...mirrorPath(url).split('/'))
     this.roots.set(dir, root)

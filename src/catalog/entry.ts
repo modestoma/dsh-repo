@@ -39,7 +39,7 @@ const localSyncSchema = z.object({
 /** Schema of one stored entry. */
 export const catalogEntrySchema = z.object({
   id: z.string().regex(/^[0-9a-f]{12}$/),
-  url: z.string().min(1).refine(isAcceptedGitUrl, '只支持 https 地址、file URL 或绝对路径'),
+  url: z.string().min(1).refine(isAcceptedGitUrl, '只支持 https 地址'),
   branch: z.string().refine(isBranchName, '分支名不合法').optional(),
   access: z.enum(['read', 'write', 'merge']),
   features: z.array(z.string().regex(FEATURE_ID)).max(MAX_REPO_FEATURES),
@@ -118,7 +118,7 @@ export interface CheckedInput {
  */
 export function checkInput(input: RepoInput): CheckedInput {
   const url = input.url.trim()
-  if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${input.url}（只支持 https 地址、file URL 或绝对路径；SSH 地址请改用仓库的 https 地址）`)
+  if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${input.url}（只支持 https 地址；SSH 地址请改用仓库的 https 地址）`)
   const branch = input.branch?.trim()
   if (branch !== undefined && branch !== '') requireBranch(branch, '分支名')
   if (!ACCESS_ORDER.includes(input.access)) throw new RepoError('invalid', `权限只能是 ${ACCESS_ORDER.join('、')}：${String(input.access)}`)

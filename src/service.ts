@@ -16,7 +16,6 @@
 
 import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
-import { isAbsolute } from 'node:path'
 import type {
   CallOptions, CatalogRepo, CiActionResult, CiJob, CiJobLog, CommitAuthor, HostCreate, HostInfo, HostsChange, MergedBranchDeletion, MergeMethod, MrInfo, MrState, Page, RepoAccess,
   RepoAddResult, RepoFeature, RepoRef, RepoTarget, TokenStatus,
@@ -677,30 +676,20 @@ export class RepoService {
   }
 
   /**
-   * Whether an address is served by a configured host, so its API is reachable.
-   * @param url - accepted git address.
-   * @returns false for local paths, `file:` URLs, and unconfigured hosts.
-   */
-  gitHost(url: string): boolean {
-    return !isAbsolute(url) && !url.startsWith('file:') && hostOf(url, this.hosts.all()) !== undefined
-  }
-
-  /**
    * Credentials git uses to reach a catalog address under a configured host.
    * @param url - accepted git address in the catalog.
-   * @returns the credentials, or undefined for a local path or `file:` URL.
+   * @returns the credentials.
    * @throws {RepoError} `not-allowed` without a configured host, `unauthenticated` without a token.
    */
-  async gitCredentials(url: string): Promise<HostGitCredentials | undefined> {
-    if (isAbsolute(url) || url.startsWith('file:')) return undefined
+  async gitCredentials(url: string): Promise<HostGitCredentials> {
     const spec = hostOf(url, this.hosts.all())
     if (spec === undefined) throw new RepoError('not-allowed', `${url} 不属于已配置的主机`)
     return { hostUrl: spec.url, username: gitUsername(spec.kind), token: await this.token(spec) }
   }
 
   /**
-   * Environment of a mirror's or workspace's network commands: the host's
-   * token for an address under a configured host, nothing for a local path.
+   * Environment of a mirror's network commands: the host's token, handed to
+   * git through a credential helper that only this command sees.
    * @param url - accepted git address.
    * @param push - whether the command writes, which needs `write` access.
    * @throws {RepoError} `invalid` for an unsupported address, `not-allowed` outside the catalog or below the access the command needs, `unauthenticated` when the host's token is unset.
@@ -709,7 +698,7 @@ export class RepoService {
     this.mirrors.dirOf(url)
     this.catalog.require(url, push ? 'write' : 'read')
     const credentials = await this.gitCredentials(url)
-    return credentials === undefined ? {} : credentialEnvironment(credentials.hostUrl, credentials.username, credentials.token)
+    return credentialEnvironment(credentials.hostUrl, credentials.username, credentials.token)
   }
 
   /**
@@ -717,12 +706,12 @@ export class RepoService {
    * once per token value.
    * @param url - accepted git address under a configured host.
    * @param signal - caller cancellation of the wait.
-   * @returns the identity, or `undefined` for a local address.
-   * @throws {RepoError} classified failure of the host's current-user API.
+   * @returns the identity.
+   * @throws {RepoError} `not-allowed` without a configured host, and the classified failure of the host's current-user API.
    */
-  async tokenIdentity(url: string, signal: AbortSignal | undefined): Promise<CommitAuthor | undefined> {
+  async tokenIdentity(url: string, signal: AbortSignal | undefined): Promise<CommitAuthor> {
     const spec = hostOf(url, this.hosts.all())
-    if (spec === undefined) return undefined
+    if (spec === undefined) throw new RepoError('not-allowed', `${url} 不属于已配置的主机`)
     const token = await this.token(spec)
     let entry = this.identities.get(spec.url)
     if (entry?.token !== token) {

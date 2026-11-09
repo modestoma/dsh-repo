@@ -4,12 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { RepoInput } from '../src/settings/contract.ts'
-import { runGit } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
 import { SyncStore } from '../src/sync/store.ts'
 import { LocalSyncer, RETRY_MS, syncRecords } from '../src/sync/syncer.ts'
-import { credentials, settingsStore, mirrorLimits, testConfig, testSettings } from './helpers.ts'
+import { credentials, settingsStore, mirrorLimits, testSettings } from './helpers.ts'
+import { fileRemote, REMOTE_HOST, REMOTE_TOKENS, remoteConfig } from './remote.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 
@@ -23,21 +23,22 @@ function commitAll(dir: string, message: string): string {
   return git(dir, 'rev-parse', 'HEAD')
 }
 
-/** A repository whose `main` holds two skill directories, and a `beta` branch. */
-function origin(): { dir: string; commit: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-repo-sync-origin-'))
-  git(dir, 'init', '--quiet', '--initial-branch=main')
+/** Stand-in remote holding every test's repositories. */
+const remote = fileRemote()
+let repos = 0
+
+/** A repository of the stand-in remote whose `main` holds two skill directories, and a `beta` branch. */
+function origin(): { url: string; dir: string; commit: string } {
+  repos += 1
+  const { url, dir } = remote.repo(`skills/repo-${repos}`, { 'alpha/SKILL.md': 'alpha v1\n', 'gamma/SKILL.md': 'gamma\n' })
   mkdirSync(join(dir, 'alpha', 'scripts'), { recursive: true })
-  writeFileSync(join(dir, 'alpha', 'SKILL.md'), 'alpha v1\n')
   writeFileSync(join(dir, 'alpha', 'scripts', 'run.sh'), '#!/bin/sh\n', { mode: 0o755 })
-  mkdirSync(join(dir, 'gamma'))
-  writeFileSync(join(dir, 'gamma', 'SKILL.md'), 'gamma\n')
-  const commit = commitAll(dir, 'init')
+  const commit = commitAll(dir, 'script')
   git(dir, 'checkout', '--quiet', '-b', 'beta')
   writeFileSync(join(dir, 'beta.md'), 'beta only\n')
   commitAll(dir, 'beta')
   git(dir, 'checkout', '--quiet', 'main')
-  return { dir, commit }
+  return { url, dir, commit }
 }
 
 /** Catalog fields of a repository with its local sync enabled. */
@@ -56,9 +57,9 @@ function setup(now?: () => number) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-sync-'))
   const service = new RepoService({
     forbiddenMirrorRoots: [],
-    credentials: credentials({}),
-    hosts: settingsStore(testConfig(), root, testSettings()),
-    mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
+    credentials: credentials(REMOTE_TOKENS),
+    hosts: settingsStore(remoteConfig(), root, testSettings()),
+    mirrors: new MirrorStore({ git: remote.git, root: join(root, 'mirrors'), limits: mirrorLimits() }),
   })
   const { catalog } = service
   const make = (): LocalSyncer => {
@@ -66,7 +67,7 @@ function setup(now?: () => number) {
       service,
       records: () => syncRecords(catalog.entries()),
       ids: () => new Set(catalog.entries().map(entry => entry.id)),
-      git: runGit,
+      git: remote.git,
       store: new SyncStore(join(root, 'local-syncs.json')),
       indexDir: join(root, 'syncs'),
       timeoutMs: () => 30_000,
@@ -102,7 +103,7 @@ describe('local syncs', () => {
     const repo = origin()
     const { root, syncer, add } = setup()
     const dir = join(root, 'shared', 'skills')
-    const { id, status } = await add(synced(repo.dir, dir))
+    const { id, status } = await add(synced(repo.url, dir))
     expect(status).toMatchObject({ state: 'idle', commit: repo.commit, syncedBranch: 'main' })
     expect(status?.error).toBeUndefined()
     expect(readFileSync(join(dir, 'alpha', 'SKILL.md'), 'utf8')).toBe('alpha v1\n')
@@ -129,7 +130,7 @@ describe('local syncs', () => {
     const repo = origin()
     const { root, syncer, add } = setup()
     const dir = join(root, 'out')
-    const { id } = await add(synced(repo.dir, dir))
+    const { id } = await add(synced(repo.url, dir))
     const untouched = statSync(join(dir, 'gamma', 'SKILL.md')).mtimeMs
     writeFileSync(join(dir, 'alpha', 'SKILL.md'), 'edited locally\n')
     rmSync(join(dir, 'alpha', 'scripts'), { recursive: true })
@@ -145,21 +146,21 @@ describe('local syncs', () => {
     const repo = origin()
     const { root, syncer, add, update } = setup()
     const first = join(root, 'first')
-    const { id, status } = await add(synced(repo.dir, first, { branch: 'beta' }))
+    const { id, status } = await add(synced(repo.url, first, { branch: 'beta' }))
     expect(status?.syncedBranch).toBe('beta')
     expect(existsSync(join(first, 'beta.md'))).toBe(true)
 
     const busy = join(root, 'busy')
     mkdirSync(busy)
     writeFileSync(join(busy, 'note.txt'), 'x')
-    const refused = await update(id, synced(repo.dir, busy, { branch: 'beta' }))
+    const refused = await update(id, synced(repo.url, busy, { branch: 'beta' }))
     expect(refused?.error).toContain('不是空目录')
     expect(refused?.commit).toBeUndefined()
     expect(readFileSync(join(busy, 'note.txt'), 'utf8')).toBe('x')
     expect(existsSync(join(busy, 'beta.md'))).toBe(false)
 
     const second = join(root, 'second')
-    const moved = await update(id, synced(repo.dir, second, { branch: '' }))
+    const moved = await update(id, synced(repo.url, second, { branch: '' }))
     expect(moved).toMatchObject({ syncedBranch: 'main' })
     expect(moved?.error).toBeUndefined()
     expect(existsSync(join(second, 'beta.md'))).toBe(false)
@@ -173,7 +174,7 @@ describe('local syncs', () => {
     const dir = join(root, 'taken')
     mkdirSync(dir)
     writeFileSync(join(dir, 'SKILL.md'), 'mine\n')
-    const { status } = await add(synced(repo.dir, dir))
+    const { status } = await add(synced(repo.url, dir))
     expect(status).toMatchObject({ state: 'idle', error: expect.stringContaining('不是空目录') })
     expect(status?.commit).toBeUndefined()
     expect(status?.failedAt).toBeDefined()
@@ -186,23 +187,23 @@ describe('local syncs', () => {
     const { root, catalog, syncer, add } = setup()
     const refused = async (input: RepoInput, code: string) => { await expect(catalog.add(input)).rejects.toMatchObject({ code }) }
     await refused(synced('git@github.com:a/b.git', join(root, 'x')), 'invalid')
-    await refused(synced(one.dir, 'relative'), 'invalid')
-    await refused(synced(one.dir, '/'), 'invalid')
-    await refused(synced(one.dir, ''), 'invalid')
-    await refused(synced(one.dir, join(root, 'x'), { branch: 'a..b' }), 'invalid')
-    await refused(synced(one.dir, join(root, 'x'), { intervalMinutes: 1 }), 'invalid')
-    await refused(synced(one.dir, join(root, 'mirrors', 'inside')), 'conflict')
-    await refused(synced(one.dir, root), 'conflict')
-    const { id } = await add(synced(one.dir, join(root, 'a')))
-    await expect(catalog.add(synced(two.dir, join(root, 'a', 'nested')))).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('重叠') })
-    await refused(synced(two.dir, join(root, 'a', '..nested')), 'conflict')
-    await refused(synced(one.dir, join(root, 'b')), 'conflict')
+    await refused(synced(one.url, 'relative'), 'invalid')
+    await refused(synced(one.url, '/'), 'invalid')
+    await refused(synced(one.url, ''), 'invalid')
+    await refused(synced(one.url, join(root, 'x'), { branch: 'a..b' }), 'invalid')
+    await refused(synced(one.url, join(root, 'x'), { intervalMinutes: 1 }), 'invalid')
+    await refused(synced(one.url, join(root, 'mirrors', 'inside')), 'conflict')
+    await refused(synced(one.url, root), 'conflict')
+    const { id } = await add(synced(one.url, join(root, 'a')))
+    await expect(catalog.add(synced(two.url, join(root, 'a', 'nested')))).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('重叠') })
+    await refused(synced(two.url, join(root, 'a', '..nested')), 'conflict')
+    await refused(synced(one.url, join(root, 'b')), 'conflict')
     expect(catalog.entries()).toHaveLength(1)
-    expect((await add(synced(two.dir, join(root, '..a')))).status?.error).toBeUndefined()
+    expect((await add(synced(two.url, join(root, '..a')))).status?.error).toBeUndefined()
     // A disabled sync keeps its directory without claiming it, and needs none.
-    await catalog.add(synced(three.dir, join(root, 'a', 'later'), { enabled: false }))
-    expect(catalog.entries().find(entry => entry.url === three.dir)?.localSync).toEqual({ enabled: false, dir: join(root, 'a', 'later'), intervalMinutes: 720 })
-    await expect(catalog.update(id, { url: one.dir, access: 'read', features: [], localSync: { enabled: false, dir: '' } })).resolves.not.toHaveProperty('localSync')
+    await catalog.add(synced(three.url, join(root, 'a', 'later'), { enabled: false }))
+    expect(catalog.entries().find(entry => entry.url === three.url)?.localSync).toEqual({ enabled: false, dir: join(root, 'a', 'later'), intervalMinutes: 720 })
+    await expect(catalog.update(id, { url: one.url, access: 'read', features: [], localSync: { enabled: false, dir: '' } })).resolves.not.toHaveProperty('localSync')
     await expect(syncer.syncNow(id)).rejects.toMatchObject({ code: 'not-found' })
     expect(syncer.status(id)).toBeUndefined()
     await syncer.stop()
@@ -212,14 +213,14 @@ describe('local syncs', () => {
     const repo = origin()
     const { root, syncer, add, update } = setup()
     const first = join(root, 'first')
-    const { id } = await add(synced(repo.dir, first))
+    const { id } = await add(synced(repo.url, first))
     const busy = join(root, 'busy')
     mkdirSync(busy)
     writeFileSync(join(busy, 'note.txt'), 'x')
-    expect((await update(id, synced(repo.dir, busy)))?.error).toContain('不是空目录')
+    expect((await update(id, synced(repo.url, busy)))?.error).toContain('不是空目录')
     rmSync(join(repo.dir, 'gamma'), { recursive: true })
     commitAll(repo.dir, 'drop gamma')
-    const back = await update(id, synced(repo.dir, first))
+    const back = await update(id, synced(repo.url, first))
     expect(back?.error).toBeUndefined()
     expect(existsSync(join(first, 'gamma'))).toBe(false)
     expect(readFileSync(join(busy, 'note.txt'), 'utf8')).toBe('x')
@@ -230,11 +231,11 @@ describe('local syncs', () => {
     const repo = origin()
     const { root, syncer, add, update } = setup()
     const dir = join(root, 'out')
-    const { id } = await add(synced(repo.dir, dir))
-    expect(await update(id, synced(repo.dir, dir, { enabled: false }))).toBeUndefined()
+    const { id } = await add(synced(repo.url, dir))
+    expect(await update(id, synced(repo.url, dir, { enabled: false }))).toBeUndefined()
     writeFileSync(join(repo.dir, 'later.md'), 'later\n')
     const head = commitAll(repo.dir, 'later')
-    const again = await update(id, synced(repo.dir, dir))
+    const again = await update(id, synced(repo.url, dir))
     expect(again).toMatchObject({ commit: head })
     expect(again?.error).toBeUndefined()
     expect(readFileSync(join(dir, 'later.md'), 'utf8')).toBe('later\n')
@@ -245,7 +246,7 @@ describe('local syncs', () => {
     const repo = origin()
     const { root, syncer, make, add } = setup()
     const dir = join(root, 'out')
-    const { id } = await add(synced(repo.dir, dir))
+    const { id } = await add(synced(repo.url, dir))
     await syncer.stop()
     // Simulate an interruption between writing files and recording the result.
     const file = join(root, 'local-syncs.json')
@@ -262,11 +263,11 @@ describe('local syncs', () => {
     const [one, two] = [origin(), origin()]
     const { root, catalog, syncer, add } = setup()
     const out = join(root, 'data', 'out')
-    await add(synced(one.dir, out))
+    await add(synced(one.url, out))
     symlinkSync(out, join(root, 'data', 'alias'))
-    await expect(catalog.add(synced(two.dir, join(root, 'data', 'alias', 'nested')))).rejects.toMatchObject({ code: 'conflict' })
+    await expect(catalog.add(synced(two.url, join(root, 'data', 'alias', 'nested')))).rejects.toMatchObject({ code: 'conflict' })
     symlinkSync(join(root, 'mirrors'), join(root, 'mirror-link'))
-    await expect(catalog.add(synced(two.dir, join(root, 'mirror-link', 'x')))).rejects.toMatchObject({ code: 'conflict' })
+    await expect(catalog.add(synced(two.url, join(root, 'mirror-link', 'x')))).rejects.toMatchObject({ code: 'conflict' })
     await syncer.stop()
   })
 
@@ -274,7 +275,7 @@ describe('local syncs', () => {
     const repo = origin()
     const { root, service, syncer, add } = setup()
     const dir = join(root, 'out')
-    const { id } = await add(synced(repo.dir, dir))
+    const { id } = await add(synced(repo.url, dir))
     await service.setMirrorDir(join(dir, 'mirrors'))
     await syncer.syncNow(id)
     expect(syncer.status(id)?.error).toContain('镜像目录')
@@ -286,7 +287,7 @@ describe('local syncs', () => {
     const repo = origin()
     const { root, catalog, syncer, add } = setup()
     const dir = join(root, 'out')
-    const { id } = await add(synced(repo.dir, dir))
+    const { id } = await add(synced(repo.url, dir))
     expect(readdirSync(join(root, 'syncs')).filter(name => name.startsWith(id))).toHaveLength(1)
     await catalog.remove(id)
     await syncer.settled(id)
@@ -302,9 +303,9 @@ describe('local syncs', () => {
     let clock = Date.parse('2026-11-01T00:00:00.000Z')
     const { root, syncer, make, add, update } = setup(() => clock)
     const dir = join(root, 'out')
-    const { id, status } = await add(synced(repo.dir, dir, { intervalMinutes: 60 }))
+    const { id, status } = await add(synced(repo.url, dir, { intervalMinutes: 60 }))
     expect(status?.nextAt).toBe('2026-11-01T01:00:00.000Z')
-    expect((await update(id, synced(repo.dir, dir, { intervalMinutes: 120 })))?.nextAt).toBe('2026-11-01T02:00:00.000Z')
+    expect((await update(id, synced(repo.url, dir, { intervalMinutes: 120 })))?.nextAt).toBe('2026-11-01T02:00:00.000Z')
     await syncer.stop()
 
     clock = Date.parse('2026-11-01T00:30:00.000Z')
@@ -326,7 +327,7 @@ describe('local syncs', () => {
   it('retries a failed sync sooner than a long interval', async () => {
     const clock = Date.parse('2026-11-01T00:00:00.000Z')
     const { root, syncer, add } = setup(() => clock)
-    const { status } = await add(synced(join(root, 'missing-repo'), join(root, 'out')))
+    const { status } = await add(synced(`${REMOTE_HOST}/skills/missing`, join(root, 'out')))
     expect(status?.error).toBeDefined()
     expect(status?.nextAt).toBe(new Date(clock + RETRY_MS).toISOString())
     await syncer.stop()

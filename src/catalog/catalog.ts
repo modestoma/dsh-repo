@@ -6,9 +6,8 @@
  * - The catalog is stored in the settings file and changed by the settings
  *   page or {@link RepoCatalog.ensure}; every change is a read-modify-write
  *   after the ones queued before it.
- * - A repository is identified by its key: `host/path` (lowercase) for an
- *   address on a configured host, the absolute path for a local repository.
- *   An address on a host that is not configured cannot be added, and an
+ * - A repository is identified by its key: `host/path` (lowercase) of its
+ *   address on a configured host. An address on a host that is not configured cannot be added, and an
  *   entry whose host was removed afterwards matches nothing until the host is
  *   added again.
  * - Features are registered by other plugins at run time and are only
@@ -20,8 +19,6 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { isAbsolute, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { HostSpec } from '../config.ts'
 import type { RepoAccess, RepoAddResult, RepoFeature, RepoTarget } from '../contract.ts'
 import { RepoError } from '../errors.ts'
@@ -56,26 +53,11 @@ export function accessLabel(access: RepoAccess): string {
  * The catalog key of an address.
  * @param url - accepted git address, `host/path`, or a PR/MR URL.
  * @param hosts - configured hosts.
- * @returns the repository's web address without its scheme (host, the host's path prefix, and the repository path) in lowercase, or `local:<absolute path>`. The path prefix keeps repositories of two instances on one host name apart.
+ * @returns the repository's web address without its scheme (host, the host's path prefix, and the repository path) in lowercase. The path prefix keeps repositories of two instances on one host name apart.
  * @throws {RepoError} `invalid` for an unreadable address, `not-allowed` when no configured host serves it.
  */
 export function catalogKey(url: string, hosts: readonly HostSpec[]): string {
-  const trimmed = url.trim()
-  if (isAbsolute(trimmed)) return `local:${resolve(trimmed)}`
-  if (trimmed.startsWith('file:')) {
-    try {
-      return `local:${resolve(fileURLToPath(trimmed))}`
-    } catch {
-      // Not a usable file URL; the address is named in the refusal.
-      throw new RepoError('invalid', `无法识别的 file 地址：${url}`)
-    }
-  }
-  return resolveTarget(trimmed, hosts).webUrl.replace(/^https?:\/\//, '').toLowerCase()
-}
-
-/** The display form of a key: the local path without its prefix. */
-function shownKey(key: string): string {
-  return key.startsWith('local:') ? key.slice('local:'.length) : key
+  return resolveTarget(url.trim(), hosts).webUrl.replace(/^https?:\/\//, '').toLowerCase()
 }
 
 /** Repositories dsh-repo may reach, with their access, features, and local syncs. */
@@ -131,9 +113,9 @@ export class RepoCatalog {
   require(target: RepoTarget, needed: RepoAccess): CatalogEntry {
     const key = catalogKey(target, this.deps.store.all())
     const entry = this.find(target)
-    if (entry === undefined) throw new RepoError('not-allowed', `${shownKey(key)} 不在 dsh-repo 的仓库清单中，不能访问；请管理员在「代码仓库 → 仓库」中添加`)
+    if (entry === undefined) throw new RepoError('not-allowed', `${key} 不在 dsh-repo 的仓库清单中，不能访问；请管理员在「代码仓库 → 仓库」中添加`)
     if (!allows(entry.access, needed)) {
-      throw new RepoError('not-allowed', `${shownKey(key)} 在仓库清单中的权限是「${accessLabel(entry.access)}」，这次操作需要「${accessLabel(needed)}」；请管理员在「代码仓库 → 仓库」中调整`)
+      throw new RepoError('not-allowed', `${key} 在仓库清单中的权限是「${accessLabel(entry.access)}」，这次操作需要「${accessLabel(needed)}」；请管理员在「代码仓库 → 仓库」中调整`)
     }
     return entry
   }
@@ -256,14 +238,14 @@ export class RepoCatalog {
     const key = catalogKey(checked.url, this.deps.store.all())
     const existing = this.find(checked.url)
     if (existing !== undefined && (checked.branch ?? '') !== '' && checked.branch !== existing.branch) {
-      throw new RepoError('conflict', `${shownKey(key)} 已在仓库清单中，跟随${existing.branch === undefined ? '默认分支' : `分支 ${existing.branch}`}；改分支请在「代码仓库 → 仓库」中操作`)
+      throw new RepoError('conflict', `${key} 已在仓库清单中，跟随${existing.branch === undefined ? '默认分支' : `分支 ${existing.branch}`}；改分支请在「代码仓库 → 仓库」中操作`)
     }
     const missing = existing === undefined ? features : features.filter(id => !existing.features.includes(id))
     if (existing !== undefined && missing.length === 0) return { status: 'unchanged', repo: publicRepo(existing) }
     const names = missing.map(id => this.features.get(id)?.feature.title ?? id).join('、')
     await authorize(existing === undefined
-      ? `把 ${shownKey(key)} 加入 dsh-repo 仓库清单（权限：${accessLabel(checked.access)}${names === '' ? '' : `；打开功能：${names}`}）`
-      : `为仓库清单中的 ${shownKey(key)} 打开功能：${names}`)
+      ? `把 ${key} 加入 dsh-repo 仓库清单（权限：${accessLabel(checked.access)}${names === '' ? '' : `；打开功能：${names}`}）`
+      : `为仓库清单中的 ${key} 打开功能：${names}`)
     type Outcome = { readonly status: RepoAddResult['status']; readonly entry: CatalogEntry }
     const outcome = await this.deps.store.updateRepos<Outcome>((current) => {
       const held = current.find((entry) => {
@@ -273,11 +255,11 @@ export class RepoCatalog {
       if (held !== undefined) {
         // Another call may have stored the entry, on another branch, while this one was being authorized.
         if (checked.branch !== undefined && checked.branch !== held.branch) {
-          throw new RepoError('conflict', `${shownKey(key)} 已在仓库清单中，跟随${held.branch === undefined ? '默认分支' : `分支 ${held.branch}`}；改分支请在「代码仓库 → 仓库」中操作`)
+          throw new RepoError('conflict', `${key} 已在仓库清单中，跟随${held.branch === undefined ? '默认分支' : `分支 ${held.branch}`}；改分支请在「代码仓库 → 仓库」中操作`)
         }
         const next: CatalogEntry = { ...held, features: [...new Set([...held.features, ...features])] }
         if (next.features.length === held.features.length) return { repos: current, result: { status: 'unchanged', entry: held } }
-        if (next.features.length > MAX_REPO_FEATURES) throw new RepoError('invalid', `一个仓库最多打开 ${MAX_REPO_FEATURES} 个功能，${shownKey(key)} 已有 ${held.features.length} 个`)
+        if (next.features.length > MAX_REPO_FEATURES) throw new RepoError('invalid', `一个仓库最多打开 ${MAX_REPO_FEATURES} 个功能，${key} 已有 ${held.features.length} 个`)
         return { repos: current.map(entry => entry.id === held.id ? next : entry), result: { status: 'updated', entry: next } }
       }
       if (current.length >= MAX_REPOS) throw new RepoError('too-large', `仓库清单最多 ${MAX_REPOS} 个仓库`)
@@ -304,7 +286,7 @@ export class RepoCatalog {
       const own = this.keyOf(entry)
       return 'key' in own && own.key === key
     })
-    if (other !== undefined) throw new RepoError('conflict', `${shownKey(key)} 已在仓库清单中（${other.url}）`)
+    if (other !== undefined) throw new RepoError('conflict', `${key} 已在仓库清单中（${other.url}）`)
   }
 
   /**

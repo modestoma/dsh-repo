@@ -719,7 +719,7 @@ export const OPERATIONS: readonly Operation[] = [
       const session = sessionOf(caller) ?? record.session
       const details = session === undefined ? undefined : await collectDetails(deps.parallel, { session, path: record.path })
       const trailers = details === undefined ? undefined : checkTrailers(details.trailers)
-      const committer = (service.gitHost(record.repo) ? await service.tokenIdentity(record.repo, caller.signal) : undefined) ?? configuredIdentity(settings)
+      const committer = await service.tokenIdentity(record.repo, caller.signal)
       const author = details?.author === undefined ? configuredIdentity(settings) ?? committer : checkAuthor(details.author)
       const outcome = await workspaces.push(record, {
         ...args.message === undefined ? {} : { message: args.message },
@@ -731,7 +731,6 @@ export const OPERATIONS: readonly Operation[] = [
         signal: caller.signal,
       }, settings.mirror.gitTimeoutMs)
       const base = { repo: record.repo, path: record.path, branch: record.branch, base: record.base, ...outcome }
-      if (!service.gitHost(record.repo)) return { ...base, openMrs: [], watching: false }
       let open: readonly MrInfo[]
       let createdMr: MrInfo | undefined
       try {

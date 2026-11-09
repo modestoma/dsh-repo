@@ -254,7 +254,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
 
 /** Watch the open requests from branches a workspace of a Session pushed through the proxy; best effort. */
 async function watchPushed(service: RepoService, watcher: ChangeWatcher, record: WorkspaceRecord, branches: readonly string[]): Promise<void> {
-  if (record.session === undefined || !watcher.active || !service.gitHost(record.repo)) return
+  if (record.session === undefined || !watcher.active) return
   for (const branch of branches) {
     try {
       const open = await service.listChanges(record.repo, { state: 'open', sourceBranch: branch, perPage: 20 })
