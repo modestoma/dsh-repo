@@ -95,12 +95,13 @@ export interface CallerAgent {
 }
 
 /**
- * Caller fields of a write. With {@link agent} the write runs exactly as the
- * matching tool does for that Agent: `access/authorize` is dispatched for its
- * Session and, while the settings say `ask`, the user approves the same card
- * the tool shows (a refusal fails with `declined`, writes turned `off` with
- * `forbidden`). Without it the calling plugin answers for the write itself:
- * nothing is dispatched or asked.
+ * Caller fields of a write. While the settings turn writes `off`, every write
+ * to a code host fails with `forbidden`, with or without {@link agent}. With
+ * {@link agent} the write runs exactly as the matching tool does for that
+ * Agent: `access/authorize` is dispatched for its Session and, while the
+ * settings say `ask`, the user approves the same card the tool shows (a
+ * refusal fails with `declined`). Without it the calling plugin answers for
+ * the write itself: nothing is dispatched or asked.
  */
 export interface WriteOptions extends CallOptions {
   readonly agent?: CallerAgent

@@ -94,7 +94,7 @@ const workspaceSchema = z.object({
 const toolsSchema = z.object({
   /** Whether model tools are offered at all; false leaves only the `dshRepos` service. */
   enabled: z.boolean().default(true),
-  /** `ask`: every write asks the user once; `allow`: writes run without asking; `off`: write tools are not offered. */
+  /** `ask`: every write asks the user once; `allow`: writes run without asking; `off`: write tools are not offered and every write to a code host, including `git push` in a workspace, is refused. */
   writes: z.enum(['ask', 'allow', 'off']).default('ask'),
   /** Whether PRs/MRs merged through the tools, and GitLab MRs opened through them (by any merge), drop their source branch. */
   deleteSourceBranch: z.boolean().default(true),

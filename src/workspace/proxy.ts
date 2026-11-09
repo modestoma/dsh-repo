@@ -8,10 +8,11 @@
  *   mirror, which is fetched from the remote first, by `git http-backend`.
  *   Needs catalog access `read`.
  * - Push (`git-receive-pack`) is forwarded to the remote with the host's
- *   token after the commands were checked: only branches (`refs/heads/*`),
- *   never the default or a protected branch, no deletions; non-fast-forward
- *   updates of other branches are allowed. Needs catalog access `write` and,
- *   for a workspace a Session created, an `access/authorize` grant
+ *   token after the write policy (`dsh-repo/policy`) allowed its commands:
+ *   writes on, catalog access `write`, only branches (`refs/heads/*`), never
+ *   the default or a protected branch, no deletions; non-fast-forward
+ *   updates of other branches are allowed. It also needs, for a workspace a
+ *   Session created, an `access/authorize` grant
  *   (`code-write`) for that Session. A refused push is answered in git's own
  *   report format, so `git push` prints the reason per branch. After the
  *   remote accepted it, the mirror is fetched before the answer is returned.
@@ -27,7 +28,6 @@ import { basename, dirname } from 'node:path'
 import { PassThrough, Readable } from 'node:stream'
 import { createGunzip } from 'node:zlib'
 import { RepoError } from '../errors.ts'
-import { isBranchName } from '../refs.ts'
 import { authorize } from '../events.ts'
 import type { ParallelDispatch } from '../events.ts'
 import type { HostLogger } from '../host.ts'
@@ -57,7 +57,6 @@ interface PushCommand {
 
 /** Largest command section of a push read before the pack data. */
 const MAX_COMMAND_BYTES = 1024 * 1024
-const ZERO = /^0+$/
 
 function pktLine(payload: Buffer | string): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload
@@ -300,7 +299,6 @@ export class GitProxy {
 
   private async receive(req: IncomingMessage, res: ServerResponse, record: WorkspaceRecord): Promise<void> {
     const { service } = this.deps
-    service.catalog.require(record.repo, 'write')
     const body = req.headers['content-encoding'] === 'gzip' ? req.pipe(createGunzip()) : req
     const { commands, capabilities, head, rest } = await readCommands(body)
     const refused = await this.check(record, commands)
@@ -348,27 +346,8 @@ export class GitProxy {
    * @returns the reason in Chinese.
    */
   private async check(record: WorkspaceRecord, commands: readonly PushCommand[]): Promise<string | undefined> {
-    const { service } = this.deps
-    let defaultBranch: string
-    try {
-      // Asked of the remote: the mirror's HEAD may predate a change of the default branch.
-      defaultBranch = await service.mirrors.store.remoteDefaultBranch(record.repo, await service.mirrors.auth(record.repo, true)) ?? await service.mirrors.store.defaultBranch(record.repo)
-    } catch (error) {
-      return `无法确认默认分支：${error instanceof Error ? error.message : String(error)}`
-    }
-    for (const command of commands) {
-      if (!command.ref.startsWith('refs/heads/') || !isBranchName(command.ref.slice('refs/heads/'.length))) return `只能推送分支，不能推送 ${command.ref}（标签等其他引用不经工作区推送）`
-      const branch = command.ref.slice('refs/heads/'.length)
-      if (ZERO.test(command.new)) return `不能删除远端分支 ${branch}`
-      if (branch === defaultBranch) return `不能直接推送到默认分支 ${branch}；推送到别的分支后创建 PR/MR`
-      try {
-        const remote = await service.forge.getBranch(record.repo, branch)
-        if (remote?.default === true) return `不能直接推送到默认分支 ${branch}；推送到别的分支后创建 PR/MR`
-        if (remote?.protected === true) return `${branch} 是受保护分支，不能经工作区推送`
-      } catch (error) {
-        return `无法确认分支 ${branch} 是否受保护：${error instanceof Error ? error.message : String(error)}`
-      }
-    }
+    const refused = await this.deps.service.policy.pushRefusal(record.repo, commands)
+    if (refused !== undefined) return refused
     if (record.session !== undefined) {
       try {
         await authorize(this.deps.parallel, { session: record.session, level: 'code-write', action: 'git-push', summary: `从工作区 ${record.path} 推送 ${record.repo} 的分支 ${commands.map(command => command.ref.slice('refs/heads/'.length)).join('、')}` })

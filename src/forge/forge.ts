@@ -1,6 +1,7 @@
 /**
  * Code host API calls: each call resolves its target and requires it in the
- * repository catalog with enough access, validates its arguments, attaches
+ * repository catalog with enough access, a write also requires writes on
+ * (see `dsh-repo/policy`), validates its arguments, attaches
  * the API deadline, delegates to the host's provider, and turns every failure
  * into a {@link RepoError}. Approval and `access/authorize` are not done here
  * but in the operation registry (`dsh-repo/operations`).
@@ -14,6 +15,7 @@ import { readLog } from '../ci/log.ts'
 import type { RepoSettings } from '../config.ts'
 import { RepoError, toRepoError } from '../errors.ts'
 import type { ActivityRequest, Call, MrActivity, Paging, Provider } from '../providers/types.ts'
+import { requireWritesOn } from '../policy.ts'
 import { requireBranch, requireCommit } from '../refs.ts'
 import type { HostRegistry } from './hosts.ts'
 
@@ -402,8 +404,9 @@ export class Forge {
   }
 
   private async run<T>(repo: RepoTarget, options: CallOptions, what: string, level: RepoAccess, body: (provider: Provider, ref: RepoRef, call: Call) => Promise<T>): Promise<T> {
-    const { spec, ...ref } = this.deps.catalog.open(repo, level).target
     const settings = this.deps.settings()
+    if (level !== 'read') requireWritesOn(settings, what)
+    const { spec, ...ref } = this.deps.catalog.open(repo, level).target
     const deadline = AbortSignal.timeout(settings.timeoutMs)
     const signal = options.signal === undefined ? deadline : AbortSignal.any([options.signal, deadline])
     try {

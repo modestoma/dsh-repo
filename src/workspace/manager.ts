@@ -243,8 +243,7 @@ export class WorkspaceManager {
     requireBranch(branch, '分支名')
     if (branch === mirror.defaultBranch) throw new RepoError('invalid', `不能在默认分支 ${branch} 上工作；用 base 指定合入目标，推送到别的分支`)
     if (branch === mirror.branch) throw new RepoError('invalid', `分支 ${branch} 是合入目标，不能同时作为工作区的推送分支`)
-    const remote = await service.forge.getBranch(url, branch, signal === undefined ? {} : { signal })
-    if (remote?.protected === true) throw new RepoError('forbidden', `${branch} 是受保护分支，工作区不能推送到它`)
+    await service.policy.requirePushableBranch(url, branch, signal)
     const existing = await this.mirrorBranch(mirror.dir, branch, signal)
     if (existing !== undefined && request.commit !== undefined) throw new RepoError('invalid', `分支 ${branch} 已存在，工作区从它的最新提交开始，不能再指定 commit`)
     let start = existing ?? request.commit ?? mirror.commit

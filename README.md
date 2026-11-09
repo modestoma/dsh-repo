@@ -52,7 +52,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | 工作区 | dsh-repo 建的所有工作区：仓库、当前分支和合入分支、未提交的文件数、只在本机的提交数、这个分支上打开中的 PR/MR、最近 git 活动；新建、在此新建会话、删除。见[从设置页新建工作区](#从设置页新建工作区) | 无 | 立即 |
 | 高级 | 工作区目录：「工作区」标签页新建的工作区放在这里，不存在会创建 | 无 | 立即 |
 | 模型工具 | `tools.enabled`：是否提供 `repo_*` 工具 | 提供 | 保存条 |
-| 模型工具 | `tools.writes`：`ask` 每次审批、`allow` 不审批、`off` 不提供写工具 | `ask` | 保存条 |
+| 模型工具 | `tools.writes`：`ask` 每次审批、`allow` 不审批、`off` 关闭所有写操作（不提供写工具，服务调用、设置页和工作区里的 `git push` 也一律拒绝） | `ask` | 保存条 |
 | 模型工具 | `tools.deleteSourceBranch`：合并后删除源分支，见[合并后的分支](#合并后的分支) | 删除 | 保存条 |
 | 模型工具 | `tools.signature`：追加到模型写的正文和评论末尾 | 空 | 保存条 |
 | MR 跟踪 | `watch.enabled`：是否跟踪 PR/MR，见[跟踪 PR/MR](#跟踪-prmr) | 跟踪 | 保存条 |
@@ -173,7 +173,7 @@ CI 工具读取 GitLab 流水线和 GitHub Actions。只通过提交状态上报
 
 - 每个工作区有自己的随机密钥，写在工作区 `.git/config` 的凭据助手里，只对这个代理地址生效；代理按密钥认出工作区，只放行这个工作区的仓库。工作区记录（含密钥）保存在设置文件旁边的 `workspaces.json`，权限 0600；文件内容不合法时移到 `workspaces.json.invalid-<时间>` 并记日志，从空开始，原文件留着以便找回记录。密钥只能读写这一个仓库，而且要经过下面的推送规则；Agent 读得到它，和读得到工作区文件一样。
 - 拉取（`git fetch` / `pull`）先同步镜像，再由 `git http-backend` 从镜像提供，所以拉到的总是远端的最新内容。
-- 推送（`git push`）先检查每条引用更新：只能推分支（不能推 tag），不能删除分支，不能推到默认分支（每次向远端确认当前的默认分支）和受保护分支；然后以创建工作区的会话发 `access/authorize` 事件（`action` 是 `git-push`）。通过后代理用主机令牌转发给远端，远端的拒绝原样返回；不通过时 git 看到 `dsh-repo: <原因>` 的拒绝。推送成功后同步镜像，并跟踪这个分支上打开中的 PR/MR。
+- 推送（`git push`）先检查每条引用更新：写操作没有关闭，仓库清单权限至少是「可改代码」，只能推分支（不能推 tag），不能删除分支，不能推到默认分支（每次向远端确认当前的默认分支）和受保护分支；然后以创建工作区的会话发 `access/authorize` 事件（`action` 是 `git-push`）。通过后代理用主机令牌转发给远端，远端的拒绝原样返回；不通过时 git 看到 `dsh-repo: <原因>` 的拒绝。推送成功后同步镜像，并跟踪这个分支上打开中的 PR/MR。
 - 端口默认自动选择并记在 `workspaces.json` 里，重启后沿用；在设置页改端口后代理换到新端口，并改写所有工作区的配置。新端口监听失败时代理留在原端口，保存设置时报错。「高级 → 代理状态」显示代理当前监听的端口；它和设置的端口不一致或代理没有运行时，那里有「重试」按钮，端口空出来后点它让代理重新监听。
 - 代理只监听 127.0.0.1；工作区的 git 配置为代理地址关闭 `http_proxy`。
 
@@ -244,7 +244,7 @@ if (repos?.version === 6) {
 | `agent` | 替哪个 Agent 调用（`{ id, session: { header: { id } } }`，通常就是工具执行上下文里的 `agent`）。写操作带 `agent` 时和模型工具完全一样：写操作关闭时以 `forbidden` 失败，以 Agent 的会话发 `access/authorize`，`writes: ask` 时请用户审批，没批准时以 `declined` 失败；推送时发 `repo/commit-trailers`、PR/MR 自动跟踪这个会话 |
 | `callId` | 审批卡片上对应的工具调用 id |
 
-不带 `agent` 的写操作只检查仓库清单的权限，不发授权事件也不审批，由调用方插件负责；`repoAdd` 也一样（带 `agent` 时按 `admin` 级别授权）。`mrWatch` 必须带 `agent`。工作区方法的 `path` 必须是绝对路径，服务调用不切换会话的工作目录。
+不带 `agent` 的写操作只检查写操作开关和仓库清单的权限（写操作关闭时同样以 `forbidden` 失败），不发授权事件也不审批，由调用方插件负责；`repoAdd` 不带 `agent` 时只检查参数（带 `agent` 时按 `admin` 级别授权，写操作关闭时拒绝）。`mrWatch` 必须带 `agent`。工作区方法的 `path` 必须是绝对路径，服务调用不切换会话的工作目录。
 
 除这些方法外，服务还提供插件和设置页用的方法：`repoResolve`、`repoOnChange`、`featureRegister`、`hostList`、`hostAdd`、`hostRemove`、`hostSetToken`、`hostOnChange`、`settingsGet`、`settingsUpdate`（镜像目录、工作区默认目录、代理端口、提交身份）。完整定义见 [`src/contract.ts`](src/contract.ts)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`、`declined`。
 

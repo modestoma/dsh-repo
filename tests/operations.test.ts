@@ -13,7 +13,10 @@ import type { RepoSettings } from '../src/config.ts'
 import { RepoError } from '../src/errors.ts'
 import type { HostApproval, ToolDefinition, WorkingDirectoryService } from '../src/host.ts'
 import { DeclinedError, OPERATIONS } from '../src/operations.ts'
-import type { OperationDeps, WatchHooks } from '../src/operations.ts'
+import type { WatchHooks } from '../src/calls.ts'
+import { ToolLeases } from '../src/mirror/tool-leases.ts'
+import type { OperationDeps } from '../src/operations.ts'
+import { requireWritesOn } from '../src/policy.ts'
 import type { RepoService } from '../src/service.ts'
 import type { WatchInfo } from '../src/settings/contract.ts'
 import { createTools, toolOffered } from '../src/tools.ts'
@@ -49,9 +52,17 @@ interface FakeParts {
 function fakeService(parts: FakeParts = {}, settings: () => RepoSettings = () => testSettings(), granted: RepoAccess = 'merge'): RepoService {
   const notUsed = async () => { throw new Error('not used') }
   const part = (members: Record<string, unknown>): object => new Proxy({}, { get: (_target, key) => members[String(key)] ?? notUsed })
+  const catalogPart = { ...catalog(granted), ...parts.catalog } as { require: (target: string, level: RepoAccess) => unknown }
   const engine: Record<string, unknown> = {
     settings: new Proxy({}, { get: (_target, key) => key === 'current' ? settings() : notUsed }),
-    catalog: part({ ...catalog(granted), ...parts.catalog }),
+    catalog: part(catalogPart),
+    policy: {
+      requireWritesOn: (action: string) => { requireWritesOn(settings(), action) },
+      requireWrite: (target: string, level: RepoAccess, action: string) => {
+        requireWritesOn(settings(), action)
+        return catalogPart.require(target, level)
+      },
+    },
     forge: part(parts.forge ?? {}),
     hosts: part(parts.hosts ?? {}),
     mirrors: part({ ...parts.mirrors, store: part(parts.mirrorStore ?? {}) }),
@@ -75,6 +86,7 @@ interface Options {
 function deps(service: RepoService, options: Options = {}): OperationDeps {
   return {
     service,
+    leases: new ToolLeases(),
     workspaces: options.workspaces ?? fakeWorkspaces(),
     approval: () => options.approval,
     workingDirectory: () => options.workingDirectory,
@@ -243,11 +255,12 @@ describe('write gate for tools', () => {
 })
 
 describe('service calls', () => {
-  it('run the same operation; without an agent only the catalog is checked', async () => {
+  it('run the same operation; without an agent only the write policy is checked', async () => {
+    let settings = testSettings({ tools: { writes: 'ask' } })
     const createIssue = vi.fn(async () => ({ number: 1 }))
     const request = vi.fn(async () => 'allowed-once' as const)
     const parallel = vi.fn(async () => {})
-    const service = fakeService({ forge: { createIssue } }, () => testSettings({ tools: { writes: 'off' } }), 'write')
+    const service = fakeService({ forge: { createIssue } }, () => settings, 'write')
     const repos = api(service, { approval: { request }, parallel })
     expect(await repos.issueCreate({ repo: 'github.com/a/b', title: 'T', signal: exec.signal })).toEqual({ number: 1 })
     expect(request).not.toHaveBeenCalled()
@@ -255,6 +268,9 @@ describe('service calls', () => {
     await expect(repos.issueCreate({ repo: 'github.com/unlisted/x', title: 'T' })).rejects.toMatchObject({ code: 'not-allowed' })
     await expect(repos.mrMerge({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) })).rejects.toMatchObject({ code: 'not-allowed' })
     await expect(repos.issueCreate({ repo: 'github.com/a/b' } as never)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('issueCreate 参数不合法') })
+    settings = testSettings({ tools: { writes: 'off' } })
+    await expect(repos.issueCreate({ repo: 'github.com/a/b', title: 'T' })).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('已关闭写操作') })
+    expect(createIssue).toHaveBeenCalledTimes(1)
   })
 
   it('gate a write made for an agent like the tool, throwing declined', async () => {
@@ -285,11 +301,15 @@ describe('service calls', () => {
     await expect(repos.repoGet({ repo: 'github.com/a/b' })).rejects.toMatchObject({ name: 'RepoError', code: 'unavailable' })
     const lease = await repos.snapshotAcquire({ repo: 'github.com/a/b' })
     expect(lease).toEqual({ repo: 'https://github.com/a/b', commit: 'c'.repeat(40), path: '/snap', release })
-    const viaTool = await tools(service).get('repo_snapshot_acquire')!.execute({ repo: 'github.com/a/b', ref: 'v1' }, exec)
+    const leases = new ToolLeases()
+    const acquire = new Map(createTools({ ...deps(service), leases }).map(tool => [tool.definition.name, tool.definition])).get('repo_snapshot_acquire')!
+    const viaTool = await acquire.execute({ repo: 'github.com/a/b', ref: 'v1' }, exec)
     expect(viaTool).toEqual({ repo: 'https://github.com/a/b', commit: 'c'.repeat(40), path: '/snap' })
-    // The tool's lease for this Session and repository is replaced by the next one.
-    await tools(service).get('repo_snapshot_acquire')!.execute({ repo: 'github.com/a/b' }, exec)
+    // The tool's lease for this Session and repository is replaced by the next one, and every held lease is released on dispose.
+    await acquire.execute({ repo: 'github.com/a/b' }, exec)
     expect(release).toHaveBeenCalledTimes(1)
+    leases.releaseAll()
+    expect(release).toHaveBeenCalledTimes(2)
   })
 })
 
