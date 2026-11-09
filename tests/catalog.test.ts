@@ -31,7 +31,11 @@ describe('repository catalog', () => {
   it('keys repositories by host and path in lowercase, and local repositories by absolute path', () => {
     const { hosts } = testConfig()
     expect(catalogKey('https://GitHub.com/A/B.git', hosts)).toBe('github.com/a/b')
-    expect(catalogKey('git@code.example.com:team/app.git', hosts)).toBe('code.example.com/team/app')
+    expect(catalogKey('git@code.example.com:team/app.git', hosts)).toBe('code.example.com/gitlab/team/app')
+    // Two instances on one host name keep their path prefixes apart.
+    const shared = [...hosts, { kind: 'gitlab' as const, url: 'https://code.example.com/other', tokenRef: 'OTHER' }]
+    expect(catalogKey('https://code.example.com/other/team/app', shared)).toBe('code.example.com/other/team/app')
+    expect(catalogKey('https://code.example.com/gitlab/team/app', shared)).toBe('code.example.com/gitlab/team/app')
     expect(catalogKey('https://github.com/a/b/pull/3', hosts)).toBe('github.com/a/b')
     expect(catalogKey('/srv/repos/x/../app', hosts)).toBe('local:/srv/repos/app')
     expect(catalogKey(pathToFileURL('/srv/repos/app').href, hosts)).toBe('local:/srv/repos/app')
@@ -123,6 +127,11 @@ describe('repository catalog', () => {
     await expect(service.addRepo('https://gitlab.com/a/c')).rejects.toMatchObject({ code: 'not-allowed' })
     expect(await service.addRepo('https://github.com/a/c', { branch: 'dev', access: 'write' })).toMatchObject({ status: 'added', repo: { branch: 'dev', access: 'write', features: [] } })
     expect(events).toHaveLength(3)
+    // The merged feature list stays within the limit the settings file accepts.
+    const many = Array.from({ length: 20 }, (_, index) => `f${index}`)
+    await service.addRepo('https://github.com/a/full', { features: many })
+    await expect(service.addRepo('https://github.com/a/full', { features: ['one-more'] })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('最多打开 20 个功能') })
+    expect(service.listRepos().find(repo => repo.url === 'https://github.com/a/full')?.features).toHaveLength(20)
   })
 
   it('keeps entries whose host is gone, reports them, and skips them for the highest access', async () => {

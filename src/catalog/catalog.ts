@@ -28,7 +28,7 @@ import { RepoError } from '../errors.ts'
 import type { HostLogger } from '../host.ts'
 import type { HostStore } from '../hosts.ts'
 import { overlaps, realPathOf } from '../paths.ts'
-import { ACCESS_LEVELS, MAX_REPOS } from '../settings/contract.ts'
+import { ACCESS_LEVELS, MAX_REPO_FEATURES, MAX_REPOS } from '../settings/contract.ts'
 import type { RepoInput } from '../settings/contract.ts'
 import { resolveTarget } from '../target.ts'
 import { allows, checkFeature, checkFeatureIds, checkInput, publicRepo, requireBranch } from './entry.ts'
@@ -55,7 +55,7 @@ export function accessLabel(access: RepoAccess): string {
  * The catalog key of an address.
  * @param url - accepted git address, `host/path`, or a PR/MR URL.
  * @param hosts - configured hosts.
- * @returns `host/path` in lowercase, or `local:<absolute path>`.
+ * @returns the repository's web address without its scheme (host, the host's path prefix, and the repository path) in lowercase, or `local:<absolute path>`. The path prefix keeps repositories of two instances on one host name apart.
  * @throws {RepoError} `invalid` for an unreadable address, `not-allowed` when no configured host serves it.
  */
 export function catalogKey(url: string, hosts: readonly HostSpec[]): string {
@@ -69,8 +69,7 @@ export function catalogKey(url: string, hosts: readonly HostSpec[]): string {
       throw new RepoError('invalid', `无法识别的 file 地址：${url}`)
     }
   }
-  const target = resolveTarget(trimmed, hosts)
-  return `${target.host}/${target.path}`.toLowerCase()
+  return resolveTarget(trimmed, hosts).webUrl.replace(/^https?:\/\//, '').toLowerCase()
 }
 
 /** The display form of a key: the local path without its prefix. */
@@ -273,6 +272,7 @@ export class RepoCatalog {
       if (held !== undefined) {
         const next: CatalogEntry = { ...held, features: [...new Set([...held.features, ...features])] }
         if (next.features.length === held.features.length) return { repos: current, result: { status: 'unchanged', entry: held } }
+        if (next.features.length > MAX_REPO_FEATURES) throw new RepoError('invalid', `一个仓库最多打开 ${MAX_REPO_FEATURES} 个功能，${shownKey(key)} 已有 ${held.features.length} 个`)
         return { repos: current.map(entry => entry.id === held.id ? next : entry), result: { status: 'updated', entry: next } }
       }
       if (current.length >= MAX_REPOS) throw new RepoError('too-large', `仓库清单最多 ${MAX_REPOS} 个仓库`)
