@@ -271,6 +271,25 @@ describe('workspace status, push, and removal', () => {
     expect((await manager.status(record, undefined, 10, TIMEOUT)).truncated).toBe(true)
   })
 
+  it('reports to the watcher only the branches the remote accepted', async () => {
+    const { bare, manager, sessions, pushed } = await setup()
+    // The remote refuses one ref by hook and still answers HTTP 200, with `ng` for that ref.
+    writeFileSync(join(bare, 'hooks', 'update'), '#!/bin/sh\n[ "$1" = refs/heads/fix/blocked ] && { echo blocked >&2; exit 1; }\nexit 0\n', { mode: 0o755 })
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, branch: 'fix/a' })
+    await git(path, 'config', 'user.name', 'Dev')
+    await git(path, 'config', 'user.email', 'dev@example.com')
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    await git(path, 'add', '.')
+    await git(path, 'commit', '--quiet', '-m', 'feat: a')
+    const partial = await tryGit(path, 'push', 'origin', 'HEAD:fix/a', 'HEAD:fix/blocked')
+    expect(partial.status).not.toBe(0)
+    expect(pushed).toEqual([['fix/a']])
+    const refused = await tryGit(path, 'push', 'origin', 'HEAD:fix/blocked')
+    expect(refused.status).not.toBe(0)
+    expect(pushed).toEqual([['fix/a']])
+  })
+
   it('commits with the given identities and trailers, pushes to a new branch, then fast-forwards it', async () => {
     const { bare, commit, manager, sessions, pushed } = await setup()
     const path = join(sessions, 'app')

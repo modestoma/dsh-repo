@@ -41,7 +41,7 @@ export interface GitProxyDeps {
   readonly registry: WorkspaceRegistry
   /** `ctx.parallel` for `access/authorize`; absent means no listeners. */
   readonly parallel?: ParallelDispatch
-  /** Runs after the remote accepted a push, with the branches it updated. */
+  /** Runs after the remote accepted a push, with the branches its report lists as updated. */
   readonly onPushed?: (record: WorkspaceRecord, branches: readonly string[]) => void
   readonly logger?: HostLogger
 }
@@ -130,6 +130,43 @@ function rejection(commands: readonly PushCommand[], capabilities: readonly stri
   const report = Buffer.concat([pktLine('unpack ok\n'), ...commands.map(command => pktLine(`ng ${command.ref} dsh-repo: ${line}\n`)), Buffer.from('0000')])
   if (!capabilities.includes('side-band-64k') && !capabilities.includes('side-band')) return report
   return Buffer.concat([pktLine(Buffer.concat([Buffer.from([1]), report])), Buffer.from('0000')])
+}
+
+/**
+ * Split pkt-lines up to the first flush packet.
+ * @param data - pkt-line encoded bytes.
+ * @returns the payloads, or undefined when the data is not pkt-line encoded.
+ */
+function pktLines(data: Buffer): Buffer[] | undefined {
+  const lines: Buffer[] = []
+  let offset = 0
+  while (offset + 4 <= data.length) {
+    const length = Number.parseInt(data.subarray(offset, offset + 4).toString('ascii'), 16)
+    if (Number.isNaN(length) || (length > 0 && length < 4) || offset + length > data.length) return undefined
+    if (length === 0) return lines
+    lines.push(data.subarray(offset + 4, offset + length))
+    offset += length
+  }
+  return lines
+}
+
+/**
+ * The refs a remote reported as updated in a receive-pack answer.
+ * @param answer - the remote's `git-receive-pack` response body.
+ * @param commands - the push's ref updates.
+ * @param capabilities - the client's capabilities, which select side-band and the report.
+ * @returns the updated refs; every command when the client asked for no report, none when the answer cannot be read.
+ */
+function acceptedRefs(answer: Buffer, commands: readonly PushCommand[], capabilities: readonly string[]): string[] {
+  if (!capabilities.includes('report-status') && !capabilities.includes('report-status-v2')) return commands.map(command => command.ref)
+  let report: Buffer | undefined = answer
+  if (capabilities.includes('side-band-64k') || capabilities.includes('side-band')) {
+    const packets = pktLines(answer)
+    report = packets === undefined ? undefined : Buffer.concat(packets.filter(packet => packet[0] === 1).map(packet => packet.subarray(1)))
+  }
+  const lines = report === undefined ? undefined : pktLines(report)?.map(line => line.toString('utf8').replace(/\n$/, ''))
+  if (lines === undefined || lines[0] !== 'unpack ok') return []
+  return lines.filter(line => line.startsWith('ok ')).map(line => line.slice(3))
 }
 
 function sendText(res: ServerResponse, status: number, text: string, headers: Record<string, string> = {}): void {
@@ -300,15 +337,16 @@ export class GitProxy {
       type = response.headers.get('content-type') ?? 'application/x-git-receive-pack-result'
       answer = Buffer.from(await response.arrayBuffer())
     }
-    const branches = commands.map(command => command.ref.slice('refs/heads/'.length))
-    this.deps.logger?.info?.('dsh-repo: 代理推送 %s %s（工作区 %s，会话 %s）：HTTP %d', record.repo, branches.join(' '), record.path, record.session ?? '无', status)
+    // The remote answers a refused update (a hook, a race) with HTTP 200 and `ng` in the report.
+    const branches = status === 200 ? acceptedRefs(answer, commands, capabilities).map(ref => ref.slice('refs/heads/'.length)) : []
+    this.deps.logger?.info?.('dsh-repo: 代理推送 %s %s（工作区 %s，会话 %s）：HTTP %d，远端接受 %s', record.repo, commands.map(command => command.ref.slice('refs/heads/'.length)).join(' '), record.path, record.session ?? '无', status, branches.join(' ') || '无')
     if (status === 200) {
       try {
         await service.syncMirror(record.repo)
       } catch (error) {
         this.deps.logger?.warn?.('dsh-repo: 推送后同步镜像 %s 失败：%s', record.repo, error instanceof Error ? error.message : String(error))
       }
-      this.deps.onPushed?.(record, branches)
+      if (branches.length > 0) this.deps.onPushed?.(record, branches)
     }
     res.writeHead(status, { 'content-type': type, 'cache-control': 'no-cache' })
     res.end(answer)

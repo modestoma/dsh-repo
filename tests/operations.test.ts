@@ -3,7 +3,7 @@
  * (`createTools`) and the `dshRepos` methods (`DshReposApi`), over an engine
  * double whose unlisted methods reject.
  */
-import { mkdirSync, mkdtempSync, realpathSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -292,6 +292,10 @@ describe('workspace operations', () => {
     await tool.execute({ repo: 'github.com/a/b', path: 'sub', branch: 'fix/x' }, run)
     expect(create).toHaveBeenLastCalledWith(expect.objectContaining({ path: join(path, 'sub'), branch: 'fix/x' }), run.signal)
     await expect(tool.execute({ repo: 'github.com/a/b', path: tmpdir() }, run)).rejects.toThrow(/^\[invalid\].*会话目录/)
+    // A symbolic link inside the Session directory that leads outside it does not widen the directory.
+    const outsideDir = mkdtempSync(join(tmpdir(), 'dsh-repo-ops-out-'))
+    symlinkSync(outsideDir, join(root, 'topics/t1/out'))
+    await expect(tool.execute({ repo: 'github.com/a/b', path: join(root, 'topics/t1/out/checkout') }, run)).rejects.toThrow(/^\[invalid\].*会话目录/)
 
     const outside: WorkingDirectoryService = { ensure: async () => tmpdir(), set: async (_agent, target) => target }
     await tools(fakeService(), { workingDirectory: outside, workspaces }).get('repo_workspace_create')!.execute({ repo: 'github.com/a/b' }, run)

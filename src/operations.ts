@@ -30,7 +30,7 @@ import { RepoError } from './errors.ts'
 import { authorize, collectDetails } from './events.ts'
 import type { ParallelDispatch } from './events.ts'
 import type { Agent, HostApproval, WorkingDirectoryService } from './host.ts'
-import { within } from './paths.ts'
+import { realPathOf, within } from './paths.ts'
 import { pushPrompt } from './push-prompt.ts'
 import type { RepoService } from './service.ts'
 import type { WatchInfo } from './settings/contract.ts'
@@ -648,7 +648,8 @@ export const OPERATIONS: readonly Operation[] = [
         const current = await currentDirectory(deps, agent, caller.signal)
         const parent = root === undefined || within(root, current) ? current : root
         path = path === undefined ? await freeDirectory(parent, basename(url.replace(/\/+$/, '').replace(/\.git$/, '')) || 'repo') : resolve(current, path)
-        if (root !== undefined && !within(root, path)) throw new RepoError('invalid', `工作区目录必须在会话目录 ${root} 里面：${path}`)
+        // Compared also through real paths: a symbolic link inside the Session directory may lead outside it.
+        if (root !== undefined && (!within(root, path) || !within(await realPathOf(root), await realPathOf(path)))) throw new RepoError('invalid', `工作区目录必须在会话目录 ${root} 里面：${path}`)
       } else if (path === undefined) {
         throw new RepoError('invalid', 'workspaceCreate 的 path 必须给出')
       }
