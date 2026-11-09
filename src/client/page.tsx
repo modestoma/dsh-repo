@@ -1,8 +1,8 @@
 /**
- * 左侧栏「代码仓库」整页设置，分六个标签页：主机（主机与令牌）、访问范围、
- * 模型工具、MR 跟踪（各类动态的处理方式、检查频率、正在跟踪的 PR/MR）、
- * 本地同步（把仓库分支定时展开到本地目录）、高级（超时、上限、镜像目录、
- * 镜像占用）。主机、令牌、镜像目录、停止跟踪和本地同步的改动立即保存；其余运行时设置有改动时出现底部保存条，保存后对之后的调用立即生效。
+ * 左侧栏「代码仓库」整页设置，分五个标签页：主机（主机与令牌）、仓库（仓库
+ * 清单：每个仓库的分支、权限、其他插件登记的功能开关和本地同步）、模型工具、
+ * MR 跟踪（各类动态的处理方式、检查频率、正在跟踪的 PR/MR）、高级（超时、
+ * 上限、镜像目录、镜像占用）。主机、令牌、仓库清单、镜像目录和停止跟踪的改动立即保存；其余运行时设置有改动时出现底部保存条，保存后对之后的调用立即生效。
  * 令牌值存入 DSH 凭据库，页面只显示是否已设置。
  *
  * @module dsh-repo/client/page
@@ -10,10 +10,10 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { ForgeKind, HostInfo, TokenStatus } from '../contract.ts'
-import { DEFAULT_SYNC_INTERVAL_MINUTES } from '../settings/contract.ts'
-import type { HostAddRequest, MirrorUsage, SettingsState, SyncInfo, SyncInput, WatchInfo } from '../settings/contract.ts'
-import { addHost, addSync, clearHostToken, fetchMirrorUsage, fetchState, messageOf, pickDirectory, removeHost, removeSync, clearMirrorDir, resetSettings, runSync, saveHostToken, saveMirrorDir, saveSettings, stopWatch, updateSync } from './api.ts'
+import type { ForgeKind, HostInfo, RepoAccess, RepoFeature, TokenStatus } from '../contract.ts'
+import { ACCESS_LEVELS, DEFAULT_SYNC_INTERVAL_MINUTES } from '../settings/contract.ts'
+import type { HostAddRequest, LocalSyncStatus, MirrorUsage, RepoInput, RepoRow, SettingsState, WatchInfo } from '../settings/contract.ts'
+import { addHost, addRepo, clearHostToken, fetchMirrorUsage, fetchState, messageOf, pickDirectory, removeHost, removeRepo, clearMirrorDir, resetSettings, saveHostToken, saveMirrorDir, saveSettings, stopWatch, syncRepo, updateRepo } from './api.ts'
 import { formatBytes, formatInterval, fromDraft, intervalHoursText, NUMBER_FIELDS, parseIntervalHours, sameDraft, toDraft, WATCH_ACTIONS, WATCH_EVENTS, WRITE_MODES } from './form.ts'
 import type { DraftField, NumberKey, SettingsDraft } from './form.ts'
 
@@ -22,14 +22,13 @@ export const PAGE_TITLE = '代码仓库'
 
 type Notice = { kind: 'ok' | 'error'; text: string } | undefined
 
-type TabId = 'hosts' | 'access' | 'tools' | 'watch' | 'sync' | 'advanced'
+type TabId = 'hosts' | 'repos' | 'tools' | 'watch' | 'advanced'
 
 const TABS: readonly { id: TabId; label: string }[] = [
   { id: 'hosts', label: '主机' },
-  { id: 'access', label: '访问范围' },
+  { id: 'repos', label: '仓库' },
   { id: 'tools', label: '模型工具' },
   { id: 'watch', label: 'MR 跟踪' },
-  { id: 'sync', label: '本地同步' },
   { id: 'advanced', label: '高级' },
 ]
 
@@ -107,7 +106,7 @@ export function bundlePointer(openPage: () => (() => void) | undefined): (props:
           <div className="dr__row">
             <div className="dr__rowText">
               <div className="dr__rowLabel">设置在左侧栏「{PAGE_TITLE}」</div>
-              <div className="dr__rowSummary">主机与令牌、访问范围、模型工具、MR 跟踪、本地同步、超时与上限、本地镜像都在那里配置。</div>
+              <div className="dr__rowSummary">主机与令牌、仓库清单（权限、功能、本地同步）、模型工具、MR 跟踪、超时与上限、本地镜像都在那里配置。</div>
             </div>
             {open === undefined ? null : <div className="dr__rowCtl"><button type="button" className="dr__btn" onClick={open}>打开设置</button></div>}
           </div>
@@ -140,7 +139,7 @@ function SettingsPanel(): JSX.Element {
 
   useEffect(() => { void reload() }, [reload])
 
-  const syncing = tab === 'sync' && !busy && state?.syncs.some(sync => sync.state !== 'idle') === true
+  const syncing = tab === 'repos' && !busy && state?.repos.some(repo => repo.sync !== undefined && repo.sync.state !== 'idle') === true
   useEffect(() => {
     if (!syncing) return undefined
     const timer = setTimeout(() => { void reload() }, SYNC_POLL_MS)
@@ -198,7 +197,7 @@ function SettingsPanel(): JSX.Element {
     setErrors({})
   }
   const resetAll = (): void => {
-    if (!window.confirm('把访问范围、模型工具、MR 跟踪、超时和上限全部恢复默认？主机、令牌、镜像目录和正在跟踪的 PR/MR 不受影响。')) return
+    if (!window.confirm('把模型工具、MR 跟踪、超时和上限全部恢复默认？主机、令牌、仓库清单、镜像目录和正在跟踪的 PR/MR 不受影响。')) return
     void run(resetSettings, '已全部恢复默认').then((ok) => { if (ok) discard() })
   }
   const form = { current, defaults, errors, busy, edit }
@@ -214,7 +213,7 @@ function SettingsPanel(): JSX.Element {
       {notice === undefined ? null : <div className={`dr__notice dr__notice--${notice.kind}`} role="status">{notice.text}</div>}
 
       {tab === 'hosts' ? <HostsTab hosts={state.hosts} busy={busy} run={run} /> : null}
-      {tab === 'access' ? <AccessTab {...form} /> : null}
+      {tab === 'repos' ? <ReposTab state={state} busy={busy} run={run} onError={(text) => { setNotice({ kind: 'error', text }) }} /> : null}
       {tab === 'tools' ? <ToolsTab {...form} /> : null}
       {tab === 'watch'
         ? (
@@ -225,7 +224,6 @@ function SettingsPanel(): JSX.Element {
             </>
           )
         : null}
-      {tab === 'sync' ? <SyncTab state={state} busy={busy} run={run} onError={(text) => { setNotice({ kind: 'error', text }) }} /> : null}
       {tab === 'advanced'
         ? (
             <>
@@ -298,20 +296,6 @@ interface FormProps {
   edit: (patch: Partial<SettingsDraft>) => void
 }
 
-function AccessTab({ current, defaults, errors, busy, edit }: FormProps): JSX.Element {
-  return (
-    <Section>
-      <Row label="可访问的仓库" summary="每行一个，* 匹配一层，** 匹配任意多层；留空表示令牌能访问的全部仓库。" error={errors.repos} block>
-        <textarea className="dr__input dr__textarea dr__mono" aria-label="可访问的仓库" spellCheck={false} rows={Math.min(8, Math.max(3, current.repos.split('\n').length + 1))} placeholder={'github.com/modestoma/*\ncode.example.com/team/**'} value={current.repos} disabled={busy} onChange={(event) => { edit({ repos: event.target.value }) }} />
-      </Row>
-      <Row label="镜像其他主机上的仓库" summary="不在主机列表里的公开仓库，不带凭据拉取。">
-        <ResetLink shown={current.otherHosts !== defaults.otherHosts} busy={busy} onReset={() => { edit({ otherHosts: defaults.otherHosts }) }} />
-        <Switch label="镜像其他主机上的仓库" checked={current.otherHosts} disabled={busy} onChange={(value) => { edit({ otherHosts: value }) }} />
-      </Row>
-    </Section>
-  )
-}
-
 function ToolsTab({ current, defaults, errors, busy, edit }: FormProps): JSX.Element {
   const off = !current.enabled
   return (
@@ -319,12 +303,9 @@ function ToolsTab({ current, defaults, errors, busy, edit }: FormProps): JSX.Ele
       <Row label="提供代码仓库工具" summary="关闭后模型看不到 repo_* 工具，其他插件不受影响。">
         <Switch label="提供代码仓库工具" checked={current.enabled} disabled={busy} onChange={(value) => { edit({ enabled: value }) }} />
       </Row>
-      <Row label="写操作" summary="创建、修改、评论 issue 与 PR/MR，推送工作区。">
+      <Row label="写操作" summary="创建、修改、评论 issue 与 PR/MR，推送工作区，合并 PR/MR；只对仓库清单中权限允许的仓库生效。">
         <ResetLink shown={current.writes !== defaults.writes} busy={busy} onReset={() => { edit({ writes: defaults.writes }) }} />
         <Segmented label="写操作" value={current.writes} options={WRITE_MODES} disabled={busy || off} onChange={(value) => { edit({ writes: value }) }} />
-      </Row>
-      <Row label="合并 PR/MR" summary="审批方式同写操作。">
-        <Switch label="合并 PR/MR" checked={current.merge} disabled={busy || off || current.writes === 'off'} onChange={(value) => { edit({ merge: value }) }} />
       </Row>
       <Row label="合并后删除源分支" summary="GitLab 新建的 MR 勾选「合并后删除源分支」，用工具合并时也一并删除；fork、默认和受保护分支不删。">
         <ResetLink shown={current.deleteSourceBranch !== defaults.deleteSourceBranch} busy={busy} onReset={() => { edit({ deleteSourceBranch: defaults.deleteSourceBranch }) }} />
@@ -558,35 +539,42 @@ function MirrorSection({ state, busy, run, onError }: { state: SettingsState; bu
   )
 }
 
-/** Notice after a change that synced: the sync's failure, or `success`. */
-function syncNotice(id: string | undefined, success: string): (state: SettingsState) => Notice {
+/** Notice after a change that may have synced: the repository's sync failure, or `success`. */
+function repoNotice(match: (repo: RepoRow) => boolean, success: string): (state: SettingsState) => Notice {
   return (state) => {
-    const sync = id === undefined ? state.syncs.at(-1) : state.syncs.find(item => item.id === id)
-    return sync?.error === undefined ? { kind: 'ok', text: success } : { kind: 'error', text: `同步失败：${sync.error}` }
+    const repo = state.repos.find(match)
+    return repo?.sync?.error === undefined ? { kind: 'ok', text: success } : { kind: 'error', text: `已保存，但本地同步失败：${repo.sync.error}` }
   }
 }
 
-function SyncTab({ state, busy, run, onError }: { state: SettingsState; busy: boolean; run: Run; onError: (text: string) => void }): JSX.Element {
+function accessText(access: RepoAccess): string {
+  return ACCESS_LEVELS.find(level => level.id === access)?.label ?? access
+}
+
+function ReposTab({ state, busy, run, onError }: { state: SettingsState; busy: boolean; run: Run; onError: (text: string) => void }): JSX.Element {
   const [adding, setAdding] = useState(false)
   const [editing, setEditing] = useState<string | undefined>()
   const now = Date.now()
+  const form = { features: state.features, picker: state.pickerAvailable, busy, onError }
   return (
     <>
       <Section>
-        {state.syncs.length === 0 && !adding ? <div className="dr__emptyRow">还没有本地同步。添加后，仓库分支的最新提交会定时展开到你指定的本地目录。</div> : null}
-        {state.syncs.map(sync => sync.id === editing
-          ? <SyncForm key={sync.id} sync={sync} picker={state.pickerAvailable} busy={busy} onError={onError} onCancel={() => { setEditing(undefined) }} onSubmit={(input) => { void run(() => updateSync(sync.id, input), syncNotice(sync.id, '已保存')).then((ok) => { if (ok) setEditing(undefined) }) }} />
-          : <SyncRow key={sync.id} sync={sync} now={now} busy={busy} run={run} onEdit={() => { setEditing(sync.id) }} />)}
+        {state.repos.length === 0 && !adding
+          ? <div className="dr__emptyRow">{state.hosts.length === 0 ? '还没有主机。先在「主机」中添加 GitLab 或 GitHub 主机和令牌，再把要用的仓库加到这里。' : '仓库清单为空。只有加入清单的仓库才能被模型工具和其他插件访问。'}</div>
+          : null}
+        {state.repos.map(repo => repo.id === editing
+          ? <RepoForm key={repo.id} repo={repo} {...form} onCancel={() => { setEditing(undefined) }} onSubmit={(input) => { void run(() => updateRepo(repo.id, input), repoNotice(item => item.id === repo.id, '已保存')).then((ok) => { if (ok) setEditing(undefined) }) }} />
+          : <RepoListRow key={repo.id} repo={repo} features={state.features} now={now} busy={busy} run={run} onEdit={() => { setEditing(repo.id) }} />)}
         {adding
-          ? <SyncForm picker={state.pickerAvailable} busy={busy} onError={onError} onCancel={() => { setAdding(false) }} onSubmit={(input) => { void run(() => addSync(input), syncNotice(undefined, '已添加并完成第一次同步')).then((ok) => { if (ok) setAdding(false) }) }} />
-          : <div className="dr__addRow"><button type="button" className="dr__link" disabled={busy} onClick={() => { setAdding(true) }}>＋ 添加本地同步</button></div>}
+          ? <RepoForm {...form} onCancel={() => { setAdding(false) }} onSubmit={(input) => { void run(() => addRepo(input), repoNotice(item => item.url === input.url.trim(), '已加入仓库清单')).then((ok) => { if (ok) setAdding(false) }) }} />
+          : <div className="dr__addRow"><button type="button" className="dr__link" disabled={busy} onClick={() => { setAdding(true) }}>＋ 添加仓库</button></div>}
       </Section>
-      <p className="dr__secFoot">本地目录里是分支最新提交展开后的普通文件，没有 .git，git 对象只在镜像目录里存一份。每次同步只写入有变化的文件，删除分支上已删除的文件，本地改过或删掉的文件会恢复成仓库里的版本；目录里另外放的文件保留。第一次同步要求目录不存在或为空。删除本地同步不会删除目录里的文件。</p>
+      <p className="dr__secFoot">清单外的仓库一律不能访问。权限：只读可以读代码、issue、PR/MR 和 CI，也可以在本机检出工作区；可改代码另外可以推送工作区、创建和评论 issue 与 PR/MR、重试或取消 CI、删除已合并的分支；可合并另外可以合并 PR/MR。功能开关由其他插件登记，例如日志分析插件用它决定分析哪些仓库。本地同步把分支最新提交定时展开到本机目录（只有普通文件，没有 .git）：只写入有变化的文件，删除分支上已删除的文件，本地改过的文件恢复成仓库里的版本；第一次同步要求目录不存在或为空；关闭或删除不会删除目录里的文件。</p>
     </>
   )
 }
 
-function syncPill(sync: SyncInfo): JSX.Element {
+function syncPill(sync: LocalSyncStatus): JSX.Element {
   if (sync.state === 'running') return <span className="dr__pill dr__pill--ok"><span className="dr__dot" />同步中</span>
   if (sync.state === 'queued') return <span className="dr__pill"><span className="dr__dot" />排队中</span>
   if (sync.error !== undefined) return <span className="dr__pill dr__pill--bad"><span className="dr__dot" />同步失败</span>
@@ -594,48 +582,68 @@ function syncPill(sync: SyncInfo): JSX.Element {
   return <span className="dr__pill dr__pill--ok"><span className="dr__dot" />已同步</span>
 }
 
-function SyncRow({ sync, now, busy, run, onEdit }: { sync: SyncInfo; now: number; busy: boolean; run: Run; onEdit: () => void }): JSX.Element {
-  const parts = [`每 ${formatInterval(sync.intervalMinutes)}`]
-  if (sync.syncedAt !== undefined) parts.push(`上次 ${ago(sync.syncedAt, now)}${sync.commit === undefined ? '' : `（${sync.syncedBranch ?? ''} ${sync.commit.slice(0, 8)}）`}`)
-  if (sync.nextAt !== undefined) parts.push(`下次 ${until(sync.nextAt, now)}`)
-  const working = sync.state !== 'idle'
+function RepoListRow({ repo, features, now, busy, run, onEdit }: { repo: RepoRow; features: readonly RepoFeature[]; now: number; busy: boolean; run: Run; onEdit: () => void }): JSX.Element {
+  const titles = repo.features.map(id => features.find(feature => feature.id === id)?.title ?? id)
+  const sync = repo.sync
+  const parts: string[] = []
+  if (repo.localSync?.enabled === true) {
+    parts.push(`每 ${formatInterval(repo.localSync.intervalMinutes)}`)
+    if (sync?.syncedAt !== undefined) parts.push(`上次 ${ago(sync.syncedAt, now)}${sync.commit === undefined ? '' : `（${sync.syncedBranch ?? ''} ${sync.commit.slice(0, 8)}）`}`)
+    if (sync?.nextAt !== undefined) parts.push(`下次 ${until(sync.nextAt, now)}`)
+  }
+  const name = repo.key ?? repo.url
   return (
     <div className="dr__row dr__row--top">
       <div className="dr__rowText">
         <div className="dr__rowLabel">
-          <span className="dr__strong dr__mono">{sync.url}</span>
-          <span className="dr__tag">{sync.branch ?? '默认分支'}</span>
-          {syncPill(sync)}
+          <span className="dr__strong dr__mono" title={repo.url}>{name}</span>
+          <span className="dr__tag">{repo.branch ?? '默认分支'}</span>
+          <span className="dr__tag">{accessText(repo.access)}</span>
+          {titles.map(title => <span key={title} className="dr__tag">{title}</span>)}
+          {sync === undefined ? null : syncPill(sync)}
         </div>
-        <div className="dr__rowSummary"><span className="dr__mono">→ {sync.dir}</span></div>
-        <div className="dr__rowSummary">{parts.join(' · ')}</div>
-        {sync.error === undefined ? null : <div className="dr__rowError">{sync.error}</div>}
+        {repo.localSync?.enabled === true ? <div className="dr__rowSummary"><span className="dr__mono">本地同步 → {repo.localSync.dir}</span>{parts.length === 0 ? null : ` · ${parts.join(' · ')}`}</div> : null}
+        {repo.problem === undefined ? null : <div className="dr__rowError">{repo.problem}</div>}
+        {sync?.error === undefined ? null : <div className="dr__rowError">{sync.error}</div>}
       </div>
       <div className="dr__rowCtl">
-        <button type="button" className="dr__btn" disabled={busy || working} onClick={() => { void run(() => runSync(sync.id), syncNotice(sync.id, `已同步 ${sync.url}`)) }}>立即同步</button>
+        {sync === undefined ? null : <button type="button" className="dr__btn" disabled={busy || sync.state !== 'idle'} onClick={() => { void run(() => syncRepo(repo.id), repoNotice(item => item.id === repo.id, `已同步 ${name}`)) }}>立即同步</button>}
         <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onEdit}>编辑</button>
-        <button type="button" className="dr__btn dr__btn--ghost dr__btn--danger" disabled={busy} onClick={() => { if (window.confirm(`删除 ${sync.url} 的本地同步？目录 ${sync.dir} 里的文件会保留。`)) void run(() => removeSync(sync.id), '已删除本地同步，目录里的文件保留') }}>删除</button>
+        <button type="button" className="dr__btn dr__btn--ghost dr__btn--danger" disabled={busy} onClick={() => { if (window.confirm(`把 ${name} 移出仓库清单？之后模型工具和其他插件都不能再访问它${repo.localSync?.enabled === true ? `；本地同步目录 ${repo.localSync.dir} 里的文件会保留` : ''}。`)) void run(() => removeRepo(repo.id), `已把 ${name} 移出仓库清单`) }}>删除</button>
       </div>
     </div>
   )
 }
 
-function SyncForm({ sync, picker, busy, onError, onCancel, onSubmit }: { sync?: SyncInfo; picker: boolean; busy: boolean; onError: (text: string) => void; onCancel: () => void; onSubmit: (input: SyncInput) => void }): JSX.Element {
-  const [url, setUrl] = useState(sync?.url ?? '')
-  const [branch, setBranch] = useState(sync?.branch ?? '')
-  const [dir, setDir] = useState(sync?.dir ?? '')
-  const [hours, setHours] = useState(intervalHoursText(sync?.intervalMinutes ?? DEFAULT_SYNC_INTERVAL_MINUTES))
+function RepoForm({ repo, features, picker, busy, onError, onCancel, onSubmit }: { repo?: RepoRow; features: readonly RepoFeature[]; picker: boolean; busy: boolean; onError: (text: string) => void; onCancel: () => void; onSubmit: (input: RepoInput) => void }): JSX.Element {
+  const [url, setUrl] = useState(repo?.url ?? '')
+  const [branch, setBranch] = useState(repo?.branch ?? '')
+  const [access, setAccess] = useState<RepoAccess>(repo?.access ?? 'read')
+  const [enabled, setEnabled] = useState<readonly string[]>(repo?.features ?? [])
+  const [syncOn, setSyncOn] = useState(repo?.localSync?.enabled ?? false)
+  const [dir, setDir] = useState(repo?.localSync?.dir ?? '')
+  const [hours, setHours] = useState(intervalHoursText(repo?.localSync?.intervalMinutes ?? DEFAULT_SYNC_INTERVAL_MINUTES))
   const [error, setError] = useState<string | undefined>()
-  const complete = url.trim() !== '' && dir.trim() !== ''
+  // Features turned on by a plugin that is not loaded now stay listed so saving keeps them.
+  const shown = [...features, ...enabled.filter(id => !features.some(feature => feature.id === id)).map(id => ({ id, title: id, description: '登记这个功能的插件当前没有加载' }))]
+  const complete = url.trim() !== '' && (!syncOn || dir.trim() !== '')
+  const toggle = (id: string, on: boolean): void => { setEnabled(on ? [...enabled, id] : enabled.filter(item => item !== id)) }
   const submit = (): void => {
     if (!complete || busy) return
     const interval = parseIntervalHours(hours)
-    if (!interval.ok) {
+    if (syncOn && !interval.ok) {
       setError(interval.message)
       return
     }
     setError(undefined)
-    onSubmit({ url: url.trim(), branch: branch.trim(), dir: dir.trim(), intervalMinutes: interval.minutes })
+    const keepSync = syncOn || dir.trim() !== ''
+    onSubmit({
+      url: url.trim(),
+      branch: branch.trim(),
+      access,
+      features: [...enabled],
+      ...keepSync ? { localSync: { enabled: syncOn, dir: dir.trim(), ...interval.ok ? { intervalMinutes: interval.minutes } : {} } } : {},
+    })
   }
   const choose = (): void => {
     void pickDirectory().then((path) => { if (path !== null) setDir(path) }, (failure: unknown) => { onError(messageOf(failure)) })
@@ -644,20 +652,39 @@ function SyncForm({ sync, picker, busy, onError, onCancel, onSubmit }: { sync?: 
   return (
     <div className="dr__addForm">
       <div className="dr__formGrid">
-        <label className="dr__field dr__field--full">仓库地址<input className="dr__input dr__mono" spellCheck={false} placeholder="https://gitlab.example.com/team/shared-skills.git" value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+        <label className="dr__field dr__field--full">仓库地址<input className="dr__input dr__mono" spellCheck={false} placeholder="https://gitlab.example.com/team/order-service.git" value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={submitOnEnter} /></label>
         <label className="dr__field">分支（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder="默认分支" value={branch} onChange={(event) => { setBranch(event.target.value) }} onKeyDown={submitOnEnter} /></label>
-        <label className="dr__field">同步间隔（小时）<input className="dr__input dr__mono" inputMode="decimal" aria-invalid={error === undefined ? undefined : true} value={hours} onChange={(event) => { setHours(event.target.value); setError(undefined) }} onKeyDown={submitOnEnter} /></label>
-        <div className="dr__field dr__field--full">本地目录
-          <div className="dr__inline dr__inline--flush">
-            <input className="dr__input dr__mono" spellCheck={false} aria-label="本地目录" placeholder="/绝对路径/目录，不存在会自动创建" value={dir} onChange={(event) => { setDir(event.target.value) }} onKeyDown={submitOnEnter} />
-            {picker ? <button type="button" className="dr__btn" disabled={busy} onClick={choose}>选择…</button> : null}
-          </div>
-        </div>
+        <label className="dr__field">权限
+          <Segmented label="权限" value={access} options={ACCESS_LEVELS} disabled={busy} onChange={setAccess} />
+        </label>
       </div>
+      <div className="dr__list">
+        {shown.map(feature => (
+          <Row key={feature.id} label={feature.title} {...feature.description === undefined ? {} : { summary: feature.description }}>
+            <Switch label={feature.title} checked={enabled.includes(feature.id)} disabled={busy} onChange={(on) => { toggle(feature.id, on) }} />
+          </Row>
+        ))}
+        <Row label="本地同步" summary="把分支最新提交定时展开到本机目录。">
+          <Switch label="本地同步" checked={syncOn} disabled={busy} onChange={setSyncOn} />
+        </Row>
+      </div>
+      {syncOn
+        ? (
+            <div className="dr__formGrid">
+              <div className="dr__field">本地目录
+                <div className="dr__inline dr__inline--flush">
+                  <input className="dr__input dr__mono" spellCheck={false} aria-label="本地目录" placeholder="/绝对路径/目录，不存在会自动创建" value={dir} onChange={(event) => { setDir(event.target.value) }} onKeyDown={submitOnEnter} />
+                  {picker ? <button type="button" className="dr__btn" disabled={busy} onClick={choose}>选择…</button> : null}
+                </div>
+              </div>
+              <label className="dr__field">同步间隔（小时）<input className="dr__input dr__mono" inputMode="decimal" aria-invalid={error === undefined ? undefined : true} value={hours} onChange={(event) => { setHours(event.target.value); setError(undefined) }} onKeyDown={submitOnEnter} /></label>
+            </div>
+          )
+        : null}
       {error === undefined ? null : <div className="dr__rowError">{error}</div>}
       <div className="dr__formActions">
         <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onCancel}>取消</button>
-        <button type="button" className="dr__btn dr__btn--primary" disabled={busy || !complete} onClick={submit}>{busy ? '同步中…' : sync === undefined ? '添加并同步' : '保存'}</button>
+        <button type="button" className="dr__btn dr__btn--primary" disabled={busy || !complete} onClick={submit}>{busy ? '保存中…' : repo === undefined ? '添加' : '保存'}</button>
       </div>
     </div>
   )

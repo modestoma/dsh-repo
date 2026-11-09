@@ -8,7 +8,7 @@ import { credentialEnvironment, runGit } from '../src/mirror/git.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
 import { isAcceptedGitUrl, mirrorPath, MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import { credentials, hostStore, mirrorLimits, testConfig, testSettings, withMirrors } from './helpers.ts'
+import { allow, catalogEntries, credentials, hostStore, mirrorLimits, testConfig, testSettings, withMirrors } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 
@@ -29,14 +29,13 @@ function origin(): { dir: string; commit: string } {
   return { dir, commit: git(dir, 'rev-parse', 'HEAD') }
 }
 
-function setup(options: { git?: GitRunner; otherHosts?: boolean; tokens?: Record<string, string> } = {}) {
+function setup(options: { git?: GitRunner; tokens?: Record<string, string> } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-mirrors-'))
   const config = testConfig()
-  const settings = testSettings({ mirror: { otherHosts: options.otherHosts ?? true }, repos: ['github.com/modestoma/*', 'code.example.com/team/**'] })
   const service = new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials(options.tokens ?? {}),
-    hosts: hostStore(config, root, settings),
+    hosts: hostStore(config, root, testSettings(), catalogEntries(['https://code.example.com/gitlab/team/app', 'https://github.com/modestoma/app'])),
     ...withMirrors(new MirrorStore({ git: options.git ?? runGit, root: join(root, 'mirrors'), limits: mirrorLimits(64, 10) }), options.git ?? runGit),
   })
   return { root, service }
@@ -72,12 +71,11 @@ describe('mirror addresses', () => {
     calls.length = 0
     await expect(service.syncMirror('git@github.com:modestoma/app.git')).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('https') })
     expect(calls).toEqual([])
-    await expect(service.syncMirror('https://elsewhere.example.com/a/b')).rejects.toMatchObject({ code: 'unavailable' })
-    expect(calls[0]?.env).toEqual({})
-    await expect(service.syncMirror('https://github.com/someone/app')).rejects.toMatchObject({ code: 'not-allowed' })
+    await expect(service.syncMirror('https://elsewhere.example.com/a/b')).rejects.toMatchObject({ code: 'not-allowed' })
+    await expect(service.syncMirror('https://github.com/someone/app')).rejects.toMatchObject({ code: 'not-allowed', message: expect.stringContaining('不在 dsh-repo 的仓库清单中') })
     await expect(service.syncMirror('https://ghe.example.com/a/b')).rejects.toMatchObject({ code: 'not-allowed' })
+    expect(calls).toEqual([])
     await expect(setup({ git: fake, tokens: {} }).service.syncMirror('https://code.example.com/gitlab/team/app')).rejects.toMatchObject({ code: 'unauthenticated' })
-    await expect(setup({ git: fake, otherHosts: false }).service.syncMirror('https://elsewhere.example.com/a/b')).rejects.toMatchObject({ code: 'not-allowed' })
     await expect(service.syncMirror('ext::sh')).rejects.toMatchObject({ code: 'invalid' })
   })
 
@@ -108,6 +106,8 @@ describe('mirror store', () => {
   it('clones, fetches, reads files and trees, and shares snapshots', async () => {
     const repo = origin()
     const { service } = setup()
+    await expect(service.syncMirror(repo.dir)).rejects.toMatchObject({ code: 'not-allowed' })
+    await allow(service, [repo.dir], 'read')
     const first = await service.syncMirror(repo.dir)
     expect(first).toMatchObject({ url: repo.dir, branch: 'main', commit: repo.commit })
     expect(existsSync(join(first.dir, '.git'))).toBe(true)
@@ -149,6 +149,7 @@ describe('mirror store', () => {
       hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
       ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(64, 10) })),
     })
+    await allow(make(), [repo.dir])
     const leftover = await make().acquireSnapshot(repo.dir, (await make().syncMirror(repo.dir)).commit)
     const restarted = make()
     const lease = await restarted.acquireSnapshot(repo.dir, repo.commit)
@@ -168,6 +169,7 @@ describe('mirror store', () => {
   it('reports a missing branch, an unsynced mirror, and a large file', async () => {
     const repo = origin()
     const { service } = setup()
+    await allow(service, [`file://${repo.dir}`])
     await expect(service.readMirrorFile(repo.dir, repo.commit, 'README.md')).rejects.toMatchObject({ code: 'not-found' })
     await expect(service.syncMirror(repo.dir, { branch: 'nope' })).rejects.toMatchObject({ code: 'not-found' })
     await expect(service.syncMirror(repo.dir, { branch: '-x' })).rejects.toMatchObject({ code: 'invalid' })
@@ -183,6 +185,7 @@ describe('mirror directory changes', () => {
   it('clones into the new directory and keeps held snapshots beside the old mirror', async () => {
     const { dir: source, commit } = origin()
     const { root, service } = setup()
+    await allow(service, [source])
     const first = await service.syncMirror(source)
     expect(first.dir.startsWith(join(root, 'mirrors'))).toBe(true)
     const lease = await service.acquireSnapshot(source, commit)
@@ -203,6 +206,7 @@ describe('mirror directory changes', () => {
   it('refuses every mirror operation while no directory is chosen, and resumes after one is', async () => {
     const { dir: source, commit } = origin()
     const { root, service } = setup()
+    await allow(service, [source])
     expect(await service.setMirrorDir(undefined)).toEqual({ dir: undefined })
     expect(service.mirrorSettings().dir).toBeUndefined()
     await expect(service.syncMirror(source)).rejects.toMatchObject({ code: 'unavailable', message: expect.stringContaining('镜像目录未设置') })

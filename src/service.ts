@@ -1,8 +1,8 @@
 /**
- * The `dshRepos` service: resolves each target against the configured hosts
- * and repositories, validates arguments, attaches the call deadline, delegates
- * to the host family's provider, and turns every failure into a
- * {@link RepoError}.
+ * The `dshRepos` service: resolves each target against the configured hosts,
+ * requires it to be in the repository catalog with enough access, validates
+ * arguments, attaches the call deadline, delegates to the host family's
+ * provider, and turns every failure into a {@link RepoError}.
  *
  * Tokens are read through `ctx.credentials` and settings from the settings
  * file's store on every request, so a rotated token or a saved setting takes
@@ -15,11 +15,13 @@ import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type {
-  CallOptions, ChangeCreate, ChangeInfo, CiActionResult, CiJob, CiJobLog, CiLogOptions, CiRunListOptions, CiTarget, CommitAuthor, CommitDetails, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
-  HostCreate, HostInfo, HostsChange, MergedBranchDeletion, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, Page, PageOptions, RepoRef, RepoTarget,
+  CallOptions, CatalogRepo, ChangeCreate, ChangeInfo, CiActionResult, CiJob, CiJobLog, CiLogOptions, CiRunListOptions, CiTarget, CommitAuthor, CommitDetails, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
+  HostCreate, HostInfo, HostsChange, MergedBranchDeletion, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, Page, PageOptions, RepoAccess, RepoAddOptions, RepoAddResult, RepoFeature, RepoRef, RepoTarget,
   SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
 } from './contract.ts'
 import { readLog } from './ci/log.ts'
+import { RepoCatalog } from './catalog/catalog.ts'
+import { publicRepo } from './catalog/entry.ts'
 import { apiBaseUrl, DEFAULT_SETTINGS, resolveSettings } from './config.ts'
 import type { HostSpec, RepoSettings } from './config.ts'
 import type { MirrorUsage } from './settings/contract.ts'
@@ -185,7 +187,9 @@ export interface RepoServiceDeps {
 
 /** The service implementation. */
 export class RepoService implements DshRepoService {
-  readonly version = 4 as const
+  readonly version = 5 as const
+  /** The repository catalog every call is checked against. */
+  readonly catalog: RepoCatalog
   private readonly providers = new Map<string, Provider>()
   private readonly parallel: ParallelDispatch | undefined
   private readonly credentials: HostCredentials
@@ -216,6 +220,7 @@ export class RepoService implements DshRepoService {
     this.logger = deps.logger
     this.parallel = deps.parallel
     this.forbiddenMirrorRoots = deps.forbiddenMirrorRoots
+    this.catalog = new RepoCatalog({ store: deps.hosts, mirrorDir: () => this.mirrors.root, ...deps.logger === undefined ? {} : { logger: deps.logger } })
     const stored = deps.hosts.mirrorDir()
     if (stored !== undefined) {
       try {
@@ -228,7 +233,6 @@ export class RepoService implements DshRepoService {
     }
   }
 
-  /** Whether any host is configured or added. */
   /** @returns the run-time settings now in effect. */
   get settings(): RepoSettings {
     return this.hosts.settings()
@@ -259,45 +263,68 @@ export class RepoService implements DshRepoService {
     return next
   }
 
+  /** Whether any host is configured or added. */
   get configured(): boolean {
     return this.hosts.all().length > 0
   }
 
   resolve(repo: RepoTarget): RepoRef {
-    const { spec: _spec, ...ref } = this.target(repo)
+    const { spec: _spec, ...ref } = resolveTarget(repo, this.hosts.all())
     return ref
   }
 
+  listRepos(options: { readonly feature?: string } = {}): readonly CatalogRepo[] {
+    const { feature } = options
+    return this.catalog.entries().filter(entry => feature === undefined || entry.features.includes(feature)).map(publicRepo)
+  }
+
+  registerFeature(feature: RepoFeature): () => void {
+    return this.catalog.registerFeature(feature)
+  }
+
+  onReposChange(listener: () => void): () => void {
+    return this.catalog.onChange(listener)
+  }
+
+  async addRepo(url: string, options: RepoAddOptions = {}): Promise<RepoAddResult> {
+    const session = options.session === undefined ? undefined : requireSession(options.session)
+    options.signal?.throwIfAborted()
+    const { session: _session, signal: _signal, ...fields } = options
+    return await this.catalog.ensure(url, fields, async (summary) => {
+      if (session !== undefined) await authorize(this.parallel, { session, level: 'admin', action: 'addRepo', summary })
+    })
+  }
+
   async repoInfo(repo: RepoTarget, options: CallOptions = {}) {
-    return await this.run(repo, options, '读取仓库信息', (provider, ref, call) => provider.repoInfo(ref, call))
+    return await this.run(repo, options, '读取仓库信息', 'read', (provider, ref, call) => provider.repoInfo(ref, call))
   }
 
   async listBranches(repo: RepoTarget, options: PageOptions & { readonly search?: string } = {}) {
     const query = { ...this.paging(options), ...options.search === undefined ? {} : { search: options.search } }
-    return await this.run(repo, options, '列出分支', (provider, ref, call) => provider.listBranches(ref, query, call))
+    return await this.run(repo, options, '列出分支', 'read', (provider, ref, call) => provider.listBranches(ref, query, call))
   }
 
   async getBranch(repo: RepoTarget, name: string, options: CallOptions = {}) {
     requireBranch(name, '分支名')
-    return await this.run(repo, options, `读取分支 ${name}`, (provider, ref, call) => provider.getBranch(ref, name, call))
+    return await this.run(repo, options, `读取分支 ${name}`, 'read', (provider, ref, call) => provider.getBranch(ref, name, call))
   }
 
   async listCommits(repo: RepoTarget, options: PageOptions & { readonly ref?: string; readonly path?: string } = {}) {
     if (options.path !== undefined) requireRepoPath(options.path, '路径')
     const query = { ...this.paging(options), ...options.ref === undefined ? {} : { ref: options.ref }, ...options.path === undefined ? {} : { path: options.path } }
-    return await this.run(repo, options, '列出提交', (provider, ref, call) => provider.listCommits(ref, query, call))
+    return await this.run(repo, options, '列出提交', 'read', (provider, ref, call) => provider.listCommits(ref, query, call))
   }
 
   async listTree(repo: RepoTarget, options: CallOptions & { readonly ref?: string; readonly path?: string; readonly recursive?: boolean } = {}) {
     const path = (options.path ?? '').replace(/^\/+|\/+$/g, '')
     if (path !== '') requireRepoPath(path, '目录')
     const query = { path, recursive: options.recursive === true, ...options.ref === undefined ? {} : { ref: options.ref } }
-    return await this.run(repo, options, '列出目录', (provider, ref, call) => provider.listTree(ref, query, call))
+    return await this.run(repo, options, '列出目录', 'read', (provider, ref, call) => provider.listTree(ref, query, call))
   }
 
   async readFile(repo: RepoTarget, path: string, options: CallOptions & { readonly ref?: string } = {}) {
     requireRepoPath(path, '文件路径')
-    return await this.run(repo, options, `读取文件 ${path}`, (provider, ref, call) => provider.readFile(ref, path, options.ref, call))
+    return await this.run(repo, options, `读取文件 ${path}`, 'read', (provider, ref, call) => provider.readFile(ref, path, options.ref, call))
   }
 
   async listIssues(repo: RepoTarget, options: IssueListOptions = {}) {
@@ -307,29 +334,29 @@ export class RepoService implements DshRepoService {
       ...options.labels === undefined ? {} : { labels: options.labels },
       ...options.assignee === undefined ? {} : { assignee: options.assignee },
     }
-    return await this.run(repo, options, '列出 issue', (provider, ref, call) => provider.listIssues(ref, query, call))
+    return await this.run(repo, options, '列出 issue', 'read', (provider, ref, call) => provider.listIssues(ref, query, call))
   }
 
   async getIssue(repo: RepoTarget, number: number, options: CallOptions = {}) {
     requireNumber(number)
-    return await this.run(repo, options, `读取 issue #${number}`, (provider, ref, call) => provider.getIssue(ref, number, call))
+    return await this.run(repo, options, `读取 issue #${number}`, 'read', (provider, ref, call) => provider.getIssue(ref, number, call))
   }
 
   async createIssue(repo: RepoTarget, fields: IssueCreate) {
     requireText(fields.title, '标题')
-    return await this.run(repo, fields, '创建 issue', (provider, ref, call) => provider.createIssue(ref, fields, call))
+    return await this.run(repo, fields, '创建 issue', 'write', (provider, ref, call) => provider.createIssue(ref, fields, call))
   }
 
   async updateIssue(repo: RepoTarget, number: number, update: IssueUpdate) {
     requireNumber(number)
     if (update.title !== undefined) requireText(update.title, '标题')
-    return await this.run(repo, update, `更新 issue #${number}`, (provider, ref, call) => provider.updateIssue(ref, number, update, call))
+    return await this.run(repo, update, `更新 issue #${number}`, 'write', (provider, ref, call) => provider.updateIssue(ref, number, update, call))
   }
 
   async commentIssue(repo: RepoTarget, number: number, body: string, options: CallOptions = {}) {
     requireNumber(number)
     requireText(body, '评论内容')
-    return await this.run(repo, options, `评论 issue #${number}`, (provider, ref, call) => provider.commentIssue(ref, number, body, call))
+    return await this.run(repo, options, `评论 issue #${number}`, 'write', (provider, ref, call) => provider.commentIssue(ref, number, body, call))
   }
 
   async listChanges(repo: RepoTarget, options: ChangeListOptions = {}) {
@@ -339,22 +366,22 @@ export class RepoService implements DshRepoService {
       ...options.sourceBranch === undefined ? {} : { sourceBranch: options.sourceBranch },
       ...options.targetBranch === undefined ? {} : { targetBranch: options.targetBranch },
     }
-    return await this.run(repo, options, '列出 PR/MR', (provider, ref, call) => provider.listChanges(ref, query, call))
+    return await this.run(repo, options, '列出 PR/MR', 'read', (provider, ref, call) => provider.listChanges(ref, query, call))
   }
 
   async getChange(repo: RepoTarget, number: number, options: CallOptions = {}) {
     requireNumber(number)
-    return await this.run(repo, options, `读取 PR/MR #${number}`, (provider, ref, call) => provider.getChange(ref, number, call))
+    return await this.run(repo, options, `读取 PR/MR #${number}`, 'read', (provider, ref, call) => provider.getChange(ref, number, call))
   }
 
   async changeDiff(repo: RepoTarget, number: number, options: CallOptions = {}) {
     requireNumber(number)
-    return await this.run(repo, options, `读取 PR/MR #${number} 的 diff`, (provider, ref, call) => provider.changeDiff(ref, number, call))
+    return await this.run(repo, options, `读取 PR/MR #${number} 的 diff`, 'read', (provider, ref, call) => provider.changeDiff(ref, number, call))
   }
 
   async changeStatus(repo: RepoTarget, number: number, options: CallOptions = {}) {
     requireNumber(number)
-    return await this.run(repo, options, `读取 PR/MR #${number} 的状态`, (provider, ref, call) => provider.changeStatus(ref, number, call))
+    return await this.run(repo, options, `读取 PR/MR #${number} 的状态`, 'read', (provider, ref, call) => provider.changeStatus(ref, number, call))
   }
 
   /**
@@ -368,7 +395,7 @@ export class RepoService implements DshRepoService {
    */
   async changeActivity(repo: RepoTarget, number: number, request: ActivityRequest, options: CallOptions = {}): Promise<ChangeActivity> {
     requireNumber(number)
-    return await this.run(repo, options, `检查 PR/MR #${number} 的动态`, (provider, ref, call) => provider.changeActivity(ref, number, request, call))
+    return await this.run(repo, options, `检查 PR/MR #${number} 的动态`, 'read', (provider, ref, call) => provider.changeActivity(ref, number, request, call))
   }
 
   async listCiRuns(repo: RepoTarget, options: CiRunListOptions = {}) {
@@ -385,12 +412,12 @@ export class RepoService implements DshRepoService {
       ...options.change === undefined ? {} : { change: options.change },
       ...options.state === undefined ? {} : { state: options.state },
     }
-    return await this.run(repo, options, '列出 CI 流水线', (provider, ref, call) => provider.listRuns(ref, query, call))
+    return await this.run(repo, options, '列出 CI 流水线', 'read', (provider, ref, call) => provider.listRuns(ref, query, call))
   }
 
   async getCiRun(repo: RepoTarget, runId: number, options: CallOptions & { readonly onlyFailed?: boolean } = {}) {
     requireId(runId, 'runId')
-    const detail = await this.run(repo, options, `读取流水线 ${runId}`, (provider, ref, call) => provider.getRun(ref, runId, call))
+    const detail = await this.run(repo, options, `读取流水线 ${runId}`, 'read', (provider, ref, call) => provider.getRun(ref, runId, call))
     return options.onlyFailed === true ? { ...detail, jobs: detail.jobs.filter(job => job.state === 'failure') } : detail
   }
 
@@ -404,7 +431,7 @@ export class RepoService implements DshRepoService {
    */
   async failedCiJobs(repo: RepoTarget, runId: number, options: CallOptions = {}): Promise<CiJob[]> {
     requireId(runId, 'runId')
-    return await this.run(repo, options, `读取流水线 ${runId} 的失败作业`, (provider, ref, call) => provider.failedJobs(ref, runId, call))
+    return await this.run(repo, options, `读取流水线 ${runId} 的失败作业`, 'read', (provider, ref, call) => provider.failedJobs(ref, runId, call))
   }
 
   async ciJobLog(repo: RepoTarget, jobId: number, options: CiLogOptions = {}): Promise<CiJobLog> {
@@ -420,7 +447,7 @@ export class RepoService implements DshRepoService {
     }
     const section = options.section?.trim()
     if (section !== undefined && (section === '' || section.length > MAX_LOG_TERM)) throw new RepoError('invalid', `section 不能为空，最多 ${MAX_LOG_TERM} 个字符`)
-    return await this.run(repo, options, `读取作业 ${jobId} 的日志`, async (provider, ref, call) => {
+    return await this.run(repo, options, `读取作业 ${jobId} 的日志`, 'read', async (provider, ref, call) => {
       const { job, body } = await provider.jobLog(ref, jobId, call)
       const excerpt = await readLog(body, {
         search,
@@ -435,24 +462,24 @@ export class RepoService implements DshRepoService {
 
   async retryCi(repo: RepoTarget, target: CiTarget, options: CallOptions = {}): Promise<CiActionResult> {
     const { kind, id, label } = ciTarget(target)
-    return await this.run(repo, options, `重试${label}`, (provider, ref, call) => kind === 'run' ? provider.retryRun(ref, id, call) : provider.retryJob(ref, id, call))
+    return await this.run(repo, options, `重试${label}`, 'write', (provider, ref, call) => kind === 'run' ? provider.retryRun(ref, id, call) : provider.retryJob(ref, id, call))
   }
 
   async cancelCi(repo: RepoTarget, target: CiTarget, options: CallOptions = {}): Promise<CiActionResult> {
     const { kind, id, label } = ciTarget(target)
-    return await this.run(repo, options, `取消${label}`, (provider, ref, call) => kind === 'run' ? provider.cancelRun(ref, id, call) : provider.cancelJob(ref, id, call))
+    return await this.run(repo, options, `取消${label}`, 'write', (provider, ref, call) => kind === 'run' ? provider.cancelRun(ref, id, call) : provider.cancelJob(ref, id, call))
   }
 
   async createChange(repo: RepoTarget, change: ChangeCreate) {
     requireText(change.title, '标题')
     requireBranch(change.sourceBranch, '源分支名')
     if (change.targetBranch !== undefined) requireBranch(change.targetBranch, '目标分支名')
+    const { host, path } = this.target(repo, 'write')
     if (change.session !== undefined) {
       const session = requireSession(change.session)
-      const { host, path } = this.target(repo)
       await authorize(this.parallel, { session, level: 'code-write', action: 'createChange', summary: `在 ${host}/${path} 创建 PR/MR：${change.sourceBranch} → ${change.targetBranch ?? '默认分支'}，标题：${change.title}` })
     }
-    return await this.run(repo, change, '创建 PR/MR', async (provider, ref, call) => {
+    return await this.run(repo, change, '创建 PR/MR', 'write', async (provider, ref, call) => {
       const targetBranch = change.targetBranch ?? (await provider.repoInfo(ref, call)).defaultBranch
       if (targetBranch === change.sourceBranch) throw new RepoError('invalid', '源分支和目标分支不能相同')
       const { signal: _signal, session: _session, ...fields } = change
@@ -464,25 +491,25 @@ export class RepoService implements DshRepoService {
     requireNumber(number)
     if (update.title !== undefined) requireText(update.title, '标题')
     if (update.targetBranch !== undefined) requireBranch(update.targetBranch, '目标分支名')
-    return await this.run(repo, update, `更新 PR/MR #${number}`, (provider, ref, call) => provider.updateChange(ref, number, update, call))
+    return await this.run(repo, update, `更新 PR/MR #${number}`, 'write', (provider, ref, call) => provider.updateChange(ref, number, update, call))
   }
 
   async commentChange(repo: RepoTarget, number: number, body: string, options: CallOptions = {}) {
     requireNumber(number)
     requireText(body, '评论内容')
-    return await this.run(repo, options, `评论 PR/MR #${number}`, (provider, ref, call) => provider.commentChange(ref, number, body, call))
+    return await this.run(repo, options, `评论 PR/MR #${number}`, 'write', (provider, ref, call) => provider.commentChange(ref, number, body, call))
   }
 
   async mergeChange(repo: RepoTarget, number: number, options: MergeOptions) {
     requireNumber(number)
     if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(options.headSha)) throw new RepoError('invalid', `headSha 必须是完整的提交号：${options.headSha}`)
     const request = { headSha: options.headSha, ...options.method === undefined ? {} : { method: options.method }, deleteSourceBranch: options.deleteSourceBranch === true }
-    return await this.run(repo, options, `合并 PR/MR #${number}`, (provider, ref, call) => provider.mergeChange(ref, number, request, call))
+    return await this.run(repo, options, `合并 PR/MR #${number}`, 'merge', (provider, ref, call) => provider.mergeChange(ref, number, request, call))
   }
 
   async deleteMergedBranch(repo: RepoTarget, branch: string, options: CallOptions = {}): Promise<MergedBranchDeletion> {
     requireBranch(branch, '分支名')
-    return await this.run(repo, options, `删除分支 ${branch}`, async (provider, ref, call) => {
+    return await this.run(repo, options, `删除分支 ${branch}`, 'write', async (provider, ref, call) => {
       // The hosts' branch deletion takes no expected commit, so the head is read last, right before the deletion, to keep the window for a concurrent push small.
       const changes = await allChangesFrom(provider, ref, branch, call)
       const head = await provider.getBranch(ref, branch, call)
@@ -597,16 +624,19 @@ export class RepoService implements DshRepoService {
 
   async readMirrorFile(url: string, commit: string, path: string, options: CallOptions = {}): Promise<string | undefined> {
     requireRepoPath(path, '文件路径')
+    this.catalog.require(url, 'read')
     return await this.mirrors.readFile(url, commit, path, options.signal)
   }
 
   async listMirrorTree(url: string, commit: string, path: string, options: CallOptions = {}): Promise<readonly MirrorTreeEntry[]> {
     const directory = path.replace(/^\/+|\/+$/g, '')
     if (directory !== '') requireRepoPath(directory, '目录')
+    this.catalog.require(url, 'read')
     return await this.mirrors.listTree(url, commit, directory, options.signal)
   }
 
   async acquireSnapshot(url: string, commit: string, options: CallOptions = {}): Promise<SnapshotLease> {
+    this.catalog.require(url, 'read')
     return await this.mirrors.acquire(url, commit, options.signal)
   }
 
@@ -638,6 +668,7 @@ export class RepoService implements DshRepoService {
     const session = options.session === undefined ? undefined : requireSession(options.session)
     const own = options.trailers === undefined ? undefined : checkTrailers(options.trailers)
     const { url } = await this.workspaces.locate(dir)
+    this.catalog.require(url, 'write')
     let details: CommitDetails | undefined
     if (session !== undefined) {
       await authorize(this.parallel, { session, level: 'code-write', action: 'pushWorkspace', summary: `推送工作区 ${dir}${options.branch === undefined ? '' : ` 到新分支 ${options.branch}`}` })
@@ -664,22 +695,17 @@ export class RepoService implements DshRepoService {
 
   /**
    * Environment of a mirror's or workspace's network commands: the host's
-   * token for an address under a configured host, nothing for local paths
-   * and (when allowed) other hosts.
+   * token for an address under a configured host, nothing for a local path.
    * @param url - accepted git address.
-   * @param push - whether the command writes, which needs a configured host's token unless the address is local.
-   * @throws {RepoError} `invalid` for an unsupported address, `not-allowed` outside the configured repositories or on another host when those are refused, `unauthenticated` when the host's token is unset or a push targets a host without one.
+   * @param push - whether the command writes, which needs `write` access.
+   * @throws {RepoError} `invalid` for an unsupported address, `not-allowed` outside the catalog or below the access the command needs, `unauthenticated` when the host's token is unset.
    */
   private async mirrorAuth(url: string, push = false): Promise<Record<string, string>> {
     this.mirrors.dirOf(url)
+    this.catalog.require(url, push ? 'write' : 'read')
     if (isAbsolute(url) || url.startsWith('file:')) return {}
     const spec = hostOf(url, this.hosts.all())
-    if (spec === undefined) {
-      if (push) throw new RepoError('unauthenticated', `${url} 不属于已配置的主机，没有令牌可用于推送；先在 dsh-repo 中添加该主机并设置令牌`)
-      if (!this.settings.mirror.otherHosts) throw new RepoError('not-allowed', `${url} 不属于已配置的主机，dsh-repo 不镜像其他主机上的仓库`)
-      return {}
-    }
-    resolveTarget(url, this.hosts.all(), this.settings.repos)
+    if (spec === undefined) throw new RepoError('not-allowed', `${url} 不属于已配置的主机`)
     return credentialEnvironment(spec.url, gitUsername(spec.kind), await this.token(spec))
   }
 
@@ -745,8 +771,14 @@ export class RepoService implements DshRepoService {
     return resolved.value
   }
 
-  private target(repo: RepoTarget): ResolvedTarget {
-    return resolveTarget(repo, this.hosts.all(), this.settings.repos)
+  /**
+   * Resolve a target and require it in the catalog.
+   * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` without a host, outside the catalog, or below `level`.
+   */
+  private target(repo: RepoTarget, level: RepoAccess = 'read'): ResolvedTarget {
+    const resolved = resolveTarget(repo, this.hosts.all())
+    this.catalog.require(repo, level)
+    return resolved
   }
 
   private paging(options: PageOptions): Paging {
@@ -767,8 +799,8 @@ export class RepoService implements DshRepoService {
     return created
   }
 
-  private async run<T>(repo: RepoTarget, options: CallOptions, what: string, body: (provider: Provider, ref: RepoRef, call: Call) => Promise<T>): Promise<T> {
-    const { spec, ...ref } = this.target(repo)
+  private async run<T>(repo: RepoTarget, options: CallOptions, what: string, level: RepoAccess, body: (provider: Provider, ref: RepoRef, call: Call) => Promise<T>): Promise<T> {
+    const { spec, ...ref } = this.target(repo, level)
     const settings = this.settings
     const deadline = AbortSignal.timeout(settings.timeoutMs)
     const signal = options.signal === undefined ? deadline : AbortSignal.any([options.signal, deadline])

@@ -1,6 +1,6 @@
 /**
  * The settings file: hosts added at run time (next to the ones configured in
- * cordis.yml), the mirror directory, and the run-time settings, kept in one
+ * cordis.yml), the mirror directory, the repository catalog, and the run-time settings, kept in one
  * JSON file written to a temporary file, then renamed. Added hosts carry
  * tokens under generated credential references; settings are stored as the
  * fields that differ from the defaults.
@@ -17,6 +17,9 @@ import { DEFAULT_SETTINGS, hostSpecSchema, normalizeHostUrl, repoSettingsSchema,
 import type { HostSpec, RepoSettings } from './config.ts'
 import { RepoError } from './errors.ts'
 import { writeJsonAtomic } from './files.ts'
+import { catalogEntrySchema } from './catalog/entry.ts'
+import type { CatalogEntry } from './catalog/entry.ts'
+import type { HostLogger } from './host.ts'
 
 /** Longest accepted token; personal access tokens are far shorter. */
 export const MAX_TOKEN_LENGTH = 4096
@@ -24,13 +27,42 @@ export const MAX_TOKEN_LENGTH = 4096
 const fileSchema = z.object({
   hosts: z.array(hostSpecSchema).default([]),
   mirrorDir: z.string().min(1).refine(isAbsolute, '镜像目录必须是绝对路径').optional(),
+  repos: z.array(catalogEntrySchema).default([]),
   settings: repoSettingsSchema.optional(),
 }).strict()
+
+/**
+ * Settings earlier versions stored that the repository catalog replaced:
+ * `settings.repos` (repository patterns), `settings.mirror.otherHosts`, and
+ * `settings.tools.merge`. They are dropped when the file is read, reported,
+ * and gone from the file after the next write.
+ */
+const RETIRED_SETTINGS: readonly (readonly [string, string])[] = [
+  ['', 'repos'],
+  ['mirror', 'otherHosts'],
+  ['tools', 'merge'],
+]
+
+/** Remove {@link RETIRED_SETTINGS} from a parsed file in place; returns the dotted names removed. */
+function dropRetired(raw: unknown): string[] {
+  if (typeof raw !== 'object' || raw === null) return []
+  const settings = (raw as { settings?: unknown }).settings
+  if (typeof settings !== 'object' || settings === null) return []
+  const dropped: string[] = []
+  for (const [group, key] of RETIRED_SETTINGS) {
+    const holder = group === '' ? settings : (settings as Record<string, unknown>)[group]
+    if (typeof holder !== 'object' || holder === null || !(key in holder)) continue
+    delete (holder as Record<string, unknown>)[key]
+    dropped.push(group === '' ? `settings.${key}` : `settings.${group}.${key}`)
+  }
+  return dropped
+}
 
 /** Everything the settings file holds. */
 interface Stored {
   readonly hosts: readonly HostSpec[]
   readonly mirrorDir: string | undefined
+  readonly repos: readonly CatalogEntry[]
   readonly settings: RepoSettings
 }
 
@@ -60,27 +92,29 @@ export class HostStore {
   private queue: Promise<unknown> = Promise.resolve()
 
   /**
-   * Read the settings file. A missing file means no added hosts, the default
-   * mirror directory, and default settings.
+   * Read the settings file. A missing file means no added hosts, no mirror
+   * directory, an empty catalog, and default settings.
    * @param configured - hosts from cordis.yml.
    * @param file - absolute path of the settings file.
+   * @param logger - reports retired settings dropped from the file.
    * @throws when the file exists but cannot be read or is invalid.
    */
-  constructor(private readonly configured: readonly HostSpec[], readonly file: string) {
-    const stored = HostStore.read(file)
+  constructor(private readonly configured: readonly HostSpec[], readonly file: string, logger?: HostLogger) {
+    const stored = HostStore.read(file, logger)
     this.stored = {
       hosts: stored.hosts.filter(host => !configured.some(spec => spec.url === host.url)),
       mirrorDir: stored.mirrorDir,
+      repos: stored.repos,
       settings: stored.settings ?? DEFAULT_SETTINGS,
     }
   }
 
-  private static read(file: string): z.output<typeof fileSchema> {
+  private static read(file: string, logger: HostLogger | undefined): z.output<typeof fileSchema> {
     let text: string
     try {
       text = readFileSync(file, 'utf8')
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { hosts: [] }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { hosts: [], repos: [] }
       throw new Error(`dsh-repo 无法读取设置文件 ${file}：${(error as Error).message}`)
     }
     let raw: unknown
@@ -89,6 +123,8 @@ export class HostStore {
     } catch (error) {
       throw new Error(`dsh-repo 设置文件 ${file} 不是合法 JSON：${(error as Error).message}`)
     }
+    const dropped = dropRetired(raw)
+    if (dropped.length > 0) logger?.warn?.(`dsh-repo: 设置文件 ${file} 中的 ${dropped.join('、')} 已由仓库清单取代，已忽略，下次保存时删除；可访问的仓库和每个仓库的权限请在「代码仓库 → 仓库」中配置`)
     const parsed = fileSchema.safeParse(raw)
     if (!parsed.success) throw new Error(`dsh-repo 设置文件 ${file} 内容不合法：${parsed.error.issues.map(issue => `${issue.path.join('.')}：${issue.message}`).join('；')}`)
     return parsed.data
@@ -106,6 +142,26 @@ export class HostStore {
    */
   setMirrorDir(dir: string | undefined): Promise<void> {
     return this.enqueue(() => this.write({ ...this.stored, mirrorDir: dir }))
+  }
+
+  /** @returns the repository catalog in order. */
+  repos(): readonly CatalogEntry[] {
+    return this.stored.repos
+  }
+
+  /**
+   * Persist a change of the repository catalog. `change` sees the catalog
+   * after every change queued before it.
+   * @param change - returns the catalog to store and the caller's result.
+   * @returns the result of `change`.
+   * @throws {RepoError} `unavailable` when the file cannot be written; whatever `change` throws. Nothing changes then.
+   */
+  updateRepos<T>(change: (current: readonly CatalogEntry[]) => { readonly repos: readonly CatalogEntry[]; readonly result: T }): Promise<T> {
+    return this.enqueue(async () => {
+      const { repos, result } = change(this.stored.repos)
+      await this.write({ ...this.stored, repos })
+      return result
+    })
   }
 
   /** @returns the run-time settings now in effect. */
@@ -208,6 +264,7 @@ export class HostStore {
     const content = {
       hosts: next.hosts,
       ...next.mirrorDir === undefined ? {} : { mirrorDir: next.mirrorDir },
+      ...next.repos.length === 0 ? {} : { repos: next.repos },
       ...Object.keys(overrides).length === 0 ? {} : { settings: overrides },
     }
     try {

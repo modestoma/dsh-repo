@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import type { DshRepoService } from '../src/contract.ts'
+import type { DshRepoService, RepoAccess } from '../src/contract.ts'
 import type { HostApproval, ToolDefinition, WorkingDirectoryService } from '../src/host.ts'
 import { RepoError } from '../src/errors.ts'
 import { createTools, toolOffered } from '../src/tools.ts'
@@ -22,11 +22,11 @@ function fakeService(overrides: Record<string, unknown> = {}): DshRepoService {
 /** The tools the settings offer, by name. */
 function tools(
   settings = testSettings(), service = fakeService(), approval?: HostApproval, workingDirectory?: WorkingDirectoryService,
-  authorize?: ToolDeps['authorize'],
+  authorize?: ToolDeps['authorize'], highest: RepoAccess | null = 'merge', allowed?: ToolDeps['allowed'],
 ): Map<string, ToolDefinition> {
   return new Map(createTools({
-    service, settings: () => settings.tools, approval: () => approval, workingDirectory: () => workingDirectory, ...authorize === undefined ? {} : { authorize },
-  }).filter(tool => toolOffered(tool.access, settings.tools)).map(tool => [tool.definition.name, tool.definition]))
+    service, settings: () => settings.tools, approval: () => approval, workingDirectory: () => workingDirectory, ...authorize === undefined ? {} : { authorize }, ...allowed === undefined ? {} : { allowed },
+  }).filter(tool => toolOffered(tool.access, settings.tools, highest ?? undefined)).map(tool => [tool.definition.name, tool.definition]))
 }
 
 /** A Session rooted at a fresh directory whose effective directory starts at `sub`. */
@@ -48,38 +48,71 @@ function checkout(dir: string): string {
 }
 
 describe('createTools', () => {
-  it('offers reads, writes, and merge according to the settings', () => {
+  it('offers reads, writes, and merge according to the settings and the highest catalog access', () => {
     expect([...tools().keys()]).toEqual([
-      'repo_info', 'repo_list_branches', 'repo_list_commits', 'repo_list_tree', 'repo_read_file',
+      'repo_list', 'repo_info', 'repo_list_branches', 'repo_list_commits', 'repo_list_tree', 'repo_read_file',
       'repo_issue_list', 'repo_issue_get', 'repo_mr_list', 'repo_mr_get', 'repo_mr_diff', 'repo_mr_status',
       'repo_ci_runs', 'repo_ci_run', 'repo_ci_job_log',
       'repo_workspace_open', 'repo_workspace_changes', 'repo_mr_watch',
       'repo_workspace_push', 'repo_issue_create', 'repo_issue_update', 'repo_issue_comment', 'repo_mr_create', 'repo_mr_update', 'repo_mr_comment', 'repo_branch_delete',
-      'repo_ci_retry', 'repo_ci_cancel',
+      'repo_ci_retry', 'repo_ci_cancel', 'repo_mr_merge',
     ])
-    expect(tools(testSettings({ tools: { writes: 'off', merge: true } })).has('repo_issue_create')).toBe(false)
+    expect(tools(testSettings({ tools: { writes: 'off' } })).has('repo_issue_create')).toBe(false)
+    expect(tools(testSettings({ tools: { writes: 'off' } })).has('repo_mr_merge')).toBe(false)
     expect(tools(testSettings({ tools: { writes: 'off' } })).has('repo_workspace_push')).toBe(false)
-    expect(tools(testSettings({ tools: { merge: true } })).has('repo_mr_merge')).toBe(true)
+    const writeOnly = tools(testSettings(), fakeService(), undefined, undefined, undefined, 'write')
+    expect(writeOnly.has('repo_issue_create')).toBe(true)
+    expect(writeOnly.has('repo_mr_merge')).toBe(false)
+    const readOnly = tools(testSettings(), fakeService(), undefined, undefined, undefined, 'read')
+    expect(readOnly.has('repo_read_file')).toBe(true)
+    expect(readOnly.has('repo_mr_watch')).toBe(true)
+    expect(readOnly.has('repo_workspace_push')).toBe(false)
+    expect(tools(testSettings(), fakeService(), undefined, undefined, undefined, null).size).toBe(0)
     expect(tools(testSettings({ tools: { enabled: false } })).size).toBe(0)
   })
 
+  it('checks the repository\'s catalog access before asking anyone', async () => {
+    const request = vi.fn(async () => 'allowed-once' as const)
+    const authorize = vi.fn(async () => undefined)
+    const createIssue = vi.fn(async () => ({ number: 1 }))
+    const mergeChange = vi.fn(async () => ({ merged: true }))
+    const allowed = vi.fn((repo: string, level: RepoAccess) => {
+      if (level === 'merge') throw new RepoError('not-allowed', `${repo} 在仓库清单中的权限是「可改代码」`)
+    })
+    const { exec: inSession } = session()
+    const offered = tools(testSettings(), fakeService({ createIssue, mergeChange }), { request }, undefined, authorize, 'merge', allowed)
+    expect(await offered.get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'Bug' }, inSession)).toEqual({ number: 1 })
+    expect(allowed).toHaveBeenLastCalledWith('github.com/a/b', 'write')
+    await expect(offered.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, inSession)).rejects.toThrow(/\[not-allowed\].*可改代码/)
+    expect(allowed).toHaveBeenLastCalledWith('github.com/a/b', 'merge')
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(authorize).toHaveBeenCalledTimes(1)
+    expect(mergeChange).not.toHaveBeenCalled()
+  })
+
+  it('lists the catalog with each repository\'s branch and access', async () => {
+    const listRepos = vi.fn(() => [{ id: 'a'.repeat(12), url: 'https://github.com/a/b', branch: 'main', access: 'write', features: ['log-analysis'] }, { id: 'b'.repeat(12), url: 'https://github.com/a/c', access: 'read', features: [] }])
+    expect(await tools(testSettings(), fakeService({ listRepos })).get('repo_list')!.execute({}, exec)).toEqual({
+      repos: [{ url: 'https://github.com/a/b', branch: 'main', access: 'write' }, { url: 'https://github.com/a/c', access: 'read' }],
+    })
+  })
+
   it('follows settings saved after the tools were built', async () => {
-    let settings = testSettings({ tools: { writes: 'allow', merge: true } })
+    let settings = testSettings({ tools: { writes: 'allow' } })
     const createIssue = vi.fn(async () => ({ number: 1 }))
     const mergeChange = vi.fn(async () => ({ merged: true }))
     const built = new Map(createTools({ service: fakeService({ createIssue, mergeChange }), settings: () => settings.tools, approval: () => undefined, workingDirectory: () => undefined })
       .map(tool => [tool.definition.name, tool.definition]))
     expect(await built.get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'Bug' }, exec)).toEqual({ number: 1 })
-    settings = testSettings({ tools: { writes: 'allow' } })
-    await expect(built.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)).rejects.toThrow(/\[forbidden\].*合并/)
     settings = testSettings({ tools: { writes: 'off' } })
+    await expect(built.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)).rejects.toThrow(/\[forbidden\].*关闭写操作/)
     await expect(built.get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'Bug' }, exec)).rejects.toThrow(/\[forbidden\].*关闭写操作/)
     expect(createIssue).toHaveBeenCalledTimes(1)
     expect(mergeChange).not.toHaveBeenCalled()
   })
 
   it('deletes source branches on create and merge as the settings say, and asks before deleting a merged branch', async () => {
-    let settings = testSettings({ tools: { writes: 'allow', merge: true } })
+    let settings = testSettings({ tools: { writes: 'allow' } })
     const createChange = vi.fn(async () => ({ number: 1 }))
     const mergeChange = vi.fn(async () => ({ sha: 'm1' }))
     const deleteMergedBranch = vi.fn(async () => ({ branch: 'f' }))
@@ -89,14 +122,14 @@ describe('createTools', () => {
     await built.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)
     expect(createChange).toHaveBeenLastCalledWith('github.com/a/b', expect.objectContaining({ deleteSourceBranch: true }))
     expect(mergeChange).toHaveBeenLastCalledWith('github.com/a/b', 1, expect.objectContaining({ deleteSourceBranch: true }))
-    settings = testSettings({ tools: { writes: 'allow', merge: true, deleteSourceBranch: false } })
+    settings = testSettings({ tools: { writes: 'allow', deleteSourceBranch: false } })
     await built.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'T', sourceBranch: 'f' }, exec)
     await built.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)
     expect(createChange).toHaveBeenLastCalledWith('github.com/a/b', expect.objectContaining({ deleteSourceBranch: false }))
     expect(mergeChange).toHaveBeenLastCalledWith('github.com/a/b', 1, expect.objectContaining({ deleteSourceBranch: false }))
 
     const request = vi.fn(async () => 'allowed-once' as const)
-    const asked = tools(testSettings({ tools: { merge: true } }), fakeService({ deleteMergedBranch, mergeChange }), { request })
+    const asked = tools(testSettings(), fakeService({ deleteMergedBranch, mergeChange }), { request })
     expect(await asked.get('repo_branch_delete')!.execute({ repo: 'github.com/a/b', branch: 'f' }, exec)).toEqual({ branch: 'f' })
     expect(deleteMergedBranch).toHaveBeenCalledWith('github.com/a/b', 'f', { signal: exec.signal })
     expect(request).toHaveBeenLastCalledWith(expect.objectContaining({ toolName: 'repo_branch_delete', reason: '删除已合并的分支\n仓库：github.com/a/b\n分支：f' }))
@@ -430,6 +463,6 @@ describe('createTools', () => {
     await expect(tool.definition.execute({ repo: 'github.com/a/b', number: 7 }, run)).rejects.toThrow(/\[invalid\].*已合并/)
     watch.active = false
     await expect(tool.definition.execute({ repo: 'github.com/a/b', number: 7 }, run)).rejects.toThrow(/\[unavailable\]/)
-    expect(toolOffered('watch', testSettings({ tools: { enabled: false } }).tools)).toBe(false)
+    expect(toolOffered('watch', testSettings({ tools: { enabled: false } }).tools, 'merge')).toBe(false)
   })
 })

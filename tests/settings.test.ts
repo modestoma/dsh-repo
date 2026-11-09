@@ -156,13 +156,12 @@ describe('settings routes', () => {
     const initial = (await call('/dsh-repo/state')).body as unknown as SettingsState
     expect(initial.settings).toEqual(initial.defaults)
     expect(initial.file).toBe(file)
-    const next = { ...initial.defaults, repos: ['github.com/modestoma/*'], tools: { ...initial.defaults.tools, writes: 'off' }, limits: { ...initial.defaults.limits, perPage: 20 } }
+    const next = { ...initial.defaults, tools: { ...initial.defaults.tools, writes: 'off' }, limits: { ...initial.defaults.limits, perPage: 20 } }
     let response = await call('/dsh-repo/settings', json('PUT', next))
     expect(response.status).toBe(200)
     expect((response.body.state as SettingsState).settings).toEqual(next)
     expect(service.settings.tools.writes).toBe('off')
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ hosts: [], settings: { repos: ['github.com/modestoma/*'], tools: { writes: 'off' }, limits: { perPage: 20 } } })
-    expect(() => service.resolve('github.com/other/repo')).toThrow(expect.objectContaining({ code: 'not-allowed' }))
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ hosts: [], settings: { tools: { writes: 'off' }, limits: { perPage: 20 } } })
 
     expect((await serve(undefined, {}, env.DSH_HOME)).service.settings).toEqual(next)
 
@@ -215,7 +214,7 @@ describe('settings routes', () => {
     expect(((await (await serve()).call('/dsh-repo/state')).body as unknown as SettingsState).watchAvailable).toBe(false)
   })
 
-  it('adds, syncs, changes, and removes local syncs, and measures the mirror directory', async () => {
+  it('adds, changes, syncs, and removes catalog repositories with their local syncs, and measures the mirror directory', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'dsh-repo-settings-origin-'))
     const author = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
     execFileSync('git', ['init', '--quiet', '--initial-branch=main'], { cwd: repo })
@@ -223,34 +222,45 @@ describe('settings routes', () => {
     writeFileSync(join(repo, 'skill-a', 'SKILL.md'), 'a\n')
     execFileSync('git', ['add', '.'], { cwd: repo })
     execFileSync('git', ['commit', '--quiet', '-m', 'init'], { cwd: repo, env: author })
-    const { call, json, env } = await serve()
+    const { call, json, env, service } = await serve()
+    const file = join(env.DSH_HOME, 'dsh-repo', 'hosts.json')
     const dir = join(env.DSH_HOME, 'shared-skills')
+    const changes: number[] = []
+    service.onReposChange(() => { changes.push(service.listRepos().length) })
+    const dispose = service.registerFeature({ id: 'log-analysis', title: '日志分析' })
+    expect(((await call('/dsh-repo/state')).body as unknown as SettingsState).features).toEqual([{ id: 'log-analysis', title: '日志分析' }])
 
-    // Without a mirror directory the sync is recorded but its first run fails with the refusal.
-    let response = await call('/dsh-repo/syncs', json('POST', { url: repo, dir }))
+    // Without a mirror directory the entry is stored but its first sync fails with the refusal.
+    let response = await call('/dsh-repo/repos', json('POST', { url: repo, access: 'read', features: [], localSync: { enabled: true, dir } }))
     expect(response.status).toBe(200)
-    expect((response.body.state as SettingsState).syncs[0]).toMatchObject({ state: 'idle', error: expect.stringContaining('镜像目录未设置') })
-    expect((await call('/dsh-repo/syncs', json('DELETE', { id: (response.body.state as SettingsState).syncs[0]?.id }))).status).toBe(200)
+    let [row] = (response.body.state as SettingsState).repos
+    expect(row).toMatchObject({ url: repo, access: 'read', key: repo, sync: { state: 'idle', error: expect.stringContaining('镜像目录未设置') } })
+    expect((await call('/dsh-repo/repos', json('DELETE', { id: row?.id }))).status).toBe(200)
     const mirrors = join(mkdtempSync(join(tmpdir(), 'dsh-repo-settings-mirrors-')), 'mirrors')
     expect((await call('/dsh-repo/mirror', json('PUT', { dir: mirrors }))).status).toBe(200)
 
-    response = await call('/dsh-repo/syncs', json('POST', { url: repo, dir }))
+    response = await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir } }))
     expect(response.status).toBe(200)
-    const [added] = (response.body.state as SettingsState).syncs
-    expect(added).toMatchObject({ url: repo, dir, intervalMinutes: 720, syncedBranch: 'main', state: 'idle' })
+    ;[row] = (response.body.state as SettingsState).repos
+    expect(row).toMatchObject({ url: repo, access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir, intervalMinutes: 720 }, sync: { syncedBranch: 'main', state: 'idle' } })
     expect(readFileSync(join(dir, 'skill-a', 'SKILL.md'), 'utf8')).toBe('a\n')
-    expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'syncs.json'), 'utf8')).syncs).toHaveLength(1)
+    expect(JSON.parse(readFileSync(file, 'utf8')).repos).toEqual([expect.objectContaining({ id: row?.id, url: repo, access: 'write' })])
+    expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'local-syncs.json'), 'utf8')).syncs).toHaveLength(1)
+    expect(service.listRepos({ feature: 'log-analysis' })).toEqual([{ id: row?.id, url: repo, access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir, intervalMinutes: 720 } }])
 
     writeFileSync(join(repo, 'skill-a', 'SKILL.md'), 'a2\n')
     execFileSync('git', ['commit', '--quiet', '-am', 'two'], { cwd: repo, env: author })
-    response = await call('/dsh-repo/syncs/run', json('POST', { id: added?.id }))
+    await call('/dsh-repo/repos/sync', json('POST', { id: row?.id }))
     expect(readFileSync(join(dir, 'skill-a', 'SKILL.md'), 'utf8')).toBe('a2\n')
-    response = await call('/dsh-repo/syncs', json('PUT', { id: added?.id, url: repo, dir, intervalMinutes: 60 }))
-    expect((response.body.state as SettingsState).syncs[0]?.intervalMinutes).toBe(60)
+    response = await call('/dsh-repo/repos', json('PUT', { id: row?.id, url: repo, access: 'merge', features: [], localSync: { enabled: true, dir, intervalMinutes: 60 } }))
+    expect((response.body.state as SettingsState).repos[0]).toMatchObject({ access: 'merge', features: [], localSync: { intervalMinutes: 60 } })
+    expect(service.listRepos({ feature: 'log-analysis' })).toEqual([])
 
-    expect((await call('/dsh-repo/syncs', json('POST', { url: repo, dir: join(dir, 'inner') }))).status).toBe(409)
-    expect((await call('/dsh-repo/syncs', json('POST', { url: 'git@x:y.git', dir: join(env.DSH_HOME, 'x') }))).status).toBe(400)
-    expect((await call('/dsh-repo/syncs/run', json('POST', { id: 'missing' }))).status).toBe(404)
+    expect((await call('/dsh-repo/repos', json('POST', { url: repo, access: 'read', features: [] }))).status).toBe(409)
+    expect((await call('/dsh-repo/repos', json('POST', { url: 'git@x:y.git', access: 'read', features: [] }))).status).toBe(400)
+    expect((await call('/dsh-repo/repos', json('POST', { url: repo, access: 'admin', features: [] }))).status).toBe(400)
+    expect((await call('/dsh-repo/repos', json('PUT', { id: '000000000000', url: repo, access: 'read', features: [] }))).status).toBe(404)
+    expect((await call('/dsh-repo/repos/sync', json('POST', { id: 'missing' }))).status).toBe(404)
 
     const usage = (await call('/dsh-repo/mirror-usage')).body as unknown as MirrorUsage
     expect(usage.root).toBe(mirrors)
@@ -259,15 +269,31 @@ describe('settings routes', () => {
     expect(usage.mirrors[0]?.bytes).toBeGreaterThan(0)
     expect(usage.totalBytes).toBeGreaterThanOrEqual(usage.mirrors[0]?.bytes ?? 0)
 
-    response = await call('/dsh-repo/syncs', json('DELETE', { id: added?.id }))
-    expect((response.body.state as SettingsState).syncs).toEqual([])
+    response = await call('/dsh-repo/repos', json('DELETE', { id: row?.id }))
+    expect((response.body.state as SettingsState).repos).toEqual([])
     expect(existsSync(join(dir, 'skill-a', 'SKILL.md'))).toBe(true)
-    expect((await call('/dsh-repo/syncs', json('DELETE', { id: added?.id }))).status).toBe(404)
+    expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'local-syncs.json'), 'utf8'))).toEqual({ syncs: [] })
+    expect((await call('/dsh-repo/repos', json('DELETE', { id: row?.id }))).status).toBe(404)
+    expect(changes).toEqual([0, 1, 0, 1, 1, 0])
+    dispose()
+    expect(((await call('/dsh-repo/state')).body as unknown as SettingsState).features).toEqual([])
+  })
+
+  it('reports catalog entries whose host is no longer configured', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-repo-settings-'))
+    mkdirSync(join(home, 'dsh-repo'))
+    const entry = { id: 'abcdefabcdef', url: 'https://gone.example.com/a/b', access: 'read', features: ['old-feature'], addedAt: '2026-11-09T00:00:00.000Z' }
+    writeFileSync(join(home, 'dsh-repo', 'hosts.json'), JSON.stringify({ hosts: [], repos: [entry] }))
+    const { call, service } = await serve(undefined, {}, home)
+    const [row] = ((await call('/dsh-repo/state')).body as unknown as SettingsState).repos
+    expect(row).toMatchObject({ id: entry.id, url: entry.url, features: ['old-feature'], problem: expect.stringContaining('gone.example.com') })
+    expect(row?.key).toBeUndefined()
+    expect(() => service.resolve('https://gone.example.com/a/b')).toThrow(expect.objectContaining({ code: 'not-allowed' }))
   })
 
   it('removes its routes when the Web server goes away', async () => {
     const { routes, disposers } = await serve()
-    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/mirror-usage', '/dsh-repo/pick-directory', '/dsh-repo/settings', '/dsh-repo/state', '/dsh-repo/syncs', '/dsh-repo/syncs/run', '/dsh-repo/watches'])
+    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/mirror-usage', '/dsh-repo/pick-directory', '/dsh-repo/repos', '/dsh-repo/repos/sync', '/dsh-repo/settings', '/dsh-repo/state', '/dsh-repo/watches'])
     for (const dispose of disposers) dispose()
     expect(routes.size).toBe(0)
   })

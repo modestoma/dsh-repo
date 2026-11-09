@@ -10,7 +10,7 @@ import { dirname, join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { ForgeKind } from './contract.ts'
 import { RepoError } from './errors.ts'
-import { MAX_REPO_PATTERNS, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS } from './settings/contract.ts'
+import { MAX_SIGNATURE_LENGTH, SETTING_BOUNDS } from './settings/contract.ts'
 import type { RepoSettingsWire } from './settings/contract.ts'
 
 
@@ -22,9 +22,6 @@ function bounded(name: keyof typeof SETTING_BOUNDS) {
 
 /** Credential reference names: environment-variable style. */
 export const TOKEN_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
-
-/** Repository pattern: `host[:port]/seg/…`, the last segment may be `*` (one level) or `**` (any depth). */
-const REPO_PATTERN = /^[a-z0-9.-]+(:\d+)?(\/[A-Za-z0-9._-]+)*(\/(\*|\*\*|[A-Za-z0-9._-]+))$/
 
 /**
  * Normalize a host address to `https://host[:port][/path]` with a lowercase
@@ -83,8 +80,6 @@ const limitsSchema = z.object({
 const mirrorSchema = z.object({
   /** Timeout of one git command (clone, fetch, worktree, push). */
   gitTimeoutMs: bounded('gitTimeoutMs').default(10 * 60 * 1000),
-  /** Whether addresses on hosts outside the host list may be mirrored with the machine's own git credentials. */
-  otherHosts: z.boolean().default(true),
 }).strict()
 
 const toolsSchema = z.object({
@@ -92,8 +87,6 @@ const toolsSchema = z.object({
   enabled: z.boolean().default(true),
   /** `ask`: every write asks the user once; `allow`: writes run without asking; `off`: write tools are not offered. */
   writes: z.enum(['ask', 'allow', 'off']).default('ask'),
-  /** Whether the merge tool is offered; it always follows `writes` for approval. */
-  merge: z.boolean().default(false),
   /** Whether PRs/MRs merged through the tools, and GitLab MRs opened through them (by any merge), drop their source branch. */
   deleteSourceBranch: z.boolean().default(true),
   /** Appended (after a blank line) to issue, change request, and comment bodies written through tools; empty = none. */
@@ -151,8 +144,6 @@ const watchSchema = z.object({
  * object (the stored overrides) parses to complete settings.
  */
 export const repoSettingsSchema = z.object({
-  /** Reachable repositories; empty = every repository on the hosts. */
-  repos: z.array(z.string().trim().toLowerCase().regex(REPO_PATTERN, '仓库格式：主机/路径，末段可以是 *（一层）或 **（任意层），例如 github.com/modestoma/*')).max(MAX_REPO_PATTERNS).default([]),
   /** Deadline of one API call. */
   timeoutMs: bounded('timeoutMs').default(30_000),
   limits: limitsSchema.prefault({}),
@@ -211,7 +202,6 @@ export function settingsOverrides(settings: RepoSettings): SettingsOverrides {
   const changedWatch = changedFields(watchFields, defaultWatchFields)
   const watch = changedWatch === undefined && events === undefined ? undefined : { ...changedWatch, ...events === undefined ? {} : { events } }
   return {
-    ...settings.repos.length === 0 ? {} : { repos: settings.repos },
     ...settings.timeoutMs === DEFAULT_SETTINGS.timeoutMs ? {} : { timeoutMs: settings.timeoutMs },
     ...limits === undefined ? {} : { limits },
     ...tools === undefined ? {} : { tools },
@@ -233,7 +223,7 @@ export const pluginConfigSchema = z.object({
       seen.add(host.url)
     }
   }),
-  /** Settings file holding added hosts, the mirror directory, and the run-time settings; default `$DSH_HOME/dsh-repo/hosts.json`. */
+  /** Settings file holding added hosts, the mirror directory, the repository catalog, and the run-time settings; default `$DSH_HOME/dsh-repo/hosts.json`. */
   hostsFile: z.string().trim().min(1, '设置文件路径不能为空').optional(),
 }).strict().prefault({})
 
@@ -306,12 +296,13 @@ export function watchesFile(settingsFile: string): string {
 }
 
 /**
- * The file local syncs are kept in: `syncs.json` next to the settings file.
+ * The file each local sync's progress is kept in: `local-syncs.json` next to
+ * the settings file. Which repositories sync where lives in the catalog.
  * @param settingsFile - absolute path of the settings file.
  * @returns absolute path.
  */
 export function syncsFile(settingsFile: string): string {
-  return join(dirname(settingsFile), 'syncs.json')
+  return join(dirname(settingsFile), 'local-syncs.json')
 }
 
 /**
