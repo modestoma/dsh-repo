@@ -7,9 +7,6 @@
  * @module dsh-repo/api
  */
 
-import { constants } from 'node:fs'
-import { access, mkdir } from 'node:fs/promises'
-import { isAbsolute, resolve } from 'node:path'
 import type {
   BranchDeleteParams, BranchGetParams, BranchInfo, BranchListParams, CallerAgent, CallOptions, CatalogRepo, CiActionParams, CiActionResult, CiGetParams, CiJobLog, CiListParams, CiLogParams,
   CiRun, CiRunDetail, CommentInfo, CommentParams, CommitInfo, CommitListParams, DshRepoService, FileContent, FileReadParams, HostCreate, HostInfo, HostsChange, IssueCreateParams, IssueDetail,
@@ -18,11 +15,11 @@ import type {
   SnapshotLease, TreeListing, TreeListParams, WatchState, WorkspaceCreateParams, WorkspaceInfo, WorkspaceListParams, WorkspacePathParams, WorkspacePushParams, WorkspacePushResult,
   WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceStatus, WriteOptions,
 } from './contract.ts'
-import { expandHome } from './config.ts'
 import { RepoError, toRepoError } from './errors.ts'
 import { execute, operationOf } from './operations.ts'
 import type { OperationDeps } from './operations.ts'
 import type { RepoService } from './service.ts'
+import { usableDirectory } from './workspace/panel.ts'
 
 /** Collaborators of the service object beyond the operations'. */
 export interface ApiDeps extends OperationDeps {
@@ -154,23 +151,4 @@ export class DshReposApi implements DshRepoService {
       throw error instanceof RepoError ? error : toRepoError(error, method)
     }
   }
-}
-
-/**
- * A directory the settings page may create workspaces in, created when missing.
- * @param dir - absolute path; `~` expands.
- * @returns the absolute directory.
- * @throws {RepoError} `invalid` for a relative path or one that cannot be created or written.
- */
-async function usableDirectory(dir: string): Promise<string> {
-  const expanded = expandHome(dir.trim())
-  if (!isAbsolute(expanded)) throw new RepoError('invalid', `工作区目录必须是绝对路径：${dir}`)
-  const target = resolve(expanded)
-  try {
-    await mkdir(target, { recursive: true })
-    await access(target, constants.W_OK)
-  } catch (error) {
-    throw new RepoError('invalid', `无法创建或写入工作区目录 ${target}：${error instanceof Error ? error.message : String(error)}`)
-  }
-  return target
 }

@@ -19,8 +19,7 @@
  */
 
 import { z } from 'zod'
-import { basename, isAbsolute, join, resolve } from 'node:path'
-import { lstat } from 'node:fs/promises'
+import { basename, isAbsolute, resolve } from 'node:path'
 import type {
   AuthorizeLevel, CallerAgent, CommitAuthor, MrInfo, MrSummary, RepoAccess, WorkspaceInfo, WorkspacePushResult,
 } from './contract.ts'
@@ -30,7 +29,7 @@ import { RepoError } from './errors.ts'
 import { authorize, collectDetails } from './events.ts'
 import type { ParallelDispatch } from './events.ts'
 import type { Agent, HostApproval, WorkingDirectoryService } from './host.ts'
-import { realPathOf, within } from './paths.ts'
+import { freeDirectory, realPathOf, within } from './paths.ts'
 import { pushPrompt } from './push-prompt.ts'
 import type { RepoService } from './service.ts'
 import type { WatchInfo } from './settings/contract.ts'
@@ -200,16 +199,6 @@ function summary(mr: MrInfo): MrSummary {
   return { number: mr.number, title: mr.title, targetBranch: mr.targetBranch, webUrl: mr.webUrl }
 }
 
-async function present(path: string): Promise<boolean> {
-  try {
-    await lstat(path)
-    return true
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-    throw error
-  }
-}
-
 /** The Agent's effective directory, or its Session's original directory without the working-directory service. */
 async function currentDirectory(deps: OperationDeps, agent: CallerAgent, signal: AbortSignal): Promise<string> {
   const host = agent as Agent
@@ -228,14 +217,6 @@ async function workspaceTarget(deps: OperationDeps, path: string | undefined, ca
   if (path !== undefined && isAbsolute(path)) return path
   const current = await currentDirectory(deps, agent, caller.signal)
   return path === undefined ? current : resolve(current, path)
-}
-
-/** The first of `<parent>/<name>`, `<parent>/<name>-2`, … that does not exist. */
-async function freeDirectory(parent: string, name: string): Promise<string> {
-  for (let index = 1; ; index += 1) {
-    const candidate = join(parent, index === 1 ? name : `${name}-${index}`)
-    if (!await present(candidate)) return candidate
-  }
 }
 
 /** The catalog address of a repository target. */

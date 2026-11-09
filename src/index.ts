@@ -36,6 +36,7 @@ import { ChangeWatcher } from './watch/watcher.ts'
 import type { ParallelDispatch } from './events.ts'
 import { WorkspaceManager } from './workspace/manager.ts'
 import type { WorkspaceGit } from './workspace/manager.ts'
+import { workspacePanel } from './workspace/panel.ts'
 import { GitProxy } from './workspace/proxy.ts'
 import type { WorkspaceRecord } from './workspace/registry.ts'
 import { WorkspaceRegistry, workspacesFile } from './workspace/registry.ts'
@@ -95,6 +96,7 @@ export { WATCH_EVENT_KINDS, WATCHES_ROUTE } from './settings/contract.ts'
 export type { WatchAction, WatchEventKind, WatchInfo } from './settings/contract.ts'
 export type { ActivityItem, ActivityRequest, ChangeActivity } from './providers/types.ts'
 export type { SyncList, WatchList } from './settings/routes.ts'
+export type { WorkspacePanel } from './workspace/panel.ts'
 export { repoRows } from './settings/routes.ts'
 export { ACCESS_LEVELS, DEFAULT_SYNC_INTERVAL_MINUTES, MAX_REPO_FEATURES, MAX_REPOS, MIRROR_USAGE_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SYNC_INTERVAL_BOUNDS } from './settings/contract.ts'
 export type { LocalSyncStatus, MirrorUsage, MirrorUsageEntry, RepoInput, RepoRow } from './settings/contract.ts'
@@ -241,7 +243,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
       void syncer.stop()
     }
   }, 'dsh-repo: local syncs')
-  mountSettingsRoutes(ctx, service, watcher, syncer)
+  mountSettingsRoutes(ctx, service, watcher, syncer, workspacePanel(service, workspaces, () => proxy.port))
   if (service.catalog.entries().length === 0) ctx.logger?.info?.('dsh-repo: 仓库清单为空，代码仓库工具在「代码仓库 → 仓库」添加仓库后提供')
   for (const { definition, access } of createTools(operations)) {
     ctx.effect(() => ctx.tools.register(definition, {

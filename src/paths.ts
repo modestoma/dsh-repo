@@ -6,7 +6,7 @@
  * @module dsh-repo/paths
  */
 
-import { realpath } from 'node:fs/promises'
+import { lstat, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 
 /**
@@ -55,4 +55,33 @@ export function overlaps(a: string, b: string, real: ReadonlyMap<string, string>
   const ra = real.get(a) ?? a
   const rb = real.get(b) ?? b
   return within(a, b) || within(b, a) || within(ra, rb) || within(rb, ra)
+}
+
+/**
+ * Whether a path exists, without following a final symbolic link.
+ * @param path - absolute path.
+ * @returns whether anything is there.
+ * @throws the file system error other than a missing path.
+ */
+export async function present(path: string): Promise<boolean> {
+  try {
+    await lstat(path)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
+/**
+ * The first of `<parent>/<name>`, `<parent>/<name>-2`, … that does not exist.
+ * @param parent - absolute directory.
+ * @param name - preferred name.
+ * @returns the absolute path.
+ */
+export async function freeDirectory(parent: string, name: string): Promise<string> {
+  for (let index = 1; ; index += 1) {
+    const candidate = join(parent, index === 1 ? name : `${name}-${index}`)
+    if (!await present(candidate)) return candidate
+  }
 }

@@ -35,6 +35,10 @@ export const REPOS_ROUTE = '/dsh-repo/repos'
 export const REPO_SYNC_ROUTE = '/dsh-repo/repos/sync'
 /** GET：{@link MirrorUsage}，镜像目录里的仓库和占用空间。 */
 export const MIRROR_USAGE_ROUTE = '/dsh-repo/mirror-usage'
+/** GET：{@link WorkspaceRows}；POST：body {@link WorkspaceCreateInput} 新建工作区，响应 {@link WorkspaceCreated}；DELETE：body `{ id, force? }` 删除工作区，有未提交改动或未推送提交且没有 `force` 时 409。 */
+export const WORKSPACES_ROUTE = '/dsh-repo/workspaces'
+/** PUT：body `{ dir }` 设置设置页新建工作区的目录（不存在会创建）；DELETE：清除。 */
+export const WORKSPACE_DIR_ROUTE = '/dsh-repo/workspace-dir'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
@@ -233,6 +237,68 @@ export interface MirrorUsage {
   totalBytes: number
 }
 
+/** A workspace as the settings page submits it. */
+export interface WorkspaceCreateInput {
+  /** Catalog entry id of the repository. */
+  repo: string
+  /** Branch the work merges into and starts from; missing or empty uses the default branch. */
+  base?: string
+  /** Branch to push to; an existing one is continued. Missing or empty: `dsh/<random>`. */
+  branch?: string
+  /** Name of the new directory under the workspace directory; missing or empty: the repository name, numbered when taken. */
+  name?: string
+}
+
+/** One open PR/MR from a workspace's branch. */
+export interface WorkspaceMr {
+  number: number
+  title: string
+  webUrl: string
+}
+
+/** One workspace as the settings page lists it. */
+export interface WorkspaceRow {
+  id: string
+  /** Catalog address of the repository. */
+  url: string
+  /** `host/path`, or the local path. */
+  repo: string
+  /** Absolute directory. */
+  path: string
+  /** Branch the work merges into. */
+  base: string
+  /** Remote branch the workspace pushes to. */
+  branch: string
+  /** Session that created it; absent for one the settings page created. */
+  session?: string
+  createdAt: string
+  /** Local branch checked out now; absent on a detached head or when the state could not be read. */
+  currentBranch?: string
+  /** Changed files not committed; absent when the state could not be read. */
+  uncommittedFiles?: number
+  /** Commits only this clone holds; absent when the state could not be read. */
+  unpushed?: number
+  /** Latest git activity; absent when the state could not be read. */
+  activityAt?: string
+  /** Open PRs/MRs from {@link branch}; absent for a local repository or when the host could not be asked. */
+  mrs?: WorkspaceMr[]
+  /** Why the state or the PRs/MRs could not be read. */
+  error?: string
+}
+
+/** `GET /dsh-repo/workspaces` response. */
+export interface WorkspaceRows {
+  ok: true
+  /** Oldest first. */
+  workspaces: WorkspaceRow[]
+}
+
+/** `POST /dsh-repo/workspaces` response. */
+export interface WorkspaceCreated {
+  ok: true
+  workspace: WorkspaceRow
+}
+
 /** Body of a host addition. */
 export interface HostAddRequest {
   /** Default `gitlab`. */
@@ -265,6 +331,12 @@ export interface SettingsState {
   repos: readonly RepoRow[]
   /** Features other plugins registered, in registration order. */
   features: readonly RepoFeature[]
+  /** Workspaces: whether this composition can create them, the directory the page creates them in, and the port the local git proxy listens on. */
+  workspace: {
+    available: boolean
+    dir?: string
+    proxyListening?: number
+  }
 }
 
 /** `POST /dsh-repo/pick-directory` response: the chosen path, or null when cancelled. */
