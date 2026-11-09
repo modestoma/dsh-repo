@@ -57,7 +57,7 @@ async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {},
   plugin.apply(ctx, remote === undefined ? { hosts: [github] } : remoteConfig([github]), {
     env,
     forbiddenMirrorRoots: [env.DSH_HOME],
-    ...remote === undefined ? {} : { git: remote.git, providerFactory: stubProviders({ getBranch: async () => undefined, listChanges: async () => ({ items: [] }) }) },
+    ...remote === undefined ? {} : { git: remote.git, providerFactory: stubProviders({ getBranch: async () => undefined, listMrs: async () => ({ items: [] }) }) },
   })
   const http = createServer((req, res) => {
     const handler = routes.get(new URL(req.url ?? '/', 'http://x').pathname)

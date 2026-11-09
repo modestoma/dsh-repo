@@ -32,7 +32,7 @@ import { hostDelivery } from './watch/delivery.ts'
 import { SyncStore } from './sync/store.ts'
 import { LocalSyncer, syncRecords } from './sync/syncer.ts'
 import { WatchStore } from './watch/store.ts'
-import { ChangeWatcher } from './watch/watcher.ts'
+import { MrWatcher } from './watch/watcher.ts'
 import type { ParallelDispatch } from './events.ts'
 import { WorkspaceManager } from './workspace/manager.ts'
 import type { WorkspaceGit } from './workspace/manager.ts'
@@ -95,7 +95,7 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
     ...options.providerFactory === undefined ? {} : { factory: options.providerFactory },
   })
-  const watcher = new ChangeWatcher({
+  const watcher = new MrWatcher({
     service,
     store: new WatchStore(watchesFile(hosts.file), ctx.logger),
     settings: () => service.settings.watch,
@@ -191,12 +191,12 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
 }
 
 /** Watch the open requests from branches a workspace of a Session pushed through the proxy; best effort. */
-async function watchPushed(service: RepoService, watcher: ChangeWatcher, record: WorkspaceRecord, branches: readonly string[]): Promise<void> {
+async function watchPushed(service: RepoService, watcher: MrWatcher, record: WorkspaceRecord, branches: readonly string[]): Promise<void> {
   if (record.session === undefined || !watcher.active) return
   for (const branch of branches) {
     try {
-      const open = await service.listChanges(record.repo, { state: 'open', sourceBranch: branch, perPage: 20 })
-      for (const mr of open.items) await watcher.track({ repo: record.repo, change: mr, session: record.session, source: 'pushed', pushed: mr.headSha })
+      const open = await service.listMrs(record.repo, { state: 'open', sourceBranch: branch, perPage: 20 })
+      for (const mr of open.items) await watcher.track({ repo: record.repo, mr, session: record.session, source: 'pushed', pushed: mr.headSha })
     } catch {
       // Watching is a convenience: the push succeeded, and the model can still watch with repo_mr_watch.
     }

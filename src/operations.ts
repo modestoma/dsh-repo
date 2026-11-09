@@ -165,7 +165,7 @@ async function watchMr(deps: OperationDeps, repoTarget: string, mr: MrInfo, call
   const session = sessionOf(caller)
   if (deps.watch === undefined || !deps.watch.active || session === undefined || mr.state !== 'open') return { watching: false }
   try {
-    await deps.watch.track({ repo: repoTarget, change: mr, session, source, ...pushed === undefined ? {} : { pushed } })
+    await deps.watch.track({ repo: repoTarget, mr, session, source, ...pushed === undefined ? {} : { pushed } })
     return { watching: true }
   } catch (error) {
     return { watching: false, watchError: error instanceof Error ? error.message : String(error) }
@@ -189,7 +189,7 @@ async function rememberComment(deps: OperationDeps, repoTarget: string, mr: numb
 async function openMrsFrom(service: RepoService, repoTarget: string, branch: string, signal: AbortSignal): Promise<readonly MrInfo[]> {
   const found: MrInfo[] = []
   for (let next: number | undefined = 1; next !== undefined;) {
-    const result = await service.listChanges(repoTarget, { state: 'open', sourceBranch: branch, page: next, perPage: 100, signal })
+    const result = await service.listMrs(repoTarget, { state: 'open', sourceBranch: branch, page: next, perPage: 100, signal })
     found.push(...result.items)
     next = result.nextPage
   }
@@ -390,7 +390,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'List pull requests (GitHub) or merge requests (GitLab).',
     schema: z.object({ repo, state: z.enum(['open', 'closed', 'merged', 'all']).optional(), sourceBranch: z.string().optional().describe('Branch of this repository the PRs/MRs come from; ones from forks are left out'), targetBranch: z.string().optional(), page, perPage }).strict(),
-    run: (args, { service }, caller) => service.listChanges(args.repo, { ...args, signal: caller.signal }),
+    run: (args, { service }, caller) => service.listMrs(args.repo, { ...args, signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_get',
@@ -398,7 +398,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read one pull/merge request with its conversation comments.',
     schema: z.object({ repo, number }).strict(),
-    run: (args, { service }, caller) => service.getChange(args.repo, args.number, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.getMr(args.repo, args.number, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_diff',
@@ -406,7 +406,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read the unified diff of a pull/merge request. Long diffs are cut at the configured size limit.',
     schema: z.object({ repo, number }).strict(),
-    run: (args, { service }, caller) => service.changeDiff(args.repo, args.number, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.mrDiff(args.repo, args.number, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_status',
@@ -414,7 +414,7 @@ export const OPERATIONS: readonly Operation[] = [
     access: 'read',
     description: 'Read CI checks/pipeline and mergeability of a pull/merge request, with its head SHA.',
     schema: z.object({ repo, number }).strict(),
-    run: (args, { service }, caller) => service.changeStatus(args.repo, args.number, { signal: caller.signal }),
+    run: (args, { service }, caller) => service.mrStatus(args.repo, args.number, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_create',
@@ -432,7 +432,7 @@ export const OPERATIONS: readonly Operation[] = [
     },
     run: async (args, deps, caller) => {
       const { service } = deps
-      const mr = await service.createChange(args.repo, {
+      const mr = await service.createMr(args.repo, {
         ...args,
         ...args.body === undefined ? {} : { body: withSignature(args.body, service.settings.tools.signature) },
         deleteSourceBranch: service.settings.tools.deleteSourceBranch,
@@ -449,7 +449,7 @@ export const OPERATIONS: readonly Operation[] = [
     schema: z.object({ repo, number, title: z.string().min(1).optional(), body: mrBody, state: z.enum(['open', 'closed']).optional(), targetBranch: z.string().optional(), labels, assignees }).strict(),
     write: { level: 'write', authorize: 'code-write', prompt: args => ({ zh: `修改 ${args.repo} 的 PR/MR #${args.number}${stateSuffix(args.state)}`, en: `Update PR/MR #${args.number} in ${args.repo}` }) },
     run: async (args, deps, caller) => {
-      const mr = await deps.service.updateChange(args.repo, args.number, { ...args, signal: caller.signal })
+      const mr = await deps.service.updateMr(args.repo, args.number, { ...args, signal: caller.signal })
       return args.state === 'open' ? { ...mr, ...await watchMr(deps, args.repo, mr, caller, 'requested') } : mr
     },
   }),
@@ -461,7 +461,7 @@ export const OPERATIONS: readonly Operation[] = [
     schema: z.object({ repo, number, body: z.string().min(1) }).strict(),
     write: { level: 'write', authorize: 'code-write', prompt: args => ({ zh: `评论 ${args.repo} 的 PR/MR #${args.number}`, en: `Comment on PR/MR #${args.number} in ${args.repo}` }) },
     run: async (args, deps, caller) => {
-      const comment = await deps.service.commentChange(args.repo, args.number, withSignature(args.body, deps.service.settings.tools.signature) ?? args.body, { signal: caller.signal })
+      const comment = await deps.service.commentMr(args.repo, args.number, withSignature(args.body, deps.service.settings.tools.signature) ?? args.body, { signal: caller.signal })
       await rememberComment(deps, args.repo, args.number, comment.id)
       return comment
     },
@@ -483,7 +483,7 @@ export const OPERATIONS: readonly Operation[] = [
         }
       },
     },
-    run: (args, { service }, caller) => service.mergeChange(args.repo, args.number, {
+    run: (args, { service }, caller) => service.mergeMr(args.repo, args.number, {
       headSha: args.headSha,
       ...args.method === undefined ? {} : { method: args.method },
       deleteSourceBranch: service.settings.tools.deleteSourceBranch,
@@ -501,10 +501,10 @@ export const OPERATIONS: readonly Operation[] = [
       if (session === undefined) throw new RepoError('invalid', 'mrWatch 需要在会话中调用')
       if (deps.watch === undefined || !deps.watch.active) throw new RepoError('unavailable', 'PR/MR 跟踪没有开启，或当前 DSH 组合不能唤醒会话')
       if (args.watch === false) return { watching: false, stopped: await deps.watch.untrack(args.repo, args.number, session), number: args.number }
-      const mr = await deps.service.getChange(args.repo, args.number, { signal: caller.signal })
+      const mr = await deps.service.getMr(args.repo, args.number, { signal: caller.signal })
       if (mr.state !== 'open') throw new RepoError('invalid', `PR/MR #${args.number} ${mr.state === 'merged' ? '已合并' : '已关闭'}，不需要跟踪`)
       const { comments: _comments, ...info } = mr
-      const watched = await deps.watch.track({ repo: args.repo, change: info, session, source: 'requested' })
+      const watched = await deps.watch.track({ repo: args.repo, mr: info, session, source: 'requested' })
       return { watching: true, number: watched.number, title: watched.title, webUrl: watched.webUrl }
     },
   }),
@@ -525,7 +525,7 @@ export const OPERATIONS: readonly Operation[] = [
     run: (args, { service }, caller) => service.listCiRuns(args.repo, {
       ...args.ref === undefined ? {} : { ref: args.ref },
       ...args.sha === undefined ? {} : { sha: args.sha },
-      ...args.number === undefined ? {} : { change: args.number },
+      ...args.number === undefined ? {} : { mr: args.number },
       ...args.state === undefined ? {} : { state: args.state },
       ...args.page === undefined ? {} : { page: args.page },
       ...args.perPage === undefined ? {} : { perPage: args.perPage },
@@ -736,7 +736,7 @@ export const OPERATIONS: readonly Operation[] = [
       try {
         open = await openMrsFrom(service, record.repo, record.branch, caller.signal)
         if (args.mr !== undefined && open.length === 0) {
-          createdMr = await service.createChange(record.repo, {
+          createdMr = await service.createMr(record.repo, {
             title: args.mr.title,
             ...args.mr.body === undefined ? {} : { body: withSignature(args.mr.body, settings.tools.signature) ?? args.mr.body },
             sourceBranch: record.branch,

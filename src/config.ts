@@ -98,7 +98,7 @@ const toolsSchema = z.object({
   writes: z.enum(['ask', 'allow', 'off']).default('ask'),
   /** Whether PRs/MRs merged through the tools, and GitLab MRs opened through them (by any merge), drop their source branch. */
   deleteSourceBranch: z.boolean().default(true),
-  /** Appended (after a blank line) to issue, change request, and comment bodies written through tools; empty = none. */
+  /** Appended (after a blank line) to issue, PR/MR, and comment bodies written through tools; empty = none. */
   signature: z.string().max(MAX_SIGNATURE_LENGTH).default(''),
 }).strict()
 

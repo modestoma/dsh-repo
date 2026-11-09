@@ -14,7 +14,7 @@ import type {
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { capFailures, errorText, nextPage, okBody, titleOf, truncateBytes } from './types.ts'
-import type { ActivityItem, ActivityRequest, Call, ChangeActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, MrActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitLab's maximum page size. */
 const MAX_PAGE = 100
@@ -105,7 +105,7 @@ interface GitlabNote {
 
 /**
  * The activity of one note: user notes are comments; GitLab records approvals
- * and change requests as system notes with fixed English bodies; other
+ * and requested changes as system notes with fixed English bodies; other
  * system notes are not activity.
  */
 function noteKind(value: GitlabNote): ActivityItem['kind'] | undefined {
@@ -470,7 +470,7 @@ export class GitlabProvider implements Provider {
     return note(await this.api.IssueNotes.create(ref.path, number, body))
   }
 
-  async listChanges(ref: RepoRef, query: Paging & { state: MrState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
+  async listMrs(ref: RepoRef, query: Paging & { state: MrState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
     call.signal.throwIfAborted()
     const state = query.state === 'all' ? undefined : query.state === 'open' ? 'opened' as const : query.state
     const data = await this.api.MergeRequests.all({
@@ -485,7 +485,7 @@ export class GitlabProvider implements Provider {
     return { items: items.map(entry => mergeRequest(entry)), ...nextPage(query, data.length) }
   }
 
-  async getChange(ref: RepoRef, number: number, call: Call) {
+  async getMr(ref: RepoRef, number: number, call: Call) {
     call.signal.throwIfAborted()
     const [data, notes] = await Promise.all([
       this.api.MergeRequests.show(ref.path, number),
@@ -494,7 +494,7 @@ export class GitlabProvider implements Provider {
     return { ...mergeRequest(data), comments: notes.filter(entry => entry.system !== true).map(note) }
   }
 
-  async changeDiff(ref: RepoRef, number: number, call: Call) {
+  async mrDiff(ref: RepoRef, number: number, call: Call) {
     call.signal.throwIfAborted()
     const files = await this.api.MergeRequests.allDiffs(ref.path, number, { perPage: MAX_PAGE })
     // GitLab leaves `diff` empty for collapsed or oversized files; say so instead of presenting a complete diff.
@@ -510,13 +510,13 @@ export class GitlabProvider implements Provider {
     return { diff: text, truncated: truncated || omitted }
   }
 
-  async changeStatus(ref: RepoRef, number: number, call: Call) {
+  async mrStatus(ref: RepoRef, number: number, call: Call) {
     call.signal.throwIfAborted()
     return statusOf(await this.api.MergeRequests.show(ref.path, number))
   }
 
   /** The merge request carries its head pipeline, so CI comes with every poll; notes are read only when its `updated_at` moved. */
-  async changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity> {
+  async mrActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<MrActivity> {
     call.signal.throwIfAborted()
     const data = await this.api.MergeRequests.show(ref.path, number)
     const change = mergeRequest(data)
@@ -531,7 +531,7 @@ export class GitlabProvider implements Provider {
         return [{ ...note(entry), kind, webUrl: `${change.webUrl}#note_${entry.id}`, ...typeof path === 'string' ? { path } : {} }]
       })
     }
-    return { change, conflict: data.has_conflicts === true, status: statusOf(data), ...items === undefined ? {} : { items } }
+    return { mr: change, conflict: data.has_conflicts === true, status: statusOf(data), ...items === undefined ? {} : { items } }
   }
 
   /**
@@ -549,7 +549,7 @@ export class GitlabProvider implements Provider {
     throw new RepoError('too-large', `新评论超过 ${MAX_NOTE_PAGES * MAX_PAGE} 条，无法完整读取`)
   }
 
-  async createChange(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; deleteSourceBranch: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
+  async createMr(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; deleteSourceBranch: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
     const assigneeIds = await this.userIds(fields.assignees, call)
     call.signal.throwIfAborted()
     const title = fields.draft && !fields.title.startsWith(DRAFT_PREFIX) ? `${DRAFT_PREFIX}${fields.title}` : fields.title
@@ -562,7 +562,7 @@ export class GitlabProvider implements Provider {
     return mergeRequest(data)
   }
 
-  async updateChange(ref: RepoRef, number: number, update: { title?: string; body?: string; state?: 'open' | 'closed'; targetBranch?: string; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
+  async updateMr(ref: RepoRef, number: number, update: { title?: string; body?: string; state?: 'open' | 'closed'; targetBranch?: string; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
     const assigneeIds = await this.userIds(update.assignees, call)
     call.signal.throwIfAborted()
     const data = await this.api.MergeRequests.edit(ref.path, number, {
@@ -576,12 +576,12 @@ export class GitlabProvider implements Provider {
     return mergeRequest(data)
   }
 
-  async commentChange(ref: RepoRef, number: number, body: string, call: Call) {
+  async commentMr(ref: RepoRef, number: number, body: string, call: Call) {
     call.signal.throwIfAborted()
     return note(await this.api.MergeRequestNotes.create(ref.path, number, body))
   }
 
-  async mergeChange(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase'; deleteSourceBranch: boolean }, call: Call) {
+  async mergeMr(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase'; deleteSourceBranch: boolean }, call: Call) {
     if (request.method === 'rebase') throw new RepoError('invalid', 'GitLab 的合并接口不支持 rebase 方式；可用 merge 或 squash')
     call.signal.throwIfAborted()
     // GitLab would also delete a fork's branch when the token may; look first so only same-project branches go.
@@ -601,7 +601,7 @@ export class GitlabProvider implements Provider {
   /** Merge request pipelines come from their own endpoint, which filters nothing, so `state` is applied to the page read. */
   async listRuns(ref: RepoRef, query: Paging & CiRunQuery, call: Call) {
     call.signal.throwIfAborted()
-    const data: readonly GitlabPipeline[] = query.change === undefined
+    const data: readonly GitlabPipeline[] = query.mr === undefined
       ? await this.api.Pipelines.all(ref.path, {
         ...paging(query),
         orderBy: 'id',
@@ -610,9 +610,9 @@ export class GitlabProvider implements Provider {
         ...query.sha === undefined ? {} : { sha: query.sha },
         ...query.state === undefined ? {} : { status: PIPELINE_STATUS[query.state] },
       })
-      : await this.api.MergeRequests.allPipelines(ref.path, query.change, paging(query))
+      : await this.api.MergeRequests.allPipelines(ref.path, query.mr, paging(query))
     const runs = data.map(pipeline)
-    return { items: query.change === undefined || query.state === undefined ? runs : runs.filter(run => run.state === query.state), ...nextPage(query, data.length) }
+    return { items: query.mr === undefined || query.state === undefined ? runs : runs.filter(run => run.state === query.state), ...nextPage(query, data.length) }
   }
 
   /** Trigger jobs come from the bridges endpoint and follow the other jobs; the test report is read only for a failed pipeline. */

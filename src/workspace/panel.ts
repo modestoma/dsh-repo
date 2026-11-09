@@ -105,7 +105,7 @@ export function workspacePanel(service: RepoService, manager: WorkspaceManager, 
       manager.summary(record, timeoutMs).catch((error: unknown) => { errors.push(error instanceof Error ? error.message : String(error)) }),
       entry === undefined
         ? undefined
-        : service.listChanges(record.repo, { state: 'open', sourceBranch: record.branch, page: 1, perPage: MAX_LISTED_MRS }).then(
+        : service.listMrs(record.repo, { state: 'open', sourceBranch: record.branch, page: 1, perPage: MAX_LISTED_MRS }).then(
             (page): WorkspaceMr[] => page.items.map(mr => ({ number: mr.number, title: mr.title, webUrl: mr.webUrl })),
             (error: unknown) => { errors.push(`无法读取 PR/MR：${error instanceof Error ? error.message : String(error)}`) },
           ),

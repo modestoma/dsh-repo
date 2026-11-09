@@ -3,14 +3,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MrInfo, MrStatus, CiJob } from '../src/contract.ts'
-import type { ActivityItem, ChangeActivity } from '../src/providers/types.ts'
+import type { ActivityItem, MrActivity } from '../src/providers/types.ts'
 import type { HostContext, LiveAgent, UserMessage } from '../src/host.ts'
 import { detect, freshCursor, renderMessage, watchId } from '../src/watch/activity.ts'
 import type { WatchRecord } from '../src/watch/activity.ts'
 import { hostDelivery, RESOLVE_AGENT_EVENT } from '../src/watch/delivery.ts'
 import type { DeliveryOutcome, WatchDelivery } from '../src/watch/delivery.ts'
 import { WatchStore } from '../src/watch/store.ts'
-import { ChangeWatcher } from '../src/watch/watcher.ts'
+import { MrWatcher } from '../src/watch/watcher.ts'
 import { credentials, testSettings } from './helpers.ts'
 
 const SHA = 'a'.repeat(40)
@@ -33,9 +33,9 @@ function item(id: string, createdAt: string, overrides: Partial<ActivityItem> = 
   return { id, kind: 'comment', author: { username: 'alice' }, body: `comment ${id}`, createdAt, ...overrides }
 }
 
-function activity(overrides: Omit<Partial<ChangeActivity>, 'change'> & { change?: Partial<MrInfo> } = {}): ChangeActivity {
-  const { change: changeOverrides, ...rest } = overrides
-  return { change: change(changeOverrides), conflict: false, ...rest }
+function activity(overrides: Omit<Partial<MrActivity>, 'mr'> & { mr?: Partial<MrInfo> } = {}): MrActivity {
+  const { mr: changeOverrides, ...rest } = overrides
+  return { mr: change(changeOverrides), conflict: false, ...rest }
 }
 
 function record(overrides: Partial<WatchRecord> = {}): WatchRecord {
@@ -51,7 +51,7 @@ describe('detect', () => {
   const now = '2026-11-01T02:00:00.000Z'
 
   it('sets a cursor on the first poll of a requested watch without reporting what already happened', () => {
-    const result = detect(record({ cursor: undefined, source: 'requested' }), activity({ status: status('failure', ['build']), items: [item('1', '2026-11-01T01:30:00Z')], change: { updatedAt: '2026-11-01T01:30:00Z' } }), now)
+    const result = detect(record({ cursor: undefined, source: 'requested' }), activity({ status: status('failure', ['build']), items: [item('1', '2026-11-01T01:30:00Z')], mr: { updatedAt: '2026-11-01T01:30:00Z' } }), now)
     expect(result.events).toEqual([])
     expect(result.cursor).toMatchObject({ checks: 'failure', failing: ['build'], since: '2026-11-01T01:30:00Z', seen: ['1'], updatedAt: '2026-11-01T01:30:00Z' })
   })
@@ -88,11 +88,11 @@ describe('detect', () => {
   })
 
   it('tells pushes by others from pushes through the tools, and waits for CI of the new head', () => {
-    const theirs = detect(record(), activity({ change: { headSha: OTHER } }), now)
+    const theirs = detect(record(), activity({ mr: { headSha: OTHER } }), now)
     expect(theirs.events).toEqual([{ kind: 'pushed', at: now, sha: OTHER }])
     expect(theirs.cursor).toMatchObject({ headSha: OTHER, checks: 'pending', headMovedAt: now })
-    expect(detect(record({ ownHeads: [SHA, OTHER] }), activity({ change: { headSha: OTHER } }), now).events).toEqual([])
-    expect(detect(record(), activity({ change: { headSha: OTHER }, status: status('failure', ['x'], SHA) }), now).events.map(event => event.kind)).toEqual(['pushed'])
+    expect(detect(record({ ownHeads: [SHA, OTHER] }), activity({ mr: { headSha: OTHER } }), now).events).toEqual([])
+    expect(detect(record(), activity({ mr: { headSha: OTHER }, status: status('failure', ['x'], SHA) }), now).events.map(event => event.kind)).toEqual(['pushed'])
   })
 
   it('reports new comments and reviews except the ones the tools posted, moving the cursor past them', () => {
@@ -102,7 +102,7 @@ describe('detect', () => {
       item('2', '2026-11-01T01:10:00Z', { kind: 'approved', author: { username: 'carol' } }),
       item('3', '2026-11-01T01:20:00Z', { kind: 'changes-requested', body: 'redo' }),
     ]
-    const result = detect(record({ ownComments: ['1'] }), activity({ items, change: { updatedAt: '2026-11-01T01:20:00Z' } }), now)
+    const result = detect(record({ ownComments: ['1'] }), activity({ items, mr: { updatedAt: '2026-11-01T01:20:00Z' } }), now)
     expect(result.events.map(event => [event.kind, event.item?.id])).toEqual([['approved', '2'], ['changesRequested', '3']])
     expect(result.cursor).toMatchObject({ since: '2026-11-01T01:20:00Z', seen: ['3'], updatedAt: '2026-11-01T01:20:00Z' })
     expect(result.touched).toBe(true)
@@ -113,8 +113,8 @@ describe('detect', () => {
 
   it('reports conflicts, merge, and close', () => {
     expect(detect(record(), activity({ conflict: true }), now).events.map(event => event.kind)).toEqual(['conflict'])
-    expect(detect(record(), activity({ change: { state: 'merged' } }), now).events.map(event => event.kind)).toEqual(['merged'])
-    expect(detect(record(), activity({ change: { state: 'closed' } }), now).events.map(event => event.kind)).toEqual(['closed'])
+    expect(detect(record(), activity({ mr: { state: 'merged' } }), now).events.map(event => event.kind)).toEqual(['merged'])
+    expect(detect(record(), activity({ mr: { state: 'closed' } }), now).events.map(event => event.kind)).toEqual(['closed'])
     expect(detect(record({ cursor: { ...record().cursor!, updatedAt: '2026-11-01T01:00:00Z' } }), activity(), now).touched).toBe(false)
   })
 })
@@ -144,8 +144,8 @@ function harness(settings: Record<string, unknown> = {}, outcomes: DeliveryOutco
   const dir = mkdtempSync(join(tmpdir(), 'dsh-repo-watch-'))
   const file = join(dir, 'watches.json')
   let current = testSettings({ watch: settings }).watch
-  let poll: ChangeActivity | Error = activity()
-  const changeActivity = vi.fn(async () => {
+  let poll: MrActivity | Error = activity()
+  const mrActivity = vi.fn(async () => {
     if (poll instanceof Error) throw poll
     return poll
   })
@@ -160,8 +160,8 @@ function harness(settings: Record<string, unknown> = {}, outcomes: DeliveryOutco
   }
   const store = new WatchStore(file)
   const failedCiJobs = vi.fn(async (): Promise<CiJob[]> => [])
-  const service = { resolve: () => ({ kind: 'github' as const, host: 'github.com', path: 'a/b', webUrl: 'https://github.com/a/b' }), changeActivity, failedCiJobs }
-  const watcher = new ChangeWatcher({ service, store, settings: () => current, delivery })
+  const service = { resolve: () => ({ kind: 'github' as const, host: 'github.com', path: 'a/b', webUrl: 'https://github.com/a/b' }), mrActivity, failedCiJobs }
+  const watcher = new MrWatcher({ service, store, settings: () => current, delivery })
   /** Let `ms` pass a second at a time, letting each poll's file writes finish before the next timer. */
   const advance = async (ms: number): Promise<void> => {
     for (let left = ms; left > 0; left -= 1000) {
@@ -170,13 +170,13 @@ function harness(settings: Record<string, unknown> = {}, outcomes: DeliveryOutco
     }
   }
   return {
-    file, store, watcher, changeActivity, failedCiJobs, delivery, deliveries, advance,
-    setPoll: (next: ChangeActivity | Error) => { poll = next },
+    file, store, watcher, mrActivity, failedCiJobs, delivery, deliveries, advance,
+    setPoll: (next: MrActivity | Error) => { poll = next },
     setSettings: (next: Record<string, unknown>) => { current = testSettings({ watch: next }).watch },
   }
 }
 
-describe('ChangeWatcher', () => {
+describe('MrWatcher', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.setSystemTime(START)
@@ -186,9 +186,9 @@ describe('ChangeWatcher', () => {
   it('collects CI and comments for the batch window, then wakes the Session once with both', async () => {
     const h = harness()
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
     await h.watcher.ownComment('github.com/a/b', 5, 'mine')
-    h.setPoll(activity({ status: status('failure', ['build']), items: [item('mine', '2026-11-01T01:30:00Z'), item('7', '2026-11-01T01:40:00Z')], change: { updatedAt: '2026-11-01T01:40:00Z' } }))
+    h.setPoll(activity({ status: status('failure', ['build']), items: [item('mine', '2026-11-01T01:30:00Z'), item('7', '2026-11-01T01:40:00Z')], mr: { updatedAt: '2026-11-01T01:40:00Z' } }))
     await h.advance(60_000)
     expect(h.deliveries).toEqual([])
     expect(h.watcher.list()[0]?.pending).toBe(2)
@@ -205,7 +205,7 @@ describe('ChangeWatcher', () => {
   it('holds notes while the Session is not live and hands them over with the next wake', async () => {
     const h = harness({ batchMs: 0 }, ['held'])
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
     h.setPoll(activity({ status: status('success') }))
     await h.advance(60_000)
     expect(h.delivery.deliver).toHaveBeenLastCalledWith('s1', expect.objectContaining({ summary: 'PR #5 有新动态：CI 通过' }), false)
@@ -222,8 +222,8 @@ describe('ChangeWatcher', () => {
   it('wakes the Session at once on merge and stops watching', async () => {
     const h = harness()
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
-    h.setPoll(activity({ change: { state: 'merged' } }))
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
+    h.setPoll(activity({ mr: { state: 'merged' } }))
     await h.advance(60_000)
     expect(h.deliveries.map(delivery => delivery.wake)).toEqual([true])
     expect(h.deliveries[0]!.text).toContain('已合并，已停止跟踪')
@@ -235,9 +235,9 @@ describe('ChangeWatcher', () => {
   it('still ends the watch when the merge notice is delivered on a retry', async () => {
     const h = harness()
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
     vi.mocked(h.delivery.deliver).mockRejectedValueOnce(new Error('session store busy'))
-    h.setPoll(activity({ change: { state: 'merged' } }))
+    h.setPoll(activity({ mr: { state: 'merged' } }))
     await h.advance(60_000)
     expect(h.deliveries).toEqual([])
     expect(h.watcher.list()[0]?.pending).toBe(1)
@@ -251,13 +251,13 @@ describe('ChangeWatcher', () => {
   it('reads CI again on later polls after a failure, so a rerun on the same head is seen', async () => {
     const h = harness({ batchMs: 0 })
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
     h.setPoll(activity({ status: status('failure', ['build']) }))
     await h.advance(60_000)
-    const failedAt = h.changeActivity.mock.calls.length
+    const failedAt = h.mrActivity.mock.calls.length
     h.setPoll(activity({ status: status('success') }))
     await h.advance(600_000)
-    const requests = h.changeActivity.mock.calls.slice(failedAt) as unknown as Array<[string, number, { withStatus: boolean }]>
+    const requests = h.mrActivity.mock.calls.slice(failedAt) as unknown as Array<[string, number, { withStatus: boolean }]>
     expect(requests[0]?.[2].withStatus).toBe(true)
     expect(h.deliveries.map(delivery => delivery.text.includes('CI 通过'))).toEqual([false, true])
     await h.watcher.stop()
@@ -266,7 +266,7 @@ describe('ChangeWatcher', () => {
   it('ends a watch after the idle days with a stop notice', async () => {
     const h = harness({ idleDays: 1 })
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
     h.setPoll(activity({ status: status('none') }))
     await h.advance(86_400_000 + 1_200_000)
     expect(h.deliveries).toHaveLength(1)
@@ -278,14 +278,14 @@ describe('ChangeWatcher', () => {
   it('stops starting turns after the daily wake limit, but still ends the watch with one', async () => {
     const h = harness({ batchMs: 0, dailyWakeLimit: 1 })
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
-    h.setPoll(activity({ items: [item('1', '2026-11-01T01:10:00Z')], change: { updatedAt: '2026-11-01T01:10:00Z' } }))
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
+    h.setPoll(activity({ items: [item('1', '2026-11-01T01:10:00Z')], mr: { updatedAt: '2026-11-01T01:10:00Z' } }))
     await h.advance(60_000)
-    h.setPoll(activity({ items: [item('2', '2026-11-01T01:20:00Z')], change: { updatedAt: '2026-11-01T01:20:00Z' } }))
+    h.setPoll(activity({ items: [item('2', '2026-11-01T01:20:00Z')], mr: { updatedAt: '2026-11-01T01:20:00Z' } }))
     await h.advance(60_000)
     expect(h.deliveries.map(delivery => delivery.wake)).toEqual([true, false])
     expect(h.deliveries[1]!.text).toContain('唤醒会话的次数已达上限')
-    h.setPoll(activity({ change: { state: 'closed', updatedAt: '2026-11-01T01:30:00Z' } }))
+    h.setPoll(activity({ mr: { state: 'closed', updatedAt: '2026-11-01T01:30:00Z' } }))
     await h.advance(60_000)
     expect(h.deliveries.map(delivery => delivery.wake)).toEqual([true, false, true])
     await h.watcher.stop()
@@ -294,11 +294,11 @@ describe('ChangeWatcher', () => {
   it('drops activity set to off, and ends the watch silently when its Session is gone', async () => {
     const h = harness({ batchMs: 0, events: { comment: 'off' } }, ['gone'])
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
-    h.setPoll(activity({ items: [item('1', '2026-11-01T01:10:00Z')], change: { updatedAt: '2026-11-01T01:10:00Z' } }))
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
+    h.setPoll(activity({ items: [item('1', '2026-11-01T01:10:00Z')], mr: { updatedAt: '2026-11-01T01:10:00Z' } }))
     await h.advance(60_000)
     expect(h.delivery.deliver).not.toHaveBeenCalled()
-    h.setPoll(activity({ conflict: true, change: { updatedAt: '2026-11-01T01:10:00Z' } }))
+    h.setPoll(activity({ conflict: true, mr: { updatedAt: '2026-11-01T01:10:00Z' } }))
     await h.advance(60_000)
     expect(h.delivery.deliver).toHaveBeenCalledTimes(1)
     expect(h.watcher.list()).toEqual([])
@@ -308,12 +308,12 @@ describe('ChangeWatcher', () => {
   it('backs off after failed polls, lists the failure, and catches up from the cursor', async () => {
     const h = harness()
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
     h.setPoll(Object.assign(new Error('令牌无效'), { code: 'unauthenticated' }))
     await h.advance(60_000 + 120_000 + 240_000)
-    expect(h.changeActivity).toHaveBeenCalledTimes(3)
+    expect(h.mrActivity).toHaveBeenCalledTimes(3)
     expect(h.watcher.list()[0]).toMatchObject({ failures: 3, lastError: '检查失败：令牌无效' })
-    h.setPoll(activity({ items: [item('1', '2026-11-01T01:10:00Z')], change: { updatedAt: '2026-11-01T01:10:00Z' } }))
+    h.setPoll(activity({ items: [item('1', '2026-11-01T01:10:00Z')], mr: { updatedAt: '2026-11-01T01:10:00Z' } }))
     await h.advance(60_000)
     expect(h.watcher.list()[0]).toMatchObject({ failures: 0, pending: 1 })
     expect(h.watcher.list()[0]?.lastError).toBeUndefined()
@@ -325,7 +325,7 @@ describe('ChangeWatcher', () => {
   it('ends a watch whose repository is no longer reachable', async () => {
     const h = harness()
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
     h.setPoll(Object.assign(new Error('不在可访问范围'), { code: 'not-allowed' }))
     await h.advance(60_000)
     expect(h.watcher.list()).toEqual([])
@@ -334,11 +334,11 @@ describe('ChangeWatcher', () => {
 
   it('keeps watches across restarts and ends the one quiet longest beyond the limit', async () => {
     const h = harness({ maxWatches: 2 })
-    await h.watcher.track({ repo: 'github.com/a/b', change: change({ number: 1 }), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change({ number: 1 }), session: 's1', source: 'created' })
     vi.setSystemTime(START + 1000)
-    await h.watcher.track({ repo: 'github.com/a/b', change: change({ number: 2 }), session: 's1', source: 'pushed' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change({ number: 2 }), session: 's1', source: 'pushed' })
     vi.setSystemTime(START + 2000)
-    await h.watcher.track({ repo: 'github.com/a/b', change: change({ number: 3 }), session: 's2', source: 'requested' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change({ number: 3 }), session: 's2', source: 'requested' })
     expect(h.watcher.list().map(watch => [watch.number, watch.source])).toEqual([[3, 'requested'], [2, 'pushed']])
     const reloaded = new WatchStore(h.file)
     expect(reloaded.all().map(entry => entry.number).sort()).toEqual([2, 3])
@@ -350,9 +350,9 @@ describe('ChangeWatcher', () => {
   it('treats a push through the tools to a watched PR as its own head and awaits its CI', async () => {
     const h = harness({ batchMs: 0 })
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'pushed', pushed: OTHER })
-    h.setPoll(activity({ change: { headSha: OTHER }, status: status('failure', ['test'], OTHER) }))
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'pushed', pushed: OTHER })
+    h.setPoll(activity({ mr: { headSha: OTHER }, status: status('failure', ['test'], OTHER) }))
     await h.advance(60_000)
     expect(h.deliveries).toHaveLength(1)
     expect(h.deliveries[0]!.text).toContain('CI 失败（提交 bbbbbbbbbbbb）：test')
@@ -361,7 +361,7 @@ describe('ChangeWatcher', () => {
   })
 })
 
-describe('ChangeWatcher CI failures', () => {
+describe('MrWatcher CI failures', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.setSystemTime(START)
@@ -375,7 +375,7 @@ describe('ChangeWatcher CI failures', () => {
       { id: 902, name: 'unit', state: 'failure', status: 'failed', allowFailure: false },
     ])
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
     h.setPoll(activity({ status: { headSha: SHA, overall: 'failure', checks: [{ name: 'pipeline #42', state: 'failure', runId: 42 }, { name: 'lint', state: 'failure', runId: 7, jobId: 8 }] } }))
     await h.advance(60_000)
     expect(h.failedCiJobs).toHaveBeenCalledTimes(1)
@@ -391,7 +391,7 @@ describe('ChangeWatcher CI failures', () => {
     const h = harness({ batchMs: 0 })
     h.failedCiJobs.mockRejectedValueOnce(new Error('[forbidden] 令牌没有权限'))
     h.watcher.start()
-    await h.watcher.track({ repo: 'github.com/a/b', change: change(), session: 's1', source: 'created' })
+    await h.watcher.track({ repo: 'github.com/a/b', mr: change(), session: 's1', source: 'created' })
     h.setPoll(activity({ status: { headSha: SHA, overall: 'failure', checks: [{ name: 'pipeline #42', state: 'failure', runId: 42 }] } }))
     await h.advance(60_000)
     expect(h.deliveries[0]!.text).toContain('    - 没能读取失败作业：[forbidden] 令牌没有权限')

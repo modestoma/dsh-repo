@@ -23,7 +23,7 @@
 import type { MrInfo, CiJob, RepoRef } from '../contract.ts'
 import type { WatchSettings } from '../config.ts'
 import type { HostLogger } from '../host.ts'
-import type { ActivityRequest, ChangeActivity } from '../providers/types.ts'
+import type { ActivityRequest, MrActivity } from '../providers/types.ts'
 import type { WatchAction, WatchEventKind, WatchInfo } from '../settings/contract.ts'
 import { detect, freshCursor, MAX_OWN_COMMENTS, MAX_OWN_HEADS, MAX_PENDING, renderMessage, watchId } from './activity.ts'
 import type { WatchCiFailure, WatchEvent, WatchRecord, WatchSource } from './activity.ts'
@@ -41,7 +41,7 @@ const DAY_MS = 86_400_000
 /** The service calls the watcher makes. */
 export interface WatchService {
   resolve(repo: string): RepoRef
-  changeActivity(repo: string, number: number, request: ActivityRequest, options: { readonly signal?: AbortSignal }): Promise<ChangeActivity>
+  mrActivity(repo: string, number: number, request: ActivityRequest, options: { readonly signal?: AbortSignal }): Promise<MrActivity>
   /** Failed jobs of a CI run, listed in a CI failure message. */
   failedCiJobs(repo: string, runId: number, options: { readonly signal?: AbortSignal }): Promise<readonly CiJob[]>
 }
@@ -62,7 +62,7 @@ export interface WatcherDeps {
 export interface TrackRequest {
   /** Repository target of the PR/MR. */
   readonly repo: string
-  readonly change: MrInfo
+  readonly mr: MrInfo
   readonly session: string
   readonly source: WatchSource
   /** Head the tools just pushed. */
@@ -83,7 +83,7 @@ function errorText(error: unknown): string {
 }
 
 /** Polls watched PRs/MRs and delivers their activity. */
-export class ChangeWatcher {
+export class MrWatcher {
   private readonly now: () => number
   private readonly nextPoll = new Map<string, number>()
   private readonly running = new Set<string>()
@@ -158,7 +158,7 @@ export class ChangeWatcher {
    */
   async track(request: TrackRequest): Promise<WatchInfo> {
     const ref = this.deps.service.resolve(request.repo)
-    const id = watchId(ref.host, ref.path, request.change.number, request.session)
+    const id = watchId(ref.host, ref.path, request.mr.number, request.session)
     const now = this.now()
     const iso = new Date(now).toISOString()
     const { maxWatches } = this.deps.settings()
@@ -173,28 +173,28 @@ export class ChangeWatcher {
           : { ...existing.cursor, headSha: pushed, headMovedAt: iso, checks: 'pending' as const, failing: [] }
         record = {
           ...existing,
-          title: request.change.title,
+          title: request.mr.title,
           lastActivityAt: iso,
           ...pushed === undefined ? {} : { ownHeads: capped(existing.ownHeads, pushed, MAX_OWN_HEADS) },
           ...cursor === undefined ? {} : { cursor },
         }
       } else {
-        const since = request.source === 'created' ? request.change.createdAt : request.change.updatedAt
+        const since = request.source === 'created' ? request.mr.createdAt : request.mr.updatedAt
         record = {
           id,
           kind: ref.kind,
           host: ref.host,
           path: ref.path,
-          number: request.change.number,
-          title: request.change.title,
-          webUrl: request.change.webUrl,
+          number: request.mr.number,
+          title: request.mr.title,
+          webUrl: request.mr.webUrl,
           session: request.session,
           source: request.source,
           startedAt: iso,
           lastActivityAt: iso,
-          ...request.source === 'requested' ? {} : { cursor: freshCursor(request.change, since, iso) },
+          ...request.source === 'requested' ? {} : { cursor: freshCursor(request.mr, since, iso) },
           ownComments: [],
-          ownHeads: pushed === undefined ? [request.change.headSha] : [pushed],
+          ownHeads: pushed === undefined ? [request.mr.headSha] : [pushed],
           wakes: { day: localDay(now), count: 0 },
           pending: [],
           dropped: 0,
@@ -317,9 +317,9 @@ export class ChangeWatcher {
       await this.finish(record, [{ kind: 'idle', at: iso }])
       return
     }
-    let activity: ChangeActivity
+    let activity: MrActivity
     try {
-      activity = await this.deps.service.changeActivity(`${record.host}/${record.path}`, record.number, {
+      activity = await this.deps.service.mrActivity(`${record.host}/${record.path}`, record.number, {
         ...record.cursor?.updatedAt === undefined ? {} : { updatedAt: record.cursor.updatedAt },
         withStatus: this.needsStatus(record, now),
         since: record.cursor?.since ?? record.startedAt,
@@ -342,8 +342,8 @@ export class ChangeWatcher {
     if (signal.aborted) return
     const updated = await this.merge(id, current => ({
       ...current,
-      title: activity.change.title,
-      webUrl: activity.change.webUrl,
+      title: activity.mr.title,
+      webUrl: activity.mr.webUrl,
       cursor,
       ...touched ? { lastActivityAt: iso } : {},
       ...this.enqueue(current, kept, iso),

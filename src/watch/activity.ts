@@ -7,7 +7,7 @@
  */
 
 import type { MrInfo, MrState, MrStatus, CheckState, ForgeKind } from '../contract.ts'
-import type { ChangeActivity } from '../providers/types.ts'
+import type { MrActivity } from '../providers/types.ts'
 import type { WatchEventKind } from '../settings/contract.ts'
 
 /** What a watch knows about its PR/MR after the last poll. */
@@ -157,8 +157,8 @@ function time(value: string): number {
  * @param now - local time.
  * @returns the next cursor, the events, and whether the PR/MR changed at all.
  */
-export function detect(record: WatchRecord, activity: ChangeActivity, now: string): { cursor: WatchCursor; events: WatchEvent[]; touched: boolean } {
-  const { change } = activity
+export function detect(record: WatchRecord, activity: MrActivity, now: string): { cursor: WatchCursor; events: WatchEvent[]; touched: boolean } {
+  const { mr: change } = activity
   const previous = record.cursor
   if (previous === undefined) {
     const items = activity.items ?? []

@@ -146,7 +146,7 @@ describe('write gate for tools', () => {
     const request = vi.fn(async () => { order.push('approve'); return 'allowed-once' as const })
     const parallel = vi.fn(async (name: string) => { order.push(name) })
     const { exec: run } = session()
-    const all = tools(fakeService({ createIssue, mergeChange: vi.fn() }, () => testSettings(), 'write'), { approval: { request }, parallel })
+    const all = tools(fakeService({ createIssue, mergeMr: vi.fn() }, () => testSettings(), 'write'), { approval: { request }, parallel })
     expect(await all.get('repo_issue_create')!.execute({ repo: 'github.com/a/b', title: 'T' }, run)).toEqual({ number: 1 })
     expect(parallel).toHaveBeenCalledWith('access/authorize', { session: 'session-1', level: 'code-write', action: 'issueCreate', summary: '在 github.com/a/b 创建 issue：T' })
     expect(order).toEqual(['access/authorize', 'approve'])
@@ -181,23 +181,23 @@ describe('write gate for tools', () => {
 
   it('applies the signature and the source-branch setting, and names CI runs and jobs in approvals', async () => {
     let settings = testSettings({ tools: { signature: '_via DSH_' } })
-    const createChange = vi.fn(async () => ({ number: 1, state: 'open' }))
-    const mergeChange = vi.fn(async () => ({ sha: 'm1' }))
-    const commentChange = vi.fn(async () => ({ id: '1' }))
+    const createMr = vi.fn(async () => ({ number: 1, state: 'open' }))
+    const mergeMr = vi.fn(async () => ({ sha: 'm1' }))
+    const commentMr = vi.fn(async () => ({ id: '1' }))
     const retryCi = vi.fn(async () => ({ runId: 42 }))
     const cancelCi = vi.fn(async () => ({ jobId: 2 }))
     const getCiRun = vi.fn(async () => ({ id: 42 }))
     const request = vi.fn(async (_request: { readonly reason?: string }) => 'allowed-once' as const)
-    const all = tools(fakeService({ createChange, mergeChange, commentChange, retryCi, cancelCi, getCiRun }, () => settings), { approval: { request } })
+    const all = tools(fakeService({ createMr, mergeMr, commentMr, retryCi, cancelCi, getCiRun }, () => settings), { approval: { request } })
     await all.get('repo_mr_comment')!.execute({ repo: 'github.com/a/b', number: 3, body: 'LGTM' }, exec)
-    expect(commentChange).toHaveBeenCalledWith('github.com/a/b', 3, 'LGTM\n\n_via DSH_', { signal: exec.signal })
+    expect(commentMr).toHaveBeenCalledWith('github.com/a/b', 3, 'LGTM\n\n_via DSH_', { signal: exec.signal })
     await all.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'T', sourceBranch: 'f', body: 'B' }, exec)
-    expect(createChange).toHaveBeenLastCalledWith('github.com/a/b', expect.objectContaining({ body: 'B\n\n_via DSH_', deleteSourceBranch: true }))
+    expect(createMr).toHaveBeenLastCalledWith('github.com/a/b', expect.objectContaining({ body: 'B\n\n_via DSH_', deleteSourceBranch: true }))
     await all.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40) }, exec)
     expect(request.mock.calls.at(-1)?.[0].reason).toContain('合并后删除源分支')
     settings = testSettings({ tools: { deleteSourceBranch: false } })
     await all.get('repo_mr_merge')!.execute({ repo: 'github.com/a/b', number: 1, headSha: 'a'.repeat(40), method: 'squash' }, exec)
-    expect(mergeChange).toHaveBeenLastCalledWith('github.com/a/b', 1, { headSha: 'a'.repeat(40), method: 'squash', deleteSourceBranch: false, signal: exec.signal })
+    expect(mergeMr).toHaveBeenLastCalledWith('github.com/a/b', 1, { headSha: 'a'.repeat(40), method: 'squash', deleteSourceBranch: false, signal: exec.signal })
 
     request.mockClear()
     await all.get('repo_ci_get')!.execute({ repo: 'gitlab.example.com/g/p', runId: 42, onlyFailed: true }, exec)
@@ -332,10 +332,10 @@ describe('workspace operations', () => {
     const push = vi.fn(async () => ({ commit: 'd'.repeat(40), committed: true, author: { name: 'bot', email: 'bot@example.com' }, created: true }))
     const workspaces = fakeWorkspaces({ locate: async (path: string) => { expect(path).toBe(join(root, 'ws/src')); return ws }, status: async () => status, push })
     const mr = { number: 7, title: 'Fix a', targetBranch: 'main', webUrl: 'https://github.com/a/b/pull/7', state: 'open' }
-    const listChanges = vi.fn(async () => ({ items: [] }))
-    const createChange = vi.fn(async () => mr)
+    const listMrs = vi.fn(async () => ({ items: [] }))
+    const createMr = vi.fn(async () => mr)
     const service = fakeService({
-      listChanges, createChange,
+      listMrs, createMr,
       tokenIdentity: async () => ({ name: 'bot', email: 'bot@example.com' }),
       mirrors: { resolveRef: async () => { throw new RepoError('not-found', 'no branch') } },
     })
@@ -357,7 +357,7 @@ describe('workspace operations', () => {
     ])
     expect(parallel).toHaveBeenCalledWith('access/authorize', expect.objectContaining({ session: 'session-1', action: 'workspacePush' }))
     expect(push).toHaveBeenCalledWith(ws, expect.objectContaining({ message: 'fix: a\n\nbody', session: 'session-1', committer: { name: 'bot', email: 'bot@example.com' }, trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }] }), expect.any(Number))
-    expect(createChange).toHaveBeenCalledWith('https://github.com/a/b', expect.objectContaining({ title: 'Fix a', sourceBranch: 'fix/a', targetBranch: 'main', draft: false }))
+    expect(createMr).toHaveBeenCalledWith('https://github.com/a/b', expect.objectContaining({ title: 'Fix a', sourceBranch: 'fix/a', targetBranch: 'main', draft: false }))
     expect(result).toEqual({
       repo: 'https://github.com/a/b', path: ws.path, branch: 'fix/a', base: 'main',
       commit: 'd'.repeat(40), committed: true, author: { name: 'bot', email: 'bot@example.com' }, created: true,
@@ -365,10 +365,10 @@ describe('workspace operations', () => {
       createdMr: { number: 7, title: 'Fix a', targetBranch: 'main', webUrl: mr.webUrl },
       watching: true,
     })
-    expect(track).toHaveBeenCalledWith({ repo: 'https://github.com/a/b', change: mr, session: 'session-1', source: 'created', pushed: 'd'.repeat(40) })
+    expect(track).toHaveBeenCalledWith({ repo: 'https://github.com/a/b', mr, session: 'session-1', source: 'created', pushed: 'd'.repeat(40) })
 
     // A failed PR/MR lookup is reported; the push already happened.
-    listChanges.mockRejectedValueOnce(new RepoError('forbidden', 'no access'))
+    listMrs.mockRejectedValueOnce(new RepoError('forbidden', 'no access'))
     expect(await tools(service, { approval: { request }, workingDirectory, workspaces }).get('repo_workspace_push')!.execute({ message: 'fix: b' }, run)).toMatchObject({ openMrs: [], watching: false, mrError: 'no access' })
   })
 })
@@ -377,13 +377,13 @@ describe('PR/MR watching', () => {
   it('watches requests opened or reopened for the calling Session, and remembers comments it posts', async () => {
     const { exec: run } = session()
     const mr = { number: 7, title: 'Fix a', targetBranch: 'main', webUrl: 'https://github.com/a/b/pull/7', state: 'open' }
-    const service = fakeService({ createChange: async () => mr, updateChange: async () => mr, commentChange: async () => ({ id: '55' }), commentIssue: async () => ({ id: '56' }) }, () => testSettings({ tools: { writes: 'allow' } }))
+    const service = fakeService({ createMr: async () => mr, updateMr: async () => mr, commentMr: async () => ({ id: '55' }), commentIssue: async () => ({ id: '56' }) }, () => testSettings({ tools: { writes: 'allow' } }))
     const track = vi.fn(async () => ({}) as WatchInfo)
     const ownComment = vi.fn(async () => {})
     const watch = { active: true, track, untrack: vi.fn(async () => true), ownComment }
     const all = tools(service, { watch })
     expect(await all.get('repo_mr_create')!.execute({ repo: 'github.com/a/b', title: 'Fix a', sourceBranch: 'fix/a' }, run)).toMatchObject({ number: 7, watching: true })
-    expect(track).toHaveBeenLastCalledWith({ repo: 'github.com/a/b', change: mr, session: 'session-1', source: 'created' })
+    expect(track).toHaveBeenLastCalledWith({ repo: 'github.com/a/b', mr, session: 'session-1', source: 'created' })
     expect(await all.get('repo_mr_update')!.execute({ repo: 'github.com/a/b', number: 7, state: 'open' }, run)).toMatchObject({ watching: true })
     expect(await all.get('repo_mr_update')!.execute({ repo: 'github.com/a/b', number: 7, title: 'T' }, run)).not.toHaveProperty('watching')
     await all.get('repo_mr_comment')!.execute({ repo: 'github.com/a/b', number: 7, body: 'done' }, run)
@@ -398,15 +398,15 @@ describe('PR/MR watching', () => {
 
   it('starts and stops a watch on request, only for open requests while watching is active', async () => {
     const { exec: run } = session()
-    const getChange = vi.fn(async () => ({ number: 7, title: 'Fix a', state: 'open', webUrl: 'https://github.com/a/b/pull/7', comments: [{ id: '1' }] }))
+    const getMr = vi.fn(async () => ({ number: 7, title: 'Fix a', state: 'open', webUrl: 'https://github.com/a/b/pull/7', comments: [{ id: '1' }] }))
     const track = vi.fn(async () => ({ number: 7, title: 'Fix a', webUrl: 'https://github.com/a/b/pull/7' }) as WatchInfo)
     const watch = { active: true, track, untrack: vi.fn(async () => true), ownComment: vi.fn(async () => {}) }
-    const tool = tools(fakeService({ getChange }), { watch }).get('repo_mr_watch')!
+    const tool = tools(fakeService({ getMr }), { watch }).get('repo_mr_watch')!
     expect(await tool.execute({ repo: 'github.com/a/b', number: 7 }, run)).toEqual({ watching: true, number: 7, title: 'Fix a', webUrl: 'https://github.com/a/b/pull/7' })
-    expect(track).toHaveBeenCalledWith({ repo: 'github.com/a/b', change: { number: 7, title: 'Fix a', state: 'open', webUrl: 'https://github.com/a/b/pull/7' }, session: 'session-1', source: 'requested' })
+    expect(track).toHaveBeenCalledWith({ repo: 'github.com/a/b', mr: { number: 7, title: 'Fix a', state: 'open', webUrl: 'https://github.com/a/b/pull/7' }, session: 'session-1', source: 'requested' })
     expect(await tool.execute({ repo: 'github.com/a/b', number: 7, watch: false }, run)).toEqual({ watching: false, stopped: true, number: 7 })
     expect(watch.untrack).toHaveBeenCalledWith('github.com/a/b', 7, 'session-1')
-    getChange.mockResolvedValueOnce({ number: 7, title: 'Fix a', state: 'merged', webUrl: '', comments: [] })
+    getMr.mockResolvedValueOnce({ number: 7, title: 'Fix a', state: 'merged', webUrl: '', comments: [] })
     await expect(tool.execute({ repo: 'github.com/a/b', number: 7 }, run)).rejects.toThrow(/\[invalid\].*已合并/)
     await expect(tool.execute({ repo: 'github.com/a/b', number: 7 }, exec)).rejects.toThrow(/\[invalid\].*会话/)
     watch.active = false

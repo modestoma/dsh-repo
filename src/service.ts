@@ -35,7 +35,7 @@ import { checkMirrorDir } from './mirror/root.ts'
 import type { MirrorState, MirrorStore } from './mirror/store.ts'
 import { GithubProvider } from './providers/github.ts'
 import { GitlabProvider } from './providers/gitlab.ts'
-import type { ActivityRequest, Call, ChangeActivity, Paging, Provider } from './providers/types.ts'
+import type { ActivityRequest, Call, MrActivity, Paging, Provider } from './providers/types.ts'
 import { hostOf, resolveTarget } from './target.ts'
 import type { ResolvedTarget } from './target.ts'
 
@@ -56,11 +56,11 @@ export interface PageOptions extends CallOptions {
   readonly perPage?: number
 }
 
-/** Filters of a CI run listing; `change` is a pull/merge request number. */
+/** Filters of a CI run listing; `mr` is a pull/merge request number. */
 export interface CiRunListOptions extends PageOptions {
   readonly ref?: string
   readonly sha?: string
-  readonly change?: number
+  readonly mr?: number
   readonly state?: 'pending' | 'running' | 'success' | 'failure' | 'canceled'
 }
 
@@ -132,14 +132,14 @@ export interface HostGitCredentials {
 }
 
 /** Pages of pull/merge requests from one branch read before giving up. */
-const MAX_BRANCH_CHANGE_PAGES = 10
+const MAX_BRANCH_MR_PAGES = 10
 
 /** Every pull/merge request, in any state, from a branch of the repository. */
-async function allChangesFrom(provider: Provider, ref: RepoRef, branch: string, call: Call): Promise<MrInfo[]> {
+async function allMrsFrom(provider: Provider, ref: RepoRef, branch: string, call: Call): Promise<MrInfo[]> {
   const found: MrInfo[] = []
   for (let page: number | undefined = 1; page !== undefined;) {
-    if (page > MAX_BRANCH_CHANGE_PAGES) throw new RepoError('too-large', `分支 ${branch} 上的 PR/MR 超过 ${MAX_BRANCH_CHANGE_PAGES * call.limits.maxPerPage} 个`)
-    const result: Page<MrInfo> = await provider.listChanges(ref, { page, perPage: call.limits.maxPerPage, state: 'all', sourceBranch: branch }, call)
+    if (page > MAX_BRANCH_MR_PAGES) throw new RepoError('too-large', `分支 ${branch} 上的 PR/MR 超过 ${MAX_BRANCH_MR_PAGES * call.limits.maxPerPage} 个`)
+    const result: Page<MrInfo> = await provider.listMrs(ref, { page, perPage: call.limits.maxPerPage, state: 'all', sourceBranch: branch }, call)
     found.push(...result.items)
     page = result.nextPage
   }
@@ -410,57 +410,57 @@ export class RepoService {
     return await this.run(repo, options, `评论 issue #${number}`, 'write', (provider, ref, call) => provider.commentIssue(ref, number, body, call))
   }
 
-  async listChanges(repo: RepoTarget, options: PageOptions & { readonly state?: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string } = {}) {
+  async listMrs(repo: RepoTarget, options: PageOptions & { readonly state?: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string } = {}) {
     const query = {
       ...this.paging(options),
       state: options.state ?? 'open',
       ...options.sourceBranch === undefined ? {} : { sourceBranch: options.sourceBranch },
       ...options.targetBranch === undefined ? {} : { targetBranch: options.targetBranch },
     }
-    return await this.run(repo, options, '列出 PR/MR', 'read', (provider, ref, call) => provider.listChanges(ref, query, call))
+    return await this.run(repo, options, '列出 PR/MR', 'read', (provider, ref, call) => provider.listMrs(ref, query, call))
   }
 
-  async getChange(repo: RepoTarget, number: number, options: CallOptions = {}) {
+  async getMr(repo: RepoTarget, number: number, options: CallOptions = {}) {
     requireNumber(number)
-    return await this.run(repo, options, `读取 PR/MR #${number}`, 'read', (provider, ref, call) => provider.getChange(ref, number, call))
+    return await this.run(repo, options, `读取 PR/MR #${number}`, 'read', (provider, ref, call) => provider.getMr(ref, number, call))
   }
 
-  async changeDiff(repo: RepoTarget, number: number, options: CallOptions = {}) {
+  async mrDiff(repo: RepoTarget, number: number, options: CallOptions = {}) {
     requireNumber(number)
-    return await this.run(repo, options, `读取 PR/MR #${number} 的 diff`, 'read', (provider, ref, call) => provider.changeDiff(ref, number, call))
+    return await this.run(repo, options, `读取 PR/MR #${number} 的 diff`, 'read', (provider, ref, call) => provider.mrDiff(ref, number, call))
   }
 
-  async changeStatus(repo: RepoTarget, number: number, options: CallOptions = {}) {
+  async mrStatus(repo: RepoTarget, number: number, options: CallOptions = {}) {
     requireNumber(number)
-    return await this.run(repo, options, `读取 PR/MR #${number} 的状态`, 'read', (provider, ref, call) => provider.changeStatus(ref, number, call))
+    return await this.run(repo, options, `读取 PR/MR #${number} 的状态`, 'read', (provider, ref, call) => provider.mrStatus(ref, number, call))
   }
 
   /**
-   * One poll of a change request for a watch; not part of the `dshRepos` service.
+   * One poll of a PR/MR for a watch; not part of the `dshRepos` service.
    * @param repo - repository target.
-   * @param number - change request number.
+   * @param number - PR/MR number.
    * @param request - what the watch already knows.
    * @param options - cancellation.
-   * @returns the change request, with CI and comments when they were read.
+   * @returns the PR/MR, with CI and comments when they were read.
    * @throws {RepoError} classified as every other call.
    */
-  async changeActivity(repo: RepoTarget, number: number, request: ActivityRequest, options: CallOptions = {}): Promise<ChangeActivity> {
+  async mrActivity(repo: RepoTarget, number: number, request: ActivityRequest, options: CallOptions = {}): Promise<MrActivity> {
     requireNumber(number)
-    return await this.run(repo, options, `检查 PR/MR #${number} 的动态`, 'read', (provider, ref, call) => provider.changeActivity(ref, number, request, call))
+    return await this.run(repo, options, `检查 PR/MR #${number} 的动态`, 'read', (provider, ref, call) => provider.mrActivity(ref, number, request, call))
   }
 
   async listCiRuns(repo: RepoTarget, options: CiRunListOptions = {}) {
     if (options.ref !== undefined) requireBranch(options.ref, 'ref')
     if (options.sha !== undefined) requireCommit(options.sha, 'sha ')
-    if (options.change !== undefined) {
-      requireNumber(options.change)
+    if (options.mr !== undefined) {
+      requireNumber(options.mr)
       if (options.ref !== undefined || options.sha !== undefined) throw new RepoError('invalid', '按 PR/MR 列出时不能再给 ref 或 sha')
     }
     const query = {
       ...this.paging(options),
       ...options.ref === undefined ? {} : { ref: options.ref },
       ...options.sha === undefined ? {} : { sha: options.sha },
-      ...options.change === undefined ? {} : { change: options.change },
+      ...options.mr === undefined ? {} : { mr: options.mr },
       ...options.state === undefined ? {} : { state: options.state },
     }
     return await this.run(repo, options, '列出 CI 流水线', 'read', (provider, ref, call) => provider.listRuns(ref, query, call))
@@ -521,7 +521,7 @@ export class RepoService {
     return await this.run(repo, options, `取消${label}`, 'write', (provider, ref, call) => kind === 'run' ? provider.cancelRun(ref, id, call) : provider.cancelJob(ref, id, call))
   }
 
-  async createChange(repo: RepoTarget, change: MrCreateFields) {
+  async createMr(repo: RepoTarget, change: MrCreateFields) {
     requireText(change.title, '标题')
     requireBranch(change.sourceBranch, '源分支名')
     if (change.targetBranch !== undefined) requireBranch(change.targetBranch, '目标分支名')
@@ -529,35 +529,35 @@ export class RepoService {
       const targetBranch = change.targetBranch ?? (await provider.repoInfo(ref, call)).defaultBranch
       if (targetBranch === change.sourceBranch) throw new RepoError('invalid', '源分支和目标分支不能相同')
       const { signal: _signal, ...fields } = change
-      return await provider.createChange(ref, { ...fields, targetBranch, draft: change.draft === true, deleteSourceBranch: change.deleteSourceBranch === true }, call)
+      return await provider.createMr(ref, { ...fields, targetBranch, draft: change.draft === true, deleteSourceBranch: change.deleteSourceBranch === true }, call)
     })
   }
 
-  async updateChange(repo: RepoTarget, number: number, update: MrUpdateFields) {
+  async updateMr(repo: RepoTarget, number: number, update: MrUpdateFields) {
     requireNumber(number)
     if (update.title !== undefined) requireText(update.title, '标题')
     if (update.targetBranch !== undefined) requireBranch(update.targetBranch, '目标分支名')
-    return await this.run(repo, update, `更新 PR/MR #${number}`, 'write', (provider, ref, call) => provider.updateChange(ref, number, update, call))
+    return await this.run(repo, update, `更新 PR/MR #${number}`, 'write', (provider, ref, call) => provider.updateMr(ref, number, update, call))
   }
 
-  async commentChange(repo: RepoTarget, number: number, body: string, options: CallOptions = {}) {
+  async commentMr(repo: RepoTarget, number: number, body: string, options: CallOptions = {}) {
     requireNumber(number)
     requireText(body, '评论内容')
-    return await this.run(repo, options, `评论 PR/MR #${number}`, 'write', (provider, ref, call) => provider.commentChange(ref, number, body, call))
+    return await this.run(repo, options, `评论 PR/MR #${number}`, 'write', (provider, ref, call) => provider.commentMr(ref, number, body, call))
   }
 
-  async mergeChange(repo: RepoTarget, number: number, options: MergeFields) {
+  async mergeMr(repo: RepoTarget, number: number, options: MergeFields) {
     requireNumber(number)
     requireCommit(options.headSha.toLowerCase(), 'headSha ')
     const request = { headSha: options.headSha, ...options.method === undefined ? {} : { method: options.method }, deleteSourceBranch: options.deleteSourceBranch === true }
-    return await this.run(repo, options, `合并 PR/MR #${number}`, 'merge', (provider, ref, call) => provider.mergeChange(ref, number, request, call))
+    return await this.run(repo, options, `合并 PR/MR #${number}`, 'merge', (provider, ref, call) => provider.mergeMr(ref, number, request, call))
   }
 
   async deleteMergedBranch(repo: RepoTarget, branch: string, options: CallOptions = {}): Promise<MergedBranchDeletion> {
     requireBranch(branch, '分支名')
     return await this.run(repo, options, `删除分支 ${branch}`, 'write', async (provider, ref, call) => {
       // The hosts' branch deletion takes no expected commit, so the head is read last, right before the deletion, to keep the window for a concurrent push small.
-      const changes = await allChangesFrom(provider, ref, branch, call)
+      const changes = await allMrsFrom(provider, ref, branch, call)
       const head = await provider.getBranch(ref, branch, call)
       if (head === undefined) throw new RepoError('not-found', `没有分支 ${branch}`)
       if (head.default) throw new RepoError('forbidden', `${branch} 是默认分支，不能删除`)

@@ -84,10 +84,10 @@ describe('GitHub provider', () => {
       { method: 'PUT', path: `${API}/pulls/5/merge`, reply: { status: 409, body: { message: 'Head branch was modified' } } },
     ])
     const service = createService(testConfig(), TOKENS)
-    const created = await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', labels: ['x'] })
+    const created = await service.createMr(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', labels: ['x'] })
     expect(created).toMatchObject({ number: 5, state: 'merged', labels: ['x'], assignees: [{ username: 'modestoma' }] })
     expect(requests.find(request => request.method === 'PATCH')?.body).toEqual({ labels: ['x'] })
-    await expect(service.mergeChange(REPO, 5, { headSha: SHA, method: 'squash' })).rejects.toMatchObject({ code: 'conflict' })
+    await expect(service.mergeMr(REPO, 5, { headSha: SHA, method: 'squash' })).rejects.toMatchObject({ code: 'conflict' })
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, merge_method: 'squash' })
   })
 
@@ -105,25 +105,25 @@ describe('GitHub provider', () => {
     ])
     const service = createService(testConfig(), TOKENS)
     const deletes = () => requests.filter(request => request.method === 'DELETE').length
-    expect(await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: true } })
+    expect(await service.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: true } })
     expect(deletes()).toBe(1)
     deleteReply = { status: 422, body: { message: 'Reference does not exist' } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
+    expect((await service.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
     deleteReply = { status: 403, body: { message: 'Resource not accessible by integration' } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'f', deleted: false, reason: expect.stringContaining('not accessible') })
+    expect((await service.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'f', deleted: false, reason: expect.stringContaining('not accessible') })
     const attempted = deletes()
 
     branch = { status: 200, body: { name: 'f', protected: true, commit: { sha: SHA } } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('受保护') })
+    expect((await service.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('受保护') })
     branch = { status: 200, body: { name: 'f', protected: false, commit: { sha: 'c'.repeat(40) } } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('新提交') })
+    expect((await service.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('新提交') })
     branch = { status: 404, body: { message: 'Branch not found' } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
+    expect((await service.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
     pull = merged(2)
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('fork') })
+    expect((await service.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('fork') })
     pull = merged(1, 'main')
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'main', deleted: false })
-    expect(await service.mergeChange(REPO, 5, { headSha: SHA })).toEqual({ sha: 'm1' })
+    expect((await service.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'main', deleted: false })
+    expect(await service.mergeMr(REPO, 5, { headSha: SHA })).toEqual({ sha: 'm1' })
     expect(deletes()).toBe(attempted)
   })
 
@@ -168,7 +168,7 @@ describe('GitHub provider', () => {
         : { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure', html_url: 'u' }] } } },
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [{ context: 'ci/lint', state: 'pending', target_url: null }] } } },
     ])
-    const status = await createService(testConfig(), TOKENS).changeStatus(REPO, 5)
+    const status = await createService(testConfig(), TOKENS).mrStatus(REPO, 5)
     expect(status.checks).toHaveLength(102)
     expect(status.overall).toBe('failure')
   })
@@ -189,7 +189,7 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/commits/${SHA}/check-runs`, reply: { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'success', html_url: 'u' }] } } },
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [{ context: 'ci/lint', state: 'pending', target_url: null }] } } },
     ])
-    expect(await createService(testConfig(), TOKENS).changeStatus(REPO, 5)).toEqual({
+    expect(await createService(testConfig(), TOKENS).mrStatus(REPO, 5)).toEqual({
       headSha: SHA,
       checks: [{ name: 'test', state: 'success', webUrl: 'u' }, { name: 'ci/lint', state: 'pending' }],
       overall: 'pending',
@@ -235,7 +235,7 @@ describe('GitHub token account', () => {
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [] } } },
     ])
     const service = createService(testConfig(), TOKENS)
-    const first = await service.changeActivity(REPO, 5, { withStatus: true, since: '2026-11-01T00:30:00Z' })
+    const first = await service.mrActivity(REPO, 5, { withStatus: true, since: '2026-11-01T00:30:00Z' })
     expect(first.conflict).toBe(true)
     expect(first.status).toMatchObject({ headSha: SHA, overall: 'failure' })
     expect(first.items?.map(item => [item.id, item.kind, item.author.username])).toEqual([
@@ -244,12 +244,12 @@ describe('GitHub token account', () => {
     expect(first.items?.[2]?.path).toBe('src/a.ts')
     expect(requests.find(request => request.url.pathname.endsWith('/issues/5/comments'))?.url.searchParams.get('since')).toBe('2026-11-01T00:30:00Z')
     requests.length = 0
-    const second = await service.changeActivity(REPO, 5, { updatedAt: updated, withStatus: false, since: '2026-11-01T00:50:00Z' })
+    const second = await service.mrActivity(REPO, 5, { updatedAt: updated, withStatus: false, since: '2026-11-01T00:50:00Z' })
     expect(second.items).toBeUndefined()
     expect(second.status).toBeUndefined()
     expect(requests.map(request => request.url.pathname)).toEqual([`${API}/pulls/5`])
     updated = '2026-11-01T02:00:00Z'
-    expect((await service.changeActivity(REPO, 5, { updatedAt: '2026-11-01T01:00:00Z', withStatus: false, since: '2026-11-01T00:50:00Z' })).items?.map(item => item.id)).toEqual(['line-9'])
+    expect((await service.mrActivity(REPO, 5, { updatedAt: '2026-11-01T01:00:00Z', withStatus: false, since: '2026-11-01T00:50:00Z' })).items?.map(item => item.id)).toEqual(['line-9'])
   })
   it('reads every page of new comments before reporting them', async () => {
     const page = (start: number, count: number) => Array.from({ length: count }, (_, index) => ({
@@ -264,7 +264,7 @@ describe('GitHub token account', () => {
       { method: 'GET', path: `${API}/pulls/5/comments`, reply: { body: [] } },
       { method: 'GET', path: `${API}/pulls/5/reviews`, reply: { body: [] } },
     ])
-    const polled = await createService(testConfig(), TOKENS).changeActivity(REPO, 5, { withStatus: false, since: '2026-11-01T00:30:00Z' })
+    const polled = await createService(testConfig(), TOKENS).mrActivity(REPO, 5, { withStatus: false, since: '2026-11-01T00:30:00Z' })
     expect(polled.items).toHaveLength(120)
   })
 })
@@ -284,7 +284,7 @@ describe('GitHub Actions CI', () => {
       { method: 'GET', path: `${API}/pulls/5`, reply: { body: { head: { sha: SHA } } } },
       { method: 'GET', path: `${API}/actions/runs`, reply: { body: { total_count: 1, workflow_runs: [runBody()] } } },
     ])
-    expect(await createService(testConfig(), TOKENS).listCiRuns(REPO, { change: 5, state: 'failure' })).toEqual({
+    expect(await createService(testConfig(), TOKENS).listCiRuns(REPO, { mr: 5, state: 'failure' })).toEqual({
       items: [{ id: 77, name: 'CI', state: 'failure', status: 'failure', ref: 'fix', sha: SHA, event: 'pull_request', createdAt: '2026-11-02T10:00:00Z', updatedAt: '2026-11-02T10:05:00Z', attempt: 1, webUrl: `${REPO}/actions/runs/77` }],
     })
     expect(Object.fromEntries(requests.at(-1)!.url.searchParams)).toMatchObject({ head_sha: SHA, status: 'failure', per_page: '30', page: '1' })
@@ -363,6 +363,6 @@ describe('GitHub Actions CI', () => {
       { method: 'GET', path: `${API}/commits/${SHA}/check-runs`, reply: { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure', html_url: `${REPO}/actions/runs/77/job/2` }] } } },
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [] } } },
     ])
-    expect((await createService(testConfig(), TOKENS).changeStatus(REPO, 5)).checks).toEqual([{ name: 'test', state: 'failure', webUrl: `${REPO}/actions/runs/77/job/2`, runId: 77, jobId: 2 }])
+    expect((await createService(testConfig(), TOKENS).mrStatus(REPO, 5)).checks).toEqual([{ name: 'test', state: 'failure', webUrl: `${REPO}/actions/runs/77/job/2`, runId: 77, jobId: 2 }])
   })
 })

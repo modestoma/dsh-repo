@@ -69,9 +69,9 @@ describe('GitLab provider', () => {
       { method: 'GET', path: `${API}/merge_requests`, reply: { body: [mr({ state: 'merged' })] } },
     ])
     const service = createService(testConfig(), TOKENS)
-    expect(await service.createChange(REPO, { title: 'T', sourceBranch: 'f', draft: true })).toMatchObject({ number: 7, draft: true, targetBranch: 'main', body: '' })
+    expect(await service.createMr(REPO, { title: 'T', sourceBranch: 'f', draft: true })).toMatchObject({ number: 7, draft: true, targetBranch: 'main', body: '' })
     expect(requests.find(request => request.method === 'POST')?.body).toMatchObject({ source_branch: 'f', target_branch: 'main', title: 'Draft: T' })
-    expect((await service.listChanges(REPO, { state: 'merged' })).items[0]?.state).toBe('merged')
+    expect((await service.listMrs(REPO, { state: 'merged' })).items[0]?.state).toBe('merged')
     expect(requests.at(-1)?.url.searchParams.get('state')).toBe('merged')
   })
 
@@ -79,7 +79,7 @@ describe('GitLab provider', () => {
     const { requests } = fakeHttp([
       { method: 'GET', path: `${API}/merge_requests`, reply: { body: [mr({ iid: 7, source_project_id: 1, target_project_id: 1 }), mr({ iid: 8, source_project_id: 2, target_project_id: 1 })] } },
     ])
-    const page = await createService(testConfig(), TOKENS).listChanges(REPO, { state: 'open', sourceBranch: 'f' })
+    const page = await createService(testConfig(), TOKENS).listMrs(REPO, { state: 'open', sourceBranch: 'f' })
     expect(page.items.map(item => item.number)).toEqual([7])
     expect(requests[0]?.url.searchParams.get('source_branch')).toBe('f')
   })
@@ -90,10 +90,10 @@ describe('GitLab provider', () => {
       { method: 'PUT', path: `${API}/merge_requests/7/merge`, reply: { body: mr({ state: 'merged', merge_commit_sha: 'm1' }) } },
     ])
     const service = createService(testConfig(), TOKENS)
-    expect(await service.changeStatus(REPO, 7)).toEqual({ headSha: SHA, checks: [{ name: 'pipeline #9', state: 'failure', webUrl: 'p', runId: 9 }], overall: 'failure', mergeable: true })
-    expect(await service.mergeChange(REPO, 7, { headSha: SHA, method: 'squash' })).toEqual({ sha: 'm1' })
+    expect(await service.mrStatus(REPO, 7)).toEqual({ headSha: SHA, checks: [{ name: 'pipeline #9', state: 'failure', webUrl: 'p', runId: 9 }], overall: 'failure', mergeable: true })
+    expect(await service.mergeMr(REPO, 7, { headSha: SHA, method: 'squash' })).toEqual({ sha: 'm1' })
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, squash: true })
-    await expect(service.mergeChange(REPO, 7, { headSha: SHA, method: 'rebase' })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(service.mergeMr(REPO, 7, { headSha: SHA, method: 'rebase' })).rejects.toMatchObject({ code: 'invalid' })
   })
 
   it('ticks "delete source branch" on new merge requests and asks GitLab to delete it on merge, except for forks', async () => {
@@ -104,15 +104,15 @@ describe('GitLab provider', () => {
       { method: 'PUT', path: `${API}/merge_requests/7/merge`, reply: request => ({ body: mr({ state: 'merged', merge_commit_sha: 'm1', should_remove_source_branch: (request.body as { should_remove_source_branch?: boolean }).should_remove_source_branch ?? null, force_remove_source_branch: false }) }) },
     ])
     const service = createService(testConfig(), TOKENS)
-    await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', deleteSourceBranch: true })
+    await service.createMr(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', deleteSourceBranch: true })
     expect(requests.at(-1)?.body).toMatchObject({ remove_source_branch: true })
-    await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main' })
+    await service.createMr(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main' })
     expect(requests.at(-1)?.body).not.toHaveProperty('remove_source_branch')
 
-    expect(await service.mergeChange(REPO, 7, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: true } })
+    expect(await service.mergeMr(REPO, 7, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: true } })
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, should_remove_source_branch: true })
     shown = mr({ source_project_id: 2, target_project_id: 1 })
-    expect(await service.mergeChange(REPO, 7, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: false, reason: expect.stringContaining('fork') } })
+    expect(await service.mergeMr(REPO, 7, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: false, reason: expect.stringContaining('fork') } })
     expect(requests.at(-1)?.body).toEqual({ sha: SHA })
   })
 
@@ -134,7 +134,7 @@ describe('GitLab provider', () => {
       { old_path: 'a.txt', new_path: 'a.txt', new_file: false, deleted_file: false, diff: '@@ -1 +1 @@\n-a\n+b\n' },
       { old_path: 'n.txt', new_path: 'n.txt', new_file: true, deleted_file: false, diff: '@@ -0,0 +1 @@\n+n\n' },
     ] } }])
-    const { diff, truncated } = await createService(testConfig(), TOKENS).changeDiff(REPO, 7)
+    const { diff, truncated } = await createService(testConfig(), TOKENS).mrDiff(REPO, 7)
     expect(truncated).toBe(false)
     expect(diff).toBe('diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/n.txt b/n.txt\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+n\n')
   })
@@ -143,7 +143,7 @@ describe('GitLab provider', () => {
     fakeHttp([{ method: 'GET', path: `${API}/merge_requests/7/diffs`, reply: { body: [
       { old_path: 'big.json', new_path: 'big.json', new_file: false, deleted_file: false, too_large: true, collapsed: false, diff: '' },
     ] } }])
-    const { diff, truncated } = await createService(testConfig(), TOKENS).changeDiff(REPO, 7)
+    const { diff, truncated } = await createService(testConfig(), TOKENS).mrDiff(REPO, 7)
     expect(truncated).toBe(true)
     expect(diff).toContain('GitLab 未返回这个文件的 diff')
   })
@@ -179,7 +179,7 @@ describe('GitLab token account', () => {
       ] } },
     ])
     const service = createService(testConfig(), TOKENS)
-    const polled = await service.changeActivity(REPO, 7, { withStatus: false, since: '2026-11-01T00:30:00.000Z' })
+    const polled = await service.mrActivity(REPO, 7, { withStatus: false, since: '2026-11-01T00:30:00.000Z' })
     expect(polled.conflict).toBe(true)
     expect(polled.status).toMatchObject({ overall: 'pending', checks: [{ name: 'pipeline #40' }] })
     expect(polled.items?.map(item => [item.id, item.kind, item.author.username, item.path])).toEqual([
@@ -188,7 +188,7 @@ describe('GitLab token account', () => {
     expect(polled.items?.[0]?.webUrl).toBe(`${REPO}/-/merge_requests/7#note_11`)
     expect(Object.fromEntries(requests[1]!.url.searchParams)).toMatchObject({ sort: 'desc', order_by: 'created_at', per_page: '100' })
     requests.length = 0
-    expect((await service.changeActivity(REPO, 7, { updatedAt: '2026-11-01T01:00:00.000Z', withStatus: false, since: '2026-11-01T00:55:00.000Z' })).items).toBeUndefined()
+    expect((await service.mrActivity(REPO, 7, { updatedAt: '2026-11-01T01:00:00.000Z', withStatus: false, since: '2026-11-01T00:55:00.000Z' })).items).toBeUndefined()
     expect(requests).toHaveLength(1)
   })
   it('reads older pages of notes until one predates the cursor', async () => {
@@ -201,7 +201,7 @@ describe('GitLab token account', () => {
         ? [...notes(400, 10, '2026-11-01T00:40:00.000Z'), ...notes(300, 5, '2026-11-01T00:10:00.000Z')]
         : notes(500, 100, '2026-11-01T00:50:00.000Z') }) },
     ])
-    const polled = await createService(testConfig(), TOKENS).changeActivity(REPO, 7, { withStatus: false, since: '2026-11-01T00:30:00.000Z' })
+    const polled = await createService(testConfig(), TOKENS).mrActivity(REPO, 7, { withStatus: false, since: '2026-11-01T00:30:00.000Z' })
     expect(polled.items).toHaveLength(110)
     expect(polled.items?.[0]?.id).toBe('391')
     expect(requests.filter(request => request.url.pathname.endsWith('/notes'))).toHaveLength(2)
@@ -227,8 +227,8 @@ describe('GitLab CI', () => {
       nextPage: 2,
     })
     expect(Object.fromEntries(requests[0]!.url.searchParams)).toMatchObject({ ref: 'main', status: 'failed', order_by: 'id', sort: 'desc', per_page: '1', page: '1' })
-    expect((await service.listCiRuns(REPO, { change: 7, state: 'running' })).items.map(run => run.id)).toEqual([43])
-    await expect(service.listCiRuns(REPO, { change: 7, ref: 'main' })).rejects.toMatchObject({ code: 'invalid' })
+    expect((await service.listCiRuns(REPO, { mr: 7, state: 'running' })).items.map(run => run.id)).toEqual([43])
+    await expect(service.listCiRuns(REPO, { mr: 7, ref: 'main' })).rejects.toMatchObject({ code: 'invalid' })
     await expect(service.listCiRuns(REPO, { sha: 'abc' })).rejects.toMatchObject({ code: 'invalid' })
   })
 
