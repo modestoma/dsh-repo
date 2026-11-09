@@ -199,6 +199,8 @@ function commitMsgHook(session: string | undefined): string {
 export class WorkspaceManager {
   /** Tail of each workspace's queue of status reads, pushes, and removals. */
   private readonly locks = new Map<string, Promise<void>>()
+  /** Tail of each destination directory's queue of creations. */
+  private readonly createLocks = new Map<string, Promise<void>>()
 
   /** @param deps - engine, registry, git runners, and the proxy. */
   constructor(private readonly deps: WorkspaceManagerDeps) {}
@@ -211,6 +213,12 @@ export class WorkspaceManager {
    * @throws {RepoError} see `DshRepoService.workspaceCreate`.
    */
   async create(request: CreateRequest, signal?: AbortSignal): Promise<WorkspaceInfo> {
+    if (!isAbsolute(request.path)) throw new RepoError('invalid', `工作区目录必须是绝对路径：${request.path}`)
+    // One creation per directory at a time, so a failed one never cleans up a directory another call just filled.
+    return await serialize(this.createLocks, await realPathOf(resolve(request.path)), async () => await this.createIn(request, signal))
+  }
+
+  private async createIn(request: CreateRequest, signal?: AbortSignal): Promise<WorkspaceInfo> {
     const { service } = this.deps
     const entry = service.catalog.require(request.repo, 'read')
     const url = entry.url
@@ -505,8 +513,11 @@ export class WorkspaceManager {
 
   /** The head of a branch in a mirror, or undefined when the mirror has no such branch. */
   private async mirrorBranch(mirrorDir: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {
-    const listed = (await this.git(['for-each-ref', '--format=%(objectname)', `refs/heads/${branch}`], mirrorDir, signal)).trim()
-    return listed === '' || ZERO.test(listed) ? undefined : listed
+    const target = `refs/heads/${branch}`
+    // for-each-ref also matches branches below `branch/`, so the refname has to match exactly.
+    const listed = await this.git(['for-each-ref', '--format=%(refname) %(objectname)', target], mirrorDir, signal)
+    const commit = listed.split('\n').find(line => line.startsWith(`${target} `))?.slice(target.length + 1).trim()
+    return commit === undefined || commit === '' || ZERO.test(commit) ? undefined : commit
   }
 
   /** Commit identity of new workspaces: the configured one, else the token account's; undefined for a local repository without configuration. */

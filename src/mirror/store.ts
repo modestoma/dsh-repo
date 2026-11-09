@@ -432,8 +432,9 @@ export class MirrorStore {
 
   private async branchHead(dir: string, branch: string, signal?: AbortSignal): Promise<{ commit: string; commitTime: string } | undefined> {
     const target = `refs/heads/${branch}`
-    const listed = await this.git(['for-each-ref', '--format=%(objectname)', target], dir, {}, signal)
-    if (listed.trim() === '') return undefined
+    // for-each-ref also matches branches below `branch/`, so the refname has to match exactly.
+    const listed = await this.git(['for-each-ref', '--format=%(refname)', target], dir, {}, signal)
+    if (!listed.split('\n').includes(target)) return undefined
     const [commit = '', commitTime = ''] = (await this.git(['log', '-1', '--format=%H%n%cI', target, '--'], dir, {}, signal)).trim().split('\n')
     return { commit, commitTime }
   }

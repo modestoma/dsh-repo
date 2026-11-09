@@ -138,6 +138,27 @@ describe('workspace creation', () => {
     expect(existsSync(join(sessions, 'b'))).toBe(false)
   })
 
+  it('does not take a branch below the requested name for the requested branch', async () => {
+    const { bare, commit, manager, sessions, root } = await setup()
+    const seed = join(root, 'seed')
+    writeFileSync(join(seed, 'other.txt'), 'other\n')
+    gitAs(seed, 'add', '.')
+    gitAs(seed, 'commit', '--quiet', '-m', 'other')
+    gitAs(seed, 'push', '--quiet', bare, 'HEAD:refs/heads/fix/sub')
+    const info = await manager.create({ repo: bare, path: join(sessions, 'app'), branch: 'fix' })
+    expect(info).toMatchObject({ branch: 'fix', baseCommit: commit })
+    expect(existsSync(join(sessions, 'app', 'other.txt'))).toBe(false)
+  })
+
+  it('creates one workspace when two calls target the same directory, leaving the winner intact', async () => {
+    const { bare, manager, sessions } = await setup()
+    const path = join(sessions, 'app')
+    const outcomes = await Promise.allSettled([manager.create({ repo: bare, path, branch: 'fix/a' }), manager.create({ repo: bare, path, branch: 'fix/b' })])
+    expect(outcomes.map(outcome => outcome.status).sort()).toEqual(['fulfilled', 'rejected'])
+    expect(existsSync(join(path, '.git'))).toBe(true)
+    expect((await manager.locate(path)).path).toBe(path)
+  })
+
   it('refuses to create a workspace while the proxy is stopped', async () => {
     const { bare, proxy, manager, sessions } = await setup()
     await proxy.stop()
