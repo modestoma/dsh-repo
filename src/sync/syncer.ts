@@ -35,7 +35,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, readdir, rm, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import type { CatalogEntry } from '../catalog/entry.ts'
-import type { MirrorState, MirrorSyncOptions } from '../contract.ts'
+import type { MirrorState } from '../mirror/store.ts'
 import { RepoError, toRepoError } from '../errors.ts'
 import type { HostLogger } from '../host.ts'
 import type { GitRunner } from '../mirror/git.ts'
@@ -70,7 +70,8 @@ export function syncRecords(entries: readonly CatalogEntry[]): SyncRecord[] {
 
 /** The service calls a sync makes. */
 export interface SyncService {
-  syncMirror(url: string, options?: MirrorSyncOptions): Promise<MirrorState>
+  /** Clone or fetch the mirror of `url` and resolve `branch` (default: the remote's default branch). */
+  syncMirror(url: string, options?: { readonly branch?: string; readonly signal?: AbortSignal }): Promise<MirrorState>
   /** @returns the mirror directory now in use, or undefined while none is chosen; sync directories must stay outside it. */
   mirrorSettings(): { readonly dir: string | undefined }
 }
@@ -380,7 +381,7 @@ export class LocalSyncer {
     }
     await mkdir(record.dir, { recursive: true })
     await mkdir(this.deps.indexDir, { recursive: true })
-    const git = (args: readonly string[]): Promise<string> => this.deps.git(['--git-dir', join(mirror.dir, '.git'), '--work-tree', record.dir, ...args], {
+    const git = (args: readonly string[]): Promise<string> => this.deps.git(['--git-dir', mirror.dir, '--work-tree', record.dir, ...args], {
       cwd: record.dir,
       timeoutMs: this.deps.timeoutMs(),
       env: { GIT_INDEX_FILE: index },

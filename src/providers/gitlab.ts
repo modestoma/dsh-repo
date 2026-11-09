@@ -9,12 +9,12 @@
 
 import { Gitlab } from '@gitbeaker/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiRunListOptions, CiState, CiTestCounts, CommentInfo, CommitAuthor, CommitInfo,
+  BranchInfo, MrInfo, MrState, MrStatus, CheckInfo, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiState, CiTestCounts, CommentInfo, CommitAuthor, CommitInfo,
   IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { capFailures, errorText, nextPage, okBody, titleOf, truncateBytes } from './types.ts'
-import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Paging, Provider, TokenSource } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ChangeActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitLab's maximum page size. */
 const MAX_PAGE = 100
@@ -82,8 +82,8 @@ function fromFork(value: GitlabMergeRequest): boolean {
   return value.source_project_id !== undefined && value.source_project_id !== value.target_project_id
 }
 
-function mergeRequest(value: GitlabMergeRequest): ChangeInfo {
-  const state: ChangeState = value.state === 'merged' ? 'merged' : value.state === 'opened' ? 'open' : 'closed'
+function mergeRequest(value: GitlabMergeRequest): MrInfo {
+  const state: MrState = value.state === 'merged' ? 'merged' : value.state === 'opened' ? 'open' : 'closed'
   return {
     ...issue(value),
     state,
@@ -121,7 +121,7 @@ interface GitlabMergeStatus {
   readonly detailed_merge_status?: unknown
 }
 
-function statusOf(data: GitlabMergeStatus): ChangeStatus {
+function statusOf(data: GitlabMergeStatus): MrStatus {
   const pipeline = data.head_pipeline
   const checks: CheckInfo[] = pipeline === undefined || pipeline === null
     ? []
@@ -159,7 +159,7 @@ function ciState(status: string): CiState {
   }
 }
 
-/** {@link CiRunListOptions.state} as a GitLab pipeline status. */
+/** {@link CiRunQuery.state} as a GitLab pipeline status. */
 const PIPELINE_STATUS = { pending: 'pending', running: 'running', success: 'success', failure: 'failed', canceled: 'canceled' } as const
 
 interface GitlabPipeline {
@@ -419,7 +419,7 @@ export class GitlabProvider implements Provider {
     return { path, ref: target, binary: false, ...truncateBytes(text, call.limits.maxFileBytes) }
   }
 
-  async listIssues(ref: RepoRef, query: Paging & { state: 'open' | 'closed' | 'all'; labels?: readonly string[]; assignee?: string }, call: Call) {
+  async listIssues(ref: RepoRef, query: Paging & { state: 'open' | 'closed' | 'all'; labels?: readonly string[]; assignee?: string; search?: string }, call: Call) {
     call.signal.throwIfAborted()
     const data = await this.api.Issues.all({
       projectId: ref.path,
@@ -427,6 +427,7 @@ export class GitlabProvider implements Provider {
       ...query.state === 'all' ? {} : { state: query.state === 'open' ? 'opened' as const : 'closed' as const },
       ...query.labels === undefined || query.labels.length === 0 ? {} : { labels: query.labels.join(',') },
       ...query.assignee === undefined ? {} : { assigneeUsername: [query.assignee] },
+      ...query.search === undefined ? {} : { search: query.search },
     })
     return { items: data.map(entry => issue(entry)), ...nextPage(query, data.length) }
   }
@@ -469,7 +470,7 @@ export class GitlabProvider implements Provider {
     return note(await this.api.IssueNotes.create(ref.path, number, body))
   }
 
-  async listChanges(ref: RepoRef, query: Paging & { state: ChangeState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
+  async listChanges(ref: RepoRef, query: Paging & { state: MrState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
     call.signal.throwIfAborted()
     const state = query.state === 'all' ? undefined : query.state === 'open' ? 'opened' as const : query.state
     const data = await this.api.MergeRequests.all({
@@ -598,7 +599,7 @@ export class GitlabProvider implements Provider {
   }
 
   /** Merge request pipelines come from their own endpoint, which filters nothing, so `state` is applied to the page read. */
-  async listRuns(ref: RepoRef, query: Paging & Pick<CiRunListOptions, 'ref' | 'sha' | 'change' | 'state'>, call: Call) {
+  async listRuns(ref: RepoRef, query: Paging & CiRunQuery, call: Call) {
     call.signal.throwIfAborted()
     const data: readonly GitlabPipeline[] = query.change === undefined
       ? await this.api.Pipelines.all(ref.path, {

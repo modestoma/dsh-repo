@@ -122,7 +122,7 @@ describe('GitLab provider', () => {
       { method: 'GET', path: `${API}/merge_requests`, reply: { body: [mr({ state: 'merged', source_project_id: 1, target_project_id: 1 })] } },
       { method: 'DELETE', path: `${API}/repository/branches/f`, reply: { status: 204 } },
     ])
-    expect(await createService(testConfig(), TOKENS).deleteMergedBranch(REPO, 'f')).toEqual({ branch: 'f', commit: SHA, change: { number: 7, webUrl: `${REPO}/-/merge_requests/7` } })
+    expect(await createService(testConfig(), TOKENS).deleteMergedBranch(REPO, 'f')).toEqual({ branch: 'f', commit: SHA, mr: { number: 7, webUrl: `${REPO}/-/merge_requests/7` } })
     const list = requests.find(request => request.url.pathname === `${API}/merge_requests`)
     expect(list?.url.searchParams.get('source_branch')).toBe('f')
     expect(list?.url.searchParams.has('state')).toBe(false)

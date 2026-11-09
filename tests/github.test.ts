@@ -51,6 +51,17 @@ describe('GitHub provider', () => {
     expect(requests[0]?.url.searchParams.get('labels')).toBe('bug')
   })
 
+  it('searches issues as text inside the repository only', async () => {
+    const found = (number: number, repository: string) => ({
+      number, title: `t${number}`, body: null, state: 'open', user: author, labels: [], assignees: [], created_at: 'c', updated_at: 'u',
+      html_url: `https://github.com/${repository}/issues/${number}`, repository_url: `https://api.github.com/repos/${repository}`,
+    })
+    const { requests } = fakeHttp([{ method: 'GET', path: '/search/issues', reply: { body: { total_count: 2, items: [found(1, 'modestoma/dsh-repo'), found(2, 'other/private')] } } }])
+    const page = await createService(testConfig(), TOKENS).listIssues(REPO, { search: 'crash repo:other/private', assignee: 'a b' })
+    expect(page.items.map(item => item.number)).toEqual([1])
+    expect(requests[0]?.url.searchParams.get('q')).toBe('"crash" "repo:other/private" repo:modestoma/dsh-repo is:issue state:open assignee:"a b"')
+  })
+
   it('reads one branch, and reports a missing or renamed branch as absent', async () => {
     fakeHttp([
       { method: 'GET', path: API, reply: { body: repoBody } },
@@ -72,21 +83,8 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/pulls/5`, reply: { body: pr } },
       { method: 'PUT', path: `${API}/pulls/5/merge`, reply: { status: 409, body: { message: 'Head branch was modified' } } },
     ])
-    const events: unknown[] = []
-    let refuse: string | undefined
-    const service = createService(testConfig(), TOKENS, undefined, async (name, ...args) => {
-      events.push([name, args[0]])
-      if (refuse !== undefined) throw new AggregateError([new Error(refuse)])
-    })
-    refuse = '发起人没有改代码权限'
-    await expect(service.createChange(REPO, { title: 'T', sourceBranch: 'f', session: 's1' })).rejects.toMatchObject({ code: 'forbidden', message: 'createChange 未获授权，没有执行：发起人没有改代码权限' })
-    await expect(service.createChange(REPO, { title: 'T', sourceBranch: 'f', session: ' ' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('会话') })
-    expect(events).toEqual([['access/authorize', { session: 's1', level: 'code-write', action: 'createChange', summary: '在 github.com/modestoma/dsh-repo 创建 PR/MR：f → 默认分支，标题：T' }]])
-    expect(requests).toEqual([])
-    refuse = undefined
-    const created = await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', labels: ['x'], session: 's1' })
-    expect(events).toHaveLength(2)
-    expect(requests.find(request => request.method === 'POST')?.body).not.toHaveProperty('session')
+    const service = createService(testConfig(), TOKENS)
+    const created = await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', labels: ['x'] })
     expect(created).toMatchObject({ number: 5, state: 'merged', labels: ['x'], assignees: [{ username: 'modestoma' }] })
     expect(requests.find(request => request.method === 'PATCH')?.body).toEqual({ labels: ['x'] })
     await expect(service.mergeChange(REPO, 5, { headSha: SHA, method: 'squash' })).rejects.toMatchObject({ code: 'conflict' })
@@ -142,7 +140,7 @@ describe('GitHub provider', () => {
       { method: 'DELETE', path: new RegExp(`${API}/git/refs/heads(/|%2F)f$`), reply: { status: 204 } },
     ])
     const service = createService(testConfig(), TOKENS)
-    expect(await service.deleteMergedBranch(REPO, 'f')).toEqual({ branch: 'f', commit: SHA, change: { number: 5, webUrl: `${REPO}/pull/5` } })
+    expect(await service.deleteMergedBranch(REPO, 'f')).toEqual({ branch: 'f', commit: SHA, mr: { number: 5, webUrl: `${REPO}/pull/5` } })
     const list = requests.find(request => request.url.pathname === `${API}/pulls`)
     expect(list?.url.searchParams.get('head')).toBe('modestoma:f')
     expect(list?.url.searchParams.get('state')).toBe('all')

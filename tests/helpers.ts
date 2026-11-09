@@ -5,13 +5,10 @@ import { tmpdir } from 'node:os'
 import { DEFAULT_SETTINGS, resolveConfig, resolveSettings, settingsOverrides } from '../src/config.ts'
 import type { RepoConfig, RepoSettings } from '../src/config.ts'
 import type { HostCredentials } from '../src/host.ts'
-import type { ParallelDispatch } from '../src/events.ts'
 import { HostStore } from '../src/hosts.ts'
 import { runGit } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import type { MirrorLimits } from '../src/mirror/store.ts'
-import { WorkspaceStore } from '../src/mirror/workspace.ts'
-import type { GitRunner } from '../src/mirror/git.ts'
 import { RepoService } from '../src/service.ts'
 import type { CatalogEntry } from '../src/catalog/entry.ts'
 import type { RepoAccess } from '../src/contract.ts'
@@ -117,25 +114,19 @@ export async function allow(service: RepoService, urls: readonly string[], acces
 }
 
 /** Fixed mirror limits. */
-export function mirrorLimits(maxFileBytes: number, maxTreeEntries: number, timeoutMs = 30_000): () => MirrorLimits {
-  return () => ({ timeoutMs, maxFileBytes, maxTreeEntries })
+export function mirrorLimits(timeoutMs = 30_000): () => MirrorLimits {
+  return () => ({ timeoutMs })
 }
 
 /** Service over a configuration, fixed tokens, settings, and catalog (default {@link TEST_REPOS} with `merge` access), with its settings file and mirrors in a fresh directory. */
-export function createService(config: RepoConfig, tokens: Record<string, string> = {}, settings: RepoSettings = DEFAULT_SETTINGS, parallel?: ParallelDispatch, repos: readonly CatalogEntry[] = catalogEntries(TEST_REPOS)): RepoService {
+export function createService(config: RepoConfig, tokens: Record<string, string> = {}, settings: RepoSettings = DEFAULT_SETTINGS, repos: readonly CatalogEntry[] = catalogEntries(TEST_REPOS)): RepoService {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-test-'))
   return new RepoService({
     forbiddenMirrorRoots: [],
     credentials: credentials(tokens),
     hosts: hostStore(config, root, settings, repos),
-    ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(settings.limits.maxFileBytes, settings.limits.maxTreeEntries) })),
-    ...parallel === undefined ? {} : { parallel },
+    mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
   })
-}
-
-/** Service dependencies over a mirror store: the store and workspaces on it. */
-export function withMirrors(mirrors: MirrorStore, git: GitRunner = runGit, maxDiffBytes = 4096): { mirrors: MirrorStore; workspaces: WorkspaceStore } {
-  return { mirrors, workspaces: new WorkspaceStore({ git, mirrors, limits: () => ({ timeoutMs: 30_000, maxDiffBytes }) }) }
 }
 
 /** Settings with overrides on top of the defaults. */

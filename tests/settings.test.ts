@@ -15,7 +15,12 @@ import { credentials } from './helpers.ts'
 type Handler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
 const servers: { close(): void }[] = []
-afterEach(() => { for (const server of servers.splice(0)) server.close() })
+/** Disposers of the plugin's effects, run after each test so its git proxy and timers stop. */
+const effects: (() => void)[] = []
+afterEach(() => {
+  for (const server of servers.splice(0)) server.close()
+  for (const dispose of effects.splice(0)) dispose()
+})
 
 /** Apply the plugin with a Web server whose routes are served on a real port. */
 async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {}, home?: string) {
@@ -36,7 +41,10 @@ async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {},
     get: name => services[name],
     effect: (callback) => {
       const dispose = callback()
-      if (typeof dispose === 'function') disposers.push(dispose)
+      if (typeof dispose === 'function') {
+        disposers.push(dispose)
+        effects.push(dispose)
+      }
       return () => {}
     },
     inject: (names, callback) => { if (names.every(name => services[name] !== undefined)) callback(ctx) },
@@ -61,7 +69,7 @@ async function serve(rejection?: 401 | 403, extra: Record<string, unknown> = {},
   }
   const json = (method: string, body: unknown, headers: Record<string, string> = {}): RequestInit =>
     ({ method, body: JSON.stringify(body), headers: { 'content-type': 'application/json', ...headers } })
-  return { call, json, routes, disposers, service: provided.get('dshRepos') as RepoService, env, base }
+  return { call, json, routes, disposers, service: Reflect.get(provided.get('dshRepos') as object, 'service') as RepoService, env, base }
 }
 
 describe('settings routes', () => {

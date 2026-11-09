@@ -7,11 +7,11 @@ import { catalogKey } from '../src/catalog/catalog.ts'
 import { HostStore } from '../src/hosts.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import type { ParallelDispatch } from '../src/events.ts'
-import { credentials, mirrorLimits, testConfig, withMirrors } from './helpers.ts'
+import { RepoError } from '../src/errors.ts'
+import { credentials, mirrorLimits, testConfig } from './helpers.ts'
 
 /** A service with an empty catalog over a fresh settings file. */
-function setup(parallel?: ParallelDispatch, seed?: unknown) {
+function setup(seed?: unknown) {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-catalog-'))
   const file = join(root, 'hosts.json')
   if (seed !== undefined) writeFileSync(file, JSON.stringify(seed))
@@ -21,8 +21,7 @@ function setup(parallel?: ParallelDispatch, seed?: unknown) {
     forbiddenMirrorRoots: [],
     credentials: credentials({}),
     hosts,
-    ...withMirrors(new MirrorStore({ git: async () => '', root: join(root, 'mirrors'), limits: mirrorLimits(10, 10, 1000) })),
-    ...parallel === undefined ? {} : { parallel },
+    mirrors: new MirrorStore({ git: async () => '', root: join(root, 'mirrors'), limits: mirrorLimits(1000) }),
   })
   return { root, file, service, catalog: service.catalog, warnings }
 }
@@ -77,7 +76,7 @@ describe('repository catalog', () => {
 
   it('refuses entries past the catalog limit', async () => {
     const repos = Array.from({ length: 200 }, (_, index) => ({ id: index.toString(16).padStart(12, '0'), url: `https://github.com/a/r${index}`, access: 'read', features: [], addedAt: 't' }))
-    const { catalog } = setup(undefined, { hosts: [], repos })
+    const { catalog } = setup({ hosts: [], repos })
     await expect(catalog.add({ url: 'https://github.com/a/more', access: 'read', features: [] })).rejects.toMatchObject({ code: 'too-large' })
   })
 
@@ -102,57 +101,56 @@ describe('repository catalog', () => {
     expect(seen).toEqual([[], [], [], ['https://github.com/a/b'], ['https://github.com/a/b']])
   })
 
-  it('adds a repository for a Session after access/authorize allows an admin change, and turns features on for an entry', async () => {
-    const events: unknown[] = []
+  it('adds a repository after the confirmation passes, and turns features on for an entry', async () => {
+    const asked: string[] = []
     let refuse: string | undefined
-    const { service } = setup(async (name, ...args) => {
-      events.push([name, args[0]])
-      if (refuse !== undefined) throw new AggregateError([new Error(refuse)])
-    })
+    const confirm = async (summary: string) => {
+      asked.push(summary)
+      if (refuse !== undefined) throw new RepoError('forbidden', refuse)
+    }
+    const { service } = setup()
     service.registerFeature({ id: 'log-analysis', title: '日志分析' })
     refuse = '只有管理员可以改仓库清单'
-    await expect(service.addRepo('https://github.com/a/b', { features: ['log-analysis'], session: 's1' })).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('只有管理员') })
+    await expect(service.addRepo('https://github.com/a/b', { features: ['log-analysis'] }, confirm)).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('只有管理员') })
     expect(service.listRepos()).toEqual([])
     refuse = undefined
-    const added = await service.addRepo('https://github.com/a/b', { features: ['log-analysis'], session: 's1' })
+    const added = await service.addRepo('https://github.com/a/b', { features: ['log-analysis'] }, confirm)
     expect(added).toMatchObject({ status: 'added', repo: { url: 'https://github.com/a/b', access: 'read', features: ['log-analysis'] } })
-    expect(events.at(-1)).toEqual(['access/authorize', { session: 's1', level: 'admin', action: 'addRepo', summary: '把 github.com/a/b 加入 dsh-repo 仓库清单（权限：只读；打开功能：日志分析）' }])
-    expect(await service.addRepo('https://GitHub.com/A/B', { features: ['log-analysis'], session: 's1' })).toMatchObject({ status: 'unchanged' })
-    expect(events).toHaveLength(2)
-    const updated = await service.addRepo('https://github.com/a/b', { features: ['other'], access: 'merge', session: 's1' })
+    expect(asked.at(-1)).toBe('把 github.com/a/b 加入 dsh-repo 仓库清单（权限：只读；打开功能：日志分析）')
+    expect(await service.addRepo('https://GitHub.com/A/B', { features: ['log-analysis'] }, confirm)).toMatchObject({ status: 'unchanged' })
+    expect(asked).toHaveLength(2)
+    const updated = await service.addRepo('https://github.com/a/b', { features: ['other'], access: 'merge' }, confirm)
     expect(updated).toMatchObject({ status: 'updated', repo: { access: 'read', features: ['log-analysis', 'other'] } })
-    expect(events.at(-1)).toMatchObject(['access/authorize', { summary: '为仓库清单中的 github.com/a/b 打开功能：other' }])
-    await expect(service.addRepo('https://github.com/a/b', { branch: 'dev' })).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('默认分支') })
-    await expect(service.addRepo('https://github.com/a/c', { session: ' ' })).rejects.toMatchObject({ code: 'invalid' })
-    await expect(service.addRepo('https://gitlab.com/a/c')).rejects.toMatchObject({ code: 'not-allowed' })
-    expect(await service.addRepo('https://github.com/a/c', { branch: 'dev', access: 'write' })).toMatchObject({ status: 'added', repo: { branch: 'dev', access: 'write', features: [] } })
-    expect(events).toHaveLength(3)
+    expect(asked.at(-1)).toBe('为仓库清单中的 github.com/a/b 打开功能：other')
+    await expect(service.addRepo('https://github.com/a/b', { branch: 'dev' }, confirm)).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('默认分支') })
+    await expect(service.addRepo('https://gitlab.com/a/c', {}, confirm)).rejects.toMatchObject({ code: 'not-allowed' })
+    expect(await service.addRepo('https://github.com/a/c', { branch: 'dev', access: 'write' }, confirm)).toMatchObject({ status: 'added', repo: { branch: 'dev', access: 'write', features: [] } })
+    expect(asked).toHaveLength(4)
     // Concurrent additions on different branches: the one stored second is refused instead of joining the first's branch.
     const racing = await Promise.allSettled([
-      service.addRepo('https://github.com/a/race', { branch: 'main', features: ['x'], session: 's1' }),
-      service.addRepo('https://github.com/a/race', { branch: 'dev', features: ['y'], session: 's1' }),
+      service.addRepo('https://github.com/a/race', { branch: 'main', features: ['x'] }, confirm),
+      service.addRepo('https://github.com/a/race', { branch: 'dev', features: ['y'] }, confirm),
     ])
     expect(racing.map(outcome => outcome.status)).toEqual(['fulfilled', 'rejected'])
     expect(racing[1]).toMatchObject({ reason: { code: 'conflict' } })
     expect(service.listRepos().find(repo => repo.url === 'https://github.com/a/race')).toMatchObject({ branch: 'main', features: ['x'] })
-    events.length = 0
     // The merged feature list stays within the limit the settings file accepts.
     const many = Array.from({ length: 20 }, (_, index) => `f${index}`)
-    await service.addRepo('https://github.com/a/full', { features: many })
-    await expect(service.addRepo('https://github.com/a/full', { features: ['one-more'] })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('最多打开 20 个功能') })
+    await service.addRepo('https://github.com/a/full', { features: many }, confirm)
+    await expect(service.addRepo('https://github.com/a/full', { features: ['one-more'] }, confirm)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('最多打开 20 个功能') })
     expect(service.listRepos().find(repo => repo.url === 'https://github.com/a/full')?.features).toHaveLength(20)
   })
 
   it('keeps entries whose host is gone, reports them, and skips them for the highest access', async () => {
     const entry = { id: 'abcdefabcdef', url: 'https://gone.example.com/a/b', access: 'merge', features: [], addedAt: 't' }
-    const { catalog } = setup(undefined, { hosts: [], repos: [entry] })
+    const { catalog } = setup({ hosts: [], repos: [entry] })
     expect(catalog.keyOf(catalog.entries()[0]!)).toEqual({ problem: expect.stringContaining('gone.example.com') })
     expect(catalog.highestAccess()).toBeUndefined()
   })
 
   it('ignores retired settings with a warning and drops them on the next save', async () => {
     const seed = { hosts: [], settings: { repos: ['github.com/a/*'], mirror: { otherHosts: true, gitTimeoutMs: 60_000 }, tools: { merge: true } } }
-    const { warnings, service, file } = setup(undefined, seed)
+    const { warnings, service, file } = setup(seed)
     expect(warnings).toEqual([expect.stringContaining('settings.repos、settings.mirror.otherHosts、settings.tools.merge')])
     expect(service.settings.mirror.gitTimeoutMs).toBe(60_000)
     await service.catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [] })

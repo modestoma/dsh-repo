@@ -20,7 +20,7 @@
  * @module dsh-repo/watch/watcher
  */
 
-import type { ChangeInfo, CiJob, RepoRef } from '../contract.ts'
+import type { MrInfo, CiJob, RepoRef } from '../contract.ts'
 import type { WatchSettings } from '../config.ts'
 import type { HostLogger } from '../host.ts'
 import type { ActivityRequest, ChangeActivity } from '../providers/types.ts'
@@ -62,7 +62,7 @@ export interface WatcherDeps {
 export interface TrackRequest {
   /** Repository target of the PR/MR. */
   readonly repo: string
-  readonly change: ChangeInfo
+  readonly change: MrInfo
   readonly session: string
   readonly source: WatchSource
   /** Head the tools just pushed. */

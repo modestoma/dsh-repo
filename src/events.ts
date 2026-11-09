@@ -41,7 +41,7 @@ export async function authorize(parallel: ParallelDispatch | undefined, event: A
  * @returns the trailers in the order they were added, and the author when a listener set one.
  * @throws {RepoError} `unavailable` naming the listener failures; `invalid` when more than one author was set.
  */
-export async function collectDetails(parallel: ParallelDispatch | undefined, request: { readonly session: string; readonly dir: string }): Promise<CommitDetails> {
+export async function collectDetails(parallel: ParallelDispatch | undefined, request: { readonly session: string; readonly path: string }): Promise<CommitDetails> {
   const trailers: CommitTrailer[] = []
   const authors: CommitAuthor[] = []
   let open = true

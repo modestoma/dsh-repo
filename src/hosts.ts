@@ -27,6 +27,7 @@ export const MAX_TOKEN_LENGTH = 4096
 const fileSchema = z.object({
   hosts: z.array(hostSpecSchema).default([]),
   mirrorDir: z.string().min(1).refine(isAbsolute, '镜像目录必须是绝对路径').optional(),
+  workspaceDir: z.string().min(1).refine(isAbsolute, '工作区目录必须是绝对路径').optional(),
   repos: z.array(catalogEntrySchema).default([]),
   settings: repoSettingsSchema.optional(),
 }).strict()
@@ -62,6 +63,7 @@ function dropRetired(raw: unknown): string[] {
 interface Stored {
   readonly hosts: readonly HostSpec[]
   readonly mirrorDir: string | undefined
+  readonly workspaceDir: string | undefined
   readonly repos: readonly CatalogEntry[]
   readonly settings: RepoSettings
 }
@@ -104,6 +106,7 @@ export class HostStore {
     this.stored = {
       hosts: stored.hosts.filter(host => !configured.some(spec => spec.url === host.url)),
       mirrorDir: stored.mirrorDir,
+      workspaceDir: stored.workspaceDir,
       repos: stored.repos,
       settings: stored.settings ?? DEFAULT_SETTINGS,
     }
@@ -142,6 +145,20 @@ export class HostStore {
    */
   setMirrorDir(dir: string | undefined): Promise<void> {
     return this.enqueue(() => this.write({ ...this.stored, mirrorDir: dir }))
+  }
+
+  /** @returns the directory the settings page creates workspaces in, or undefined while none is chosen. */
+  workspaceDir(): string | undefined {
+    return this.stored.workspaceDir
+  }
+
+  /**
+   * Persist the workspace directory, or clear the choice.
+   * @param dir - absolute directory, or undefined.
+   * @throws {RepoError} `unavailable` when the file cannot be written.
+   */
+  setWorkspaceDir(dir: string | undefined): Promise<void> {
+    return this.enqueue(() => this.write({ ...this.stored, workspaceDir: dir }))
   }
 
   /** @returns the repository catalog in order. */
@@ -264,6 +281,7 @@ export class HostStore {
     const content = {
       hosts: next.hosts,
       ...next.mirrorDir === undefined ? {} : { mirrorDir: next.mirrorDir },
+      ...next.workspaceDir === undefined ? {} : { workspaceDir: next.workspaceDir },
       ...next.repos.length === 0 ? {} : { repos: next.repos },
       ...Object.keys(overrides).length === 0 ? {} : { settings: overrides },
     }

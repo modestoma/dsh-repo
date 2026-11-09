@@ -2,25 +2,28 @@
  * dsh-repo —— DeepSeek Harness 代码仓库插件。
  *
  * 用 GitHub 官方 SDK（Octokit）和 GitLab 文档推荐的 GitBeaker 抹平
- * GitHub（含 GitHub Enterprise Server）与 GitLab（含自建实例）的差异：
- * 对其他插件提供 `dshRepos` 服务（类型见 `dsh-repo/contract`），
- * 对模型提供代码、issue、PR/MR 工具，写操作逐次经用户审批。只有仓库清单中的
- * 仓库可以访问，每个仓库按清单里的权限（只读、可改代码、可合并）限制操作，
- * 并可把分支定时展开到本机目录（本地同步）；其他插件可以登记按仓库开关的功能。
- * Web 组合中另在左侧栏「代码仓库」提供整页设置（见 `dsh-repo/client`）。
+ * GitHub（含 GitHub Enterprise Server）与 GitLab（含自建实例）的差异。
+ * 每个模型工具 `repo_<对象>_<动作>` 都对应一个 `dshRepos` 服务方法
+ * `<对象><动作>`（类型见 `dsh-repo/contract`），两者走同一套校验、
+ * 授权与审批。工作区是普通 git 克隆，经本机 127.0.0.1 上的 git 代理访问远端，
+ * 工作区里不存放任何令牌。只有仓库清单中的仓库可以访问，每个仓库按清单里的
+ * 权限（只读、可改代码、可合并）限制操作，并可把分支定时展开到本机目录
+ * （本地同步）；其他插件可以登记按仓库开关的功能。Web 组合中另在左侧栏
+ * 「代码仓库」提供整页设置（见 `dsh-repo/client`）。
  *
  * @module dsh-repo
  */
 
 import { hostsFile, resolveConfig, syncIndexDir, syncsFile, watchesFile } from './config.ts'
 import { forbiddenMirrorRoots } from './mirror/root.ts'
-import type { HostApproval, HostContext, WorkingDirectoryService } from './host.ts'
+import { DshReposApi } from './api.ts'
+import type { HostApproval, HostContext, SandboxConfiner, WorkingDirectoryService } from './host.ts'
 import type { WatchDelivery } from './watch/delivery.ts'
 import { HostStore } from './hosts.ts'
-import { runGit } from './mirror/git.ts'
+import { runCommand, runGit } from './mirror/git.ts'
 import type { GitRunner } from './mirror/git.ts'
 import { MirrorStore } from './mirror/store.ts'
-import { WorkspaceStore } from './mirror/workspace.ts'
+import type { OperationDeps } from './operations.ts'
 import { DSH_REPOS_SERVICE, RepoService } from './service.ts'
 import type { ProviderFactory } from './service.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
@@ -30,8 +33,12 @@ import { SyncStore } from './sync/store.ts'
 import { LocalSyncer, syncRecords } from './sync/syncer.ts'
 import { WatchStore } from './watch/store.ts'
 import { ChangeWatcher } from './watch/watcher.ts'
-import { authorize } from './events.ts'
 import type { ParallelDispatch } from './events.ts'
+import { WorkspaceManager } from './workspace/manager.ts'
+import type { WorkspaceGit } from './workspace/manager.ts'
+import { GitProxy } from './workspace/proxy.ts'
+import type { WorkspaceRecord } from './workspace/registry.ts'
+import { WorkspaceRegistry, workspacesFile } from './workspace/registry.ts'
 
 export type * from './contract.ts'
 export type { HostSpec, RepoConfig, RepoLimits, RepoSettings, SettingsOverrides } from './config.ts'
@@ -39,14 +46,22 @@ export { DEFAULT_SETTINGS, apiBaseUrl, hostsFile, normalizeHostUrl, pluginConfig
 export { MIRROR_DIR_UNSET, checkMirrorDir, forbiddenMirrorRoots } from './mirror/root.ts'
 export { RepoError, toRepoError } from './errors.ts'
 export { HostStore, addedTokenRef, isAcceptedToken } from './hosts.ts'
-export { GitError, credentialEnvironment, runGit } from './mirror/git.ts'
+export { GitError, credentialEnvironment, runCommand, runGit } from './mirror/git.ts'
 export type { GitRunOptions, GitRunner } from './mirror/git.ts'
 export { MirrorStore, isAcceptedGitUrl, mirrorPath } from './mirror/store.ts'
-export type { MirrorLimits, MirrorStoreDeps } from './mirror/store.ts'
-export { WorkspaceStore, forgetAbandonedWorkspaces } from './mirror/workspace.ts'
-export type { PushRequest, WorkspaceLimits, WorkspaceStoreDeps } from './mirror/workspace.ts'
+export type { MirrorLimits, MirrorSnapshot, MirrorState, MirrorStoreDeps } from './mirror/store.ts'
 export { DSH_REPOS_SERVICE, RepoService, defaultProviderFactory } from './service.ts'
 export type { ProviderFactory, RepoServiceDeps } from './service.ts'
+export { DshReposApi } from './api.ts'
+export type { ApiDeps } from './api.ts'
+export { DeclinedError, OPERATIONS, execute, operationOf } from './operations.ts'
+export type { Caller, Operation, OperationDeps, Prompt, WatchHooks } from './operations.ts'
+export { WorkspaceManager, proxyUrl, workspaceInfo } from './workspace/manager.ts'
+export type { WorkspaceGit, WorkspaceManagerDeps } from './workspace/manager.ts'
+export { WorkspaceRegistry, workspacesFile } from './workspace/registry.ts'
+export type { WorkspaceRecord } from './workspace/registry.ts'
+export { GitProxy } from './workspace/proxy.ts'
+export type { GitProxyDeps } from './workspace/proxy.ts'
 export { GithubProvider } from './providers/github.ts'
 export { GitlabProvider } from './providers/gitlab.ts'
 export type { Provider } from './providers/types.ts'
@@ -58,11 +73,11 @@ export type { CatalogEntry, CheckedInput } from './catalog/entry.ts'
 export { overlaps, realPathOf, within } from './paths.ts'
 export { createTools, toolOffered } from './tools.ts'
 export { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, SETTING_BOUNDS, STATE_ROUTE } from './settings/contract.ts'
-export type { HostAddRequest, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState } from './settings/contract.ts'
+export type { HostAddRequest, MirrorSettings, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState } from './settings/contract.ts'
 export { hostDirectoryPicker } from './settings/directory-picker.ts'
 export type { DirectoryPicker } from './settings/directory-picker.ts'
 export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes, settingsState } from './settings/routes.ts'
-export type { Declined, RepoTool, ToolAccess, ToolDeps, WatchHooks } from './tools.ts'
+export type { Declined, RepoTool, ToolAccess } from './tools.ts'
 export { ACTIVITY_SOURCE, RESOLVE_AGENT_EVENT, activityMessage, hostDelivery } from './watch/delivery.ts'
 export type { DeliveryOutcome, WatchDelivery } from './watch/delivery.ts'
 export { WatchStore } from './watch/store.ts'
@@ -112,13 +127,14 @@ export interface RepoPluginOptions {
 }
 
 /**
- * Provide the `dshRepos` service, start the PR/MR watcher and the catalog's
- * local syncs, mount the settings routes while the Host serves the Web, and
- * register the model tools, each offered only while the catalog holds a
- * repository whose access the tool needs and the current tool settings allow
- * it (`repo_mr_watch` also needs watching to be active). Writes made for a
- * Session go through the `access/authorize` listeners first, and pushes
- * collect `repo/commit-trailers` (see `dsh-repo/events`).
+ * Provide the `dshRepos` service, start the local git proxy, the PR/MR
+ * watcher, and the catalog's local syncs, mount the settings routes while the
+ * Host serves the Web, and register the model tools, each offered only while
+ * the catalog holds a repository whose access the tool needs and the current
+ * tool settings allow it (`repo_mr_watch` also needs watching to be active).
+ * Writes made for a Session go through the `access/authorize` listeners first,
+ * and commits made by `workspacePush` collect `repo/commit-trailers` (see
+ * `dsh-repo/events`).
  * @param ctx - plugin context.
  * @param config - loader-validated configuration.
  * @param options - test seams.
@@ -129,34 +145,16 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   const env = options.env ?? process.env
   const hosts = new HostStore(resolved.hosts, hostsFile(resolved, env), ctx.logger)
   const git = options.git ?? runGit
-  const mirrors = new MirrorStore({
-    git,
-    root: undefined,
-    limits: () => {
-      const { mirror, limits } = hosts.settings()
-      return { timeoutMs: mirror.gitTimeoutMs, maxFileBytes: limits.maxFileBytes, maxTreeEntries: limits.maxTreeEntries }
-    },
-  })
-  const workspaces = new WorkspaceStore({
-    git,
-    mirrors,
-    limits: () => {
-      const { mirror, limits } = hosts.settings()
-      return { timeoutMs: mirror.gitTimeoutMs, maxDiffBytes: limits.maxDiffBytes }
-    },
-  })
+  const mirrors = new MirrorStore({ git, root: undefined, limits: () => ({ timeoutMs: hosts.settings().mirror.gitTimeoutMs }) })
   const parallel: ParallelDispatch | undefined = ctx.parallel === undefined ? undefined : (name, ...args) => ctx.parallel!(name, ...args)
   const service = new RepoService({
     credentials: ctx.credentials,
     hosts,
     mirrors,
-    workspaces,
     forbiddenMirrorRoots: options.forbiddenMirrorRoots ?? forbiddenMirrorRoots(env),
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
-    ...parallel === undefined ? {} : { parallel },
     ...options.providerFactory === undefined ? {} : { factory: options.providerFactory },
   })
-  ctx.provide?.(DSH_REPOS_SERVICE, service)
   const watcher = new ChangeWatcher({
     service,
     store: new WatchStore(watchesFile(hosts.file), ctx.logger),
@@ -164,6 +162,63 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
     delivery: options.delivery ?? hostDelivery(ctx),
     ...ctx.logger === undefined ? {} : { logger: ctx.logger },
   })
+  const registry = new WorkspaceRegistry(workspacesFile(hosts.file), ctx.logger)
+  const proxy = new GitProxy({
+    service,
+    registry,
+    ...parallel === undefined ? {} : { parallel },
+    onPushed: (record, branches) => { void watchPushed(service, watcher, record, branches) },
+    ...ctx.logger === undefined ? {} : { logger: ctx.logger },
+  })
+  const workspaceGit: WorkspaceGit = async (dir, args, runOptions) => {
+    const sandbox = ctx.get?.('sandbox') as SandboxConfiner | undefined
+    if (sandbox === undefined) return await git(args, { cwd: dir, ...runOptions })
+    const confined = await sandbox.confine(['git', ...args], { mode: 'workspace-write', workspaceRoot: dir }, runOptions.signal)
+    return await runCommand(confined.argv, { cwd: dir, ...runOptions })
+  }
+  const workspaces = new WorkspaceManager({
+    service,
+    registry,
+    git,
+    workspaceGit,
+    proxy: () => proxy.port === undefined ? undefined : { port: proxy.port },
+    ...ctx.logger === undefined ? {} : { logger: ctx.logger },
+  })
+  const startProxy = async (): Promise<void> => {
+    const configured = service.settings.workspace.proxyPort
+    const saved = registry.port()
+    let port: number
+    try {
+      port = await proxy.start(configured !== 0 ? configured : saved ?? 0)
+    } catch (error) {
+      if (configured !== 0) throw new Error(`本机 git 代理无法监听设置的端口 ${configured}：${error instanceof Error ? error.message : String(error)}`)
+      port = await proxy.start(0)
+    }
+    if (saved !== undefined && saved !== port) await workspaces.moveProxy(port, saved)
+    if (saved !== port) await registry.setPort(port)
+    ctx.logger?.info?.('dsh-repo: 本机 git 代理监听 127.0.0.1:%d', port)
+  }
+  ctx.effect(() => {
+    startProxy().catch((error: unknown) => { ctx.logger?.error?.('dsh-repo: %s', error instanceof Error ? error.message : String(error)) })
+    const unlisten = service.onSettingsChange(async (next, previous) => {
+      // Also when the proxy is not where the settings want it, so saving again retries a port that failed earlier.
+      const wanted = next.workspace.proxyPort
+      if (wanted !== previous.workspace.proxyPort || proxy.port === undefined || (wanted !== 0 && proxy.port !== wanted)) await startProxy()
+    })
+    return () => {
+      unlisten()
+      void proxy.stop()
+    }
+  }, 'dsh-repo: local git proxy')
+  const operations: OperationDeps = {
+    service,
+    workspaces,
+    approval: () => ctx.get?.('approval') as HostApproval | undefined,
+    workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
+    ...parallel === undefined ? {} : { parallel },
+    watch: watcher,
+  }
+  ctx.provide?.(DSH_REPOS_SERVICE, new DshReposApi({ ...operations, proxyPort: () => proxy.port }))
   ctx.effect(() => {
     watcher.start()
     return () => { void watcher.stop() }
@@ -188,18 +243,22 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   }, 'dsh-repo: local syncs')
   mountSettingsRoutes(ctx, service, watcher, syncer)
   if (service.catalog.entries().length === 0) ctx.logger?.info?.('dsh-repo: 仓库清单为空，代码仓库工具在「代码仓库 → 仓库」添加仓库后提供')
-  const tools = createTools({
-    service,
-    settings: () => service.settings.tools,
-    approval: () => ctx.get?.('approval') as HostApproval | undefined,
-    workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
-    authorize: event => authorize(parallel, event),
-    allowed: (repo, level) => { service.catalog.require(repo, level) },
-    watch: watcher,
-  })
-  for (const { definition, access } of tools) {
+  for (const { definition, access } of createTools(operations)) {
     ctx.effect(() => ctx.tools.register(definition, {
       when: () => toolOffered(access, service.settings.tools, service.catalog.highestAccess()) && (access !== 'watch' || watcher.active),
     }), `dsh-repo: ${definition.name}`)
+  }
+}
+
+/** Watch the open requests from branches a workspace of a Session pushed through the proxy; best effort. */
+async function watchPushed(service: RepoService, watcher: ChangeWatcher, record: WorkspaceRecord, branches: readonly string[]): Promise<void> {
+  if (record.session === undefined || !watcher.active || !service.gitHost(record.repo)) return
+  for (const branch of branches) {
+    try {
+      const open = await service.listChanges(record.repo, { state: 'open', sourceBranch: branch, perPage: 20 })
+      for (const mr of open.items) await watcher.track({ repo: record.repo, change: mr, session: record.session, source: 'pushed', pushed: mr.headSha })
+    } catch {
+      // Watching is a convenience: the push succeeded, and the model can still watch with repo_mr_watch.
+    }
   }
 }
