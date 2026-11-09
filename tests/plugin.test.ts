@@ -25,7 +25,7 @@ function context() {
 
 /** Run the plugin's push tool for Session `s1` with the given `access/authorize` listeners, the service's push mocked. */
 async function pushWithListeners(listeners: Array<(event: AuthorizeEvent) => void | Promise<void>>) {
-  const { ctx, registered, env } = context()
+  const { ctx, registered, provided, env } = context()
   const dir = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-'))
   writeFileSync(join(dir, '.git'), 'gitdir: /mirrors/x\n')
   const changes = { workspace: { url: 'https://github.com/a/b.git', dir, baseBranch: 'main', baseCommit: 'c'.repeat(40) }, commits: [], uncommitted: true, files: [], diff: '', truncated: false }
@@ -44,6 +44,7 @@ async function pushWithListeners(listeners: Array<(event: AuthorizeEvent) => voi
     },
   }
   plugin.apply(withEvents, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
+  await (provided.get('dshRepos') as RepoService).catalog.add({ url: 'https://github.com/a/b', access: 'write', features: [] })
   const tool = registered.find(entry => entry.definition.name === 'repo_workspace_push')!.definition
   const agent = { id: 'a1', session: { header: { id: 's1' } } }
   const outcome = tool.execute({ dir, branch: 'fix/a', message: 'fix: a' }, { signal: new AbortController().signal, agent })
@@ -75,38 +76,45 @@ describe('plugin', () => {
     expect([...plugin.inject]).toEqual(['tools', 'credentials'])
   })
 
-  it('provides dshRepos and offers tools when a host is configured', async () => {
+  it('provides dshRepos and offers tools once the catalog holds a repository', async () => {
     const { ctx, registered, provided, env } = context()
     plugin.apply(ctx, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
     const service = provided.get('dshRepos')
     expect(service).toBeInstanceOf(RepoService)
-    expect((service as RepoService).version).toBe(4)
+    expect((service as RepoService).version).toBe(5)
     expect((service as RepoService).mirrorSettings()).toEqual({ dir: undefined })
     expect(registered.length).toBeGreaterThan(10)
+    expect(await registered[0]?.when?.()).toBe(false)
+    await (service as RepoService).catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [] })
     expect(await registered[0]?.when?.()).toBe(true)
   })
 
-  it('offers tools only after a host is added, and fails loudly on bad config', async () => {
+  it('offers no tools before a host and a repository are added, and fails loudly on bad config', async () => {
     const { ctx, registered, provided, info, env } = context()
     plugin.apply(ctx, undefined, { env })
     const service = provided.get('dshRepos') as RepoService
     expect(registered.length).toBeGreaterThan(10)
     expect(await registered[0]?.when?.()).toBe(false)
     expect(info).toHaveBeenCalled()
+    await expect(service.catalog.add({ url: 'https://code.example.com/team/app', access: 'read', features: [] })).rejects.toMatchObject({ code: 'not-allowed' })
     await service.addHost({ url: 'https://code.example.com' })
+    await service.catalog.add({ url: 'https://code.example.com/team/app', access: 'read', features: [] })
     expect(await registered[0]?.when?.()).toBe(true)
     expect(() => plugin.apply(context().ctx, { hosts: 'github.com' })).toThrow(/配置不合法/)
   })
 
-  it('offers tools as the saved tool settings allow', async () => {
+  it('offers tools as the saved tool settings and the catalog access allow', async () => {
     const { ctx, registered, provided, env } = context()
     plugin.apply(ctx, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
     const service = provided.get('dshRepos') as RepoService
     const offered = async (name: string) => await registered.find(entry => entry.definition.name === name)!.when!()
+    const entry = await service.catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [] })
+    expect([await offered('repo_info'), await offered('repo_issue_create'), await offered('repo_mr_merge')]).toEqual([true, false, false])
+    await service.catalog.update(entry.id, { url: entry.url, access: 'write', features: [] })
     expect([await offered('repo_info'), await offered('repo_issue_create'), await offered('repo_mr_merge')]).toEqual([true, true, false])
-    await service.updateSettings({ tools: { merge: true } })
+    await service.catalog.update(entry.id, { url: entry.url, access: 'merge', features: [] })
     expect(await offered('repo_mr_merge')).toBe(true)
-    await service.updateSettings({ tools: { writes: 'off', merge: true } })
+    await service.updateSettings({ tools: { writes: 'off' } })
     expect([await offered('repo_info'), await offered('repo_issue_create'), await offered('repo_mr_merge')]).toEqual([true, false, false])
     await service.updateSettings({ tools: { enabled: false } })
     expect(await offered('repo_info')).toBe(false)
@@ -116,6 +124,7 @@ describe('plugin', () => {
     const services: Record<string, unknown> = {}
     const { ctx, registered, provided, env } = context()
     plugin.apply({ ...ctx, get: name => services[name] }, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
+    await (provided.get('dshRepos') as RepoService).catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [] })
     const offered = async () => await registered.find(entry => entry.definition.name === 'repo_mr_watch')!.when!()
     expect(await offered()).toBe(false)
     services.sessionController = { resolveAgent: async () => ({ error: new Error('unused') }) }

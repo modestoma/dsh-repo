@@ -11,12 +11,13 @@
  *
  * Every method rejects with an error whose `name` is `RepoError` and whose
  * `code` is a {@link RepoErrorCode}; nothing else is thrown for an expected
- * failure. A repository is addressed by a {@link RepoTarget}; only hosts and
- * repositories the deployment configured are reachable through the host APIs.
- * Local mirrors and workspaces take HTTPS addresses (or local paths); an
- * address on a configured host carries that host's token, and addresses on
- * other hosts are mirrored without credentials unless the deployment turned
- * that off.
+ * failure. A repository is addressed by a {@link RepoTarget}. Only
+ * repositories in the deployment's repository catalog ({@link CatalogRepo})
+ * are reachable, through the host APIs and as mirrors, snapshots, and
+ * workspaces alike, and each only up to the catalog's {@link RepoAccess};
+ * everything else fails with `not-allowed`. Local mirrors and workspaces take
+ * HTTPS addresses (or local paths); an address on a configured host carries
+ * that host's token.
  *
  * @module dsh-repo/contract
  */
@@ -29,7 +30,7 @@ export type DshReposServiceName = 'dshRepos'
  * consumer misbehave; a consumer refuses a provider whose version it does not
  * know.
  */
-export type DshReposVersion = 4
+export type DshReposVersion = 5
 
 /** Code host family. */
 export type ForgeKind = 'github' | 'gitlab'
@@ -45,7 +46,7 @@ export type RepoTarget = string
 export type RepoErrorCode =
   /** The arguments break a documented rule. */
   | 'invalid'
-  /** No configured host serves the repository, or it is outside the configured repositories. */
+  /** No configured host serves the repository, it is not in the catalog, or its catalog access does not allow the call. */
   | 'not-allowed'
   /** The host's token is missing or rejected. */
   | 'unauthenticated'
@@ -168,7 +169,9 @@ export interface FileContent {
 
 /**
  * What an `access/authorize` listener is asked to allow. dsh-repo asks for
- * `code-write`; other plugins use the other levels for their own writes.
+ * `code-write` before its writes and `admin` before
+ * {@link DshRepoService.addRepo} changes the catalog for a Session; other
+ * plugins use the levels for their own writes.
  * Listeners refuse a level they do not know.
  */
 export type AuthorizeLevel = 'code-write' | 'wiki-read' | 'wiki-write' | 'admin'
@@ -177,9 +180,9 @@ export type AuthorizeLevel = 'code-write' | 'wiki-read' | 'wiki-write' | 'admin'
  * Payload of the `access/authorize` event, dispatched with `ctx.parallel`
  * before a write is made for a Session: by every write tool after its
  * arguments are validated and before the user is asked to approve, and by
- * {@link DshRepoService.pushWorkspace} and {@link DshRepoService.createChange}
- * when called with `session` (a tool call therefore asks twice with the same
- * answer). A listener that knows the Session and refuses throws an `Error`
+ * {@link DshRepoService.pushWorkspace}, {@link DshRepoService.createChange}, and
+ * {@link DshRepoService.addRepo} when called with `session` (a tool call that
+ * reaches them therefore asks twice with the same answer). A listener that knows the Session and refuses throws an `Error`
  * whose message says why; the write then fails with `forbidden` and nothing
  * is asked or changed. A listener that does not know the Session returns.
  * No listener means allowed. The Session may be a subagent's; listeners
@@ -696,6 +699,74 @@ export type HostsChange =
   }
 
 /**
+ * What dsh-repo may do in one catalog repository, each level including the
+ * ones before it: `read` reads code, history, issues, PRs/MRs, CI runs and
+ * logs, and uses mirrors, snapshots, and workspaces; `write` also pushes
+ * workspaces, creates, edits, and comments on issues and PRs/MRs, deletes
+ * merged branches, and retries or cancels CI; `merge` also merges PRs/MRs.
+ */
+export type RepoAccess = 'read' | 'write' | 'merge'
+
+/**
+ * A feature other plugins offer per catalog repository (for example log
+ * analysis). The settings page shows one switch per registered feature on
+ * every repository; dsh-repo stores which repositories turned it on and
+ * attaches no behavior of its own.
+ */
+export interface RepoFeature {
+  /** Lowercase letters, digits, and `-`, starting with a letter, at most 40 characters. */
+  readonly id: string
+  /** Column title on the settings page, at most 20 characters. */
+  readonly title: string
+  /** One line explaining the switch, at most 200 characters. */
+  readonly description?: string
+}
+
+/** Keeping a local directory equal to the head of the repository's branch. */
+export interface LocalSyncSpec {
+  /** Whether the directory is kept up to date; a disabled sync keeps its directory and interval. */
+  readonly enabled: boolean
+  /** Absolute directory on the Host the files are expanded into. */
+  readonly dir: string
+  /** Minutes between two syncs. */
+  readonly intervalMinutes: number
+}
+
+/** One repository of the catalog. */
+export interface CatalogRepo {
+  /** Stable id, 12 lowercase hex characters. */
+  readonly id: string
+  /** HTTPS address on a configured host, `file:` URL, or absolute local path. */
+  readonly url: string
+  /** Branch consumers and the local sync follow; absent follows the remote's default branch. */
+  readonly branch?: string
+  readonly access: RepoAccess
+  /** Ids of the {@link RepoFeature}s turned on, including features whose plugin is not loaded now. */
+  readonly features: readonly string[]
+  /** Absent until a local directory was configured. */
+  readonly localSync?: LocalSyncSpec
+}
+
+/** Options of {@link DshRepoService.addRepo}. */
+export interface RepoAddOptions extends CallOptions {
+  /** Branch of a new entry; for an existing entry it must equal the entry's branch. */
+  readonly branch?: string
+  /** Access of a new entry, default `read`; an existing entry keeps its access. */
+  readonly access?: RepoAccess
+  /** Features turned on in addition to the ones already on. */
+  readonly features?: readonly string[]
+  /** Session the change is made for: dsh-repo asks `access/authorize` (level `admin`) first and fails with `forbidden` when refused. */
+  readonly session?: string
+}
+
+/** Outcome of {@link DshRepoService.addRepo}. */
+export interface RepoAddResult {
+  /** `added`: a new entry; `updated`: features were turned on; `unchanged`: nothing to do. */
+  readonly status: 'added' | 'updated' | 'unchanged'
+  readonly repo: CatalogRepo
+}
+
+/**
  * Where local mirrors live. There is no default: while `dir` is undefined,
  * every call that needs a mirror (sync, read, snapshot, workspace, usage)
  * rejects with `unavailable`.
@@ -973,6 +1044,37 @@ export interface DshRepoService {
    */
   setHostToken(url: string, token: string | undefined): Promise<HostInfo>
   /**
+   * The repository catalog: the only repositories dsh-repo reaches.
+   * @param options - `feature` keeps only repositories with that feature on.
+   * @returns the repositories in catalog order.
+   */
+  listRepos(options?: { readonly feature?: string }): readonly CatalogRepo[]
+  /**
+   * Offer a feature as a per-repository switch on the settings page while the
+   * returned disposer is not called. Registering an id again replaces its
+   * title and description; stored switches survive unregistering.
+   * @param feature - id, title, and description.
+   * @returns disposer that withdraws this registration.
+   * @throws `invalid` for a bad id, title, or description.
+   */
+  registerFeature(feature: RepoFeature): () => void
+  /**
+   * Observe every successful catalog change, whoever made it. A throwing
+   * listener does not affect the change or other listeners.
+   * @param listener - runs after the change.
+   * @returns disposer that stops the observation.
+   */
+  onReposChange(listener: () => void): () => void
+  /**
+   * Add a repository to the catalog, or turn features on for the entry that
+   * already holds it. Nothing is asked or written when nothing changes.
+   * @param url - HTTPS address on a configured host, `file:` URL, or absolute local path.
+   * @returns the outcome and the entry.
+   * @throws `invalid` for a bad address, branch, or feature id; `not-allowed` for an address on an unconfigured host; `conflict` when the entry follows another branch; `forbidden` when `access/authorize` refused; `too-large` when the catalog is full; `unavailable` when the catalog cannot be saved.
+   */
+  addRepo(url: string, options?: RepoAddOptions): Promise<RepoAddResult>
+
+  /**
    * Observe changes made through {@link addHost}, {@link removeHost},
    * {@link setHostToken}, and {@link setMirrorDir}, whoever made them. The listener runs after the change
    * succeeded; a throwing listener does not affect the change or other listeners.
@@ -997,11 +1099,10 @@ export interface DshRepoService {
   /**
    * Clone the address as a fetch-only mirror, or fetch it, and resolve the
    * branch head. Calls for the same mirror run one at a time. Addresses under
-   * a configured host carry its token; other hosts are fetched without
-   * credentials.
+   * a configured host carry its token.
    * @param url - HTTPS address, `file:` URL, or absolute local path; SSH and other transports are refused.
    * @returns the mirror and the branch head.
-   * @throws `invalid` for an unsupported address or branch, `not-allowed` outside the configured repositories or on other hosts when they are refused, `not-found` for a missing branch, `unavailable` when git fails.
+   * @throws `invalid` for an unsupported address or branch, `not-allowed` outside the catalog, `not-found` for a missing branch, `unavailable` when git fails.
    */
   syncMirror(url: string, options?: MirrorSyncOptions): Promise<MirrorState>
   /**
@@ -1032,7 +1133,7 @@ export interface DshRepoService {
    * service; deleting the directory abandons it.
    * @param url - HTTPS address, `file:` URL, or absolute local path.
    * @returns the workspace.
-   * @throws `invalid` for an unsupported address, branch, commit, or a directory that exists, for `commit` with `branch`, and for a `branch` that is the base or default branch; `not-allowed` outside the configured repositories; `not-found` for a missing branch or commit; `unavailable` when git fails.
+   * @throws `invalid` for an unsupported address, branch, commit, or a directory that exists, for `commit` with `branch`, and for a `branch` that is the base or default branch; `not-allowed` outside the catalog; `not-found` for a missing branch or commit; `unavailable` when git fails.
    */
   openWorkspace(url: string, options: WorkspaceOpenOptions): Promise<WorkspaceInfo>
   /**

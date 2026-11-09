@@ -3,15 +3,18 @@
  * pull/merge requests, and CI runs and job logs, and, after the user approves
  * each call, write them or retry and cancel CI.
  *
- * - Every tool takes `repo` (URL or `host/path`); only configured hosts and
- *   repositories are reachable.
+ * - Every tool takes `repo` (URL or `host/path`); only repositories in the
+ *   catalog are reachable, each up to its catalog access; `repo_list` lists
+ *   them.
  * - Every tool is built; {@link toolOffered} decides from the current
- *   settings whether the model sees it. Write tools are offered unless
- *   `tools.writes` is `off`; for an Agent's Session they first ask the
- *   `access/authorize` listeners ({@link ToolDeps.authorize}), then ask the
- *   user once per call through `ctx.approval` while `tools.writes` is `ask`;
- *   without an approval service they refuse. The merge tool is offered only
- *   while `tools.merge` is also true.
+ *   settings and the catalog whether the model sees it. Write tools are
+ *   offered unless `tools.writes` is `off` or no repository allows writing;
+ *   the merge tool only while a repository allows merging. A write first
+ *   checks the repository's catalog access ({@link ToolDeps.allowed}), then,
+ *   for an Agent's Session, asks the `access/authorize` listeners
+ *   ({@link ToolDeps.authorize}), then asks the user once per call through
+ *   `ctx.approval` while `tools.writes` is `ask`; without an approval service
+ *   it refuses.
  * - A declined approval returns `{ status: 'declined' }`; a service failure
  *   throws with the failure code in brackets, e.g. `[not-found] …`.
  *
@@ -25,7 +28,8 @@ import type { RepoSettings } from './config.ts'
 import { RepoError } from './errors.ts'
 import { lstat, readFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-import type { AuthorizeEvent, ChangeInfo, CiTarget, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
+import type { AuthorizeEvent, ChangeInfo, CiTarget, RepoAccess, WorkspaceChanges, WorkspacePushResult } from './contract.ts'
+import { allows } from './catalog/entry.ts'
 import type { Agent, ContentBlock, HostApproval, ToolDefinition, ToolRunContext, WorkingDirectoryService } from './host.ts'
 import type { WatchInfo } from './settings/contract.ts'
 import type { TrackRequest } from './watch/watcher.ts'
@@ -53,6 +57,12 @@ export interface ToolDeps {
    * Absent means every Session may.
    */
   readonly authorize?: (event: AuthorizeEvent) => Promise<void>
+  /**
+   * Require a repository in the catalog with at least an access level,
+   * before a write asks anyone; throws a `RepoError` `not-allowed`. Absent
+   * leaves the check to the service call.
+   */
+  readonly allowed?: (repo: string, level: RepoAccess) => void
   /** PR/MR watching; absent means PRs/MRs are not watched. */
   readonly watch?: WatchHooks
 }
@@ -87,6 +97,8 @@ interface Spec<S extends z.ZodType, V> {
   readonly schema: S
   /** Present on write tools: what the approval prompt says will happen. */
   readonly describe?: (args: z.output<S>, exec: ToolRunContext) => Prompt | Promise<Prompt>
+  /** Catalog access a write tool needs on `repo`; default `write`. */
+  readonly level?: RepoAccess
   readonly run: (args: z.output<S>, signal: AbortSignal, exec: ToolRunContext) => Promise<V>
 }
 
@@ -99,7 +111,7 @@ function withSignature(body: string | undefined, signature: string): string | un
   return `${body}\n\n${signature}`
 }
 
-/** Which settings offer a tool: reads and watch always, writes unless `writes` is `off`, merge also needs `merge`; the plugin offers watch only while watching is active. */
+/** Which settings offer a tool: reads and watch always, writes unless `writes` is `off`, merge too; each also needs a catalog repository with that access. The plugin offers watch only while watching is active. */
 export type ToolAccess = 'read' | 'watch' | 'write' | 'merge'
 
 /** One built tool and the settings that offer it. */
@@ -109,16 +121,17 @@ export interface RepoTool {
 }
 
 /**
- * Whether the tool settings offer a tool to the model.
+ * Whether the tool settings and the catalog offer a tool to the model.
  * @param access - the tool's access class.
  * @param settings - tool settings now in effect.
+ * @param highest - the highest access of any reachable catalog repository; undefined for an empty catalog.
  * @returns whether the model sees the tool.
  */
-export function toolOffered(access: ToolAccess, settings: RepoSettings['tools']): boolean {
-  if (!settings.enabled) return false
+export function toolOffered(access: ToolAccess, settings: RepoSettings['tools'], highest: RepoAccess | undefined): boolean {
+  if (!settings.enabled || highest === undefined) return false
   if (access === 'read' || access === 'watch') return true
   if (settings.writes === 'off') return false
-  return access === 'write' || settings.merge
+  return allows(highest, access)
 }
 
 /**
@@ -132,6 +145,12 @@ export function createTools(deps: ToolDeps): RepoTool[] {
   const signRequired = (body: string) => withSignature(body, deps.settings().signature) ?? body
 
   const reads: ToolDefinition[] = [
+    define(deps, {
+      name: 'repo_list',
+      description: 'List the repositories these tools can reach (the deployment\'s repository catalog) with the branch each follows and its access: `read` (read only), `write` (also push workspaces, issues, PRs/MRs, comments, CI retry/cancel), or `merge` (also merge PRs/MRs). Every other repository is refused; an administrator adds repositories on the dsh-repo settings page.',
+      schema: z.object({}).strict(),
+      run: async () => ({ repos: service.listRepos().map(item => ({ url: item.url, ...item.branch === undefined ? {} : { branch: item.branch }, access: item.access })) }),
+    }),
     define(deps, {
       name: 'repo_info',
       description: 'Show a repository\'s default branch, visibility, description, and clone URL on GitHub or GitLab.',
@@ -306,6 +325,7 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       }).strict(),
       describe: async (args, exec) => {
         const changes = await service.workspaceChanges(await workspaceRoot(deps, args.dir, exec, exec.signal), { signal: exec.signal })
+        deps.allowed?.(changes.workspace.url, 'write')
         return pushPrompt(changes, args.branch ?? changes.workspace.branch ?? '', args.message)
       },
       run: async (args, signal, exec) => {
@@ -435,8 +455,8 @@ export function createTools(deps: ToolDeps): RepoTool[] {
     name: 'repo_mr_merge',
     description: 'Merge a pull/merge request, only while its head is still `headSha` (read it with repo_mr_status first). When the settings delete source branches, its source branch is deleted too (never a fork\'s); `sourceBranch` in the result says whether it was. Requires user approval.',
     schema: z.object({ repo, number, headSha: z.string().min(40), method: z.enum(['merge', 'squash', 'rebase']).optional() }).strict(),
+    level: 'merge',
     describe: (args) => {
-      requireMerge(deps)
       const drop = deps.settings().deleteSourceBranch
       return {
         zh: `合并 ${args.repo} 的 PR/MR #${args.number}（head ${args.headSha.slice(0, 12)}${args.method === undefined ? '' : `，方式 ${args.method}`}${drop ? '，合并后删除源分支' : ''}）`,
@@ -444,7 +464,6 @@ export function createTools(deps: ToolDeps): RepoTool[] {
       }
     },
     run: (args, signal) => {
-      requireMerge(deps)
       return service.mergeChange(args.repo, args.number, {
         headSha: args.headSha,
         ...args.method === undefined ? {} : { method: args.method },
@@ -554,10 +573,6 @@ interface OpenChange {
   readonly webUrl: string
 }
 
-function requireMerge(deps: ToolDeps): void {
-  if (!deps.settings().merge) throw new RepoError('forbidden', 'dsh-repo 设置页没有开放合并，repo_mr_merge 不会执行')
-}
-
 function requireAgent(exec: ToolRunContext, toolName: string): Agent {
   if (exec.agent === undefined) throw new RepoError('invalid', `${toolName} 需要由 Agent 调用`)
   return exec.agent
@@ -653,6 +668,8 @@ function define<S extends z.ZodType, V>(deps: ToolDeps, spec: Spec<S, V>): ToolD
       if (spec.describe !== undefined) {
         let text: Prompt
         try {
+          const target = (args as { repo?: unknown }).repo
+          if (typeof target === 'string') deps.allowed?.(target, spec.level ?? 'write')
           text = await spec.describe(args, exec)
           const session = exec.agent?.session?.header.id
           if (session !== undefined) await deps.authorize?.({ session, level: 'code-write', action: spec.name, summary: text.zh })

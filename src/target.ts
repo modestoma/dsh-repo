@@ -1,6 +1,7 @@
 /**
  * Repository targets: map a URL or `host/path` to a configured host and a
- * repository path, and apply the configured repository patterns.
+ * repository path. Whether the repository may be reached is the catalog's
+ * decision (see `dsh-repo/catalog`).
  *
  * @module dsh-repo/target
  */
@@ -56,24 +57,6 @@ function repoPath(kind: HostSpec['kind'], rest: string): string | undefined {
   return segments.every(segment => SEGMENT.test(segment) && segment !== '.' && segment !== '..') ? segments.join('/') : undefined
 }
 
-/**
- * Whether a repository key matches one configured pattern.
- * @param key - lowercase `host/path`.
- * @param pattern - lowercase pattern; a final `*` matches one segment, `**` one or more.
- * @returns whether it matches.
- */
-export function matchesPattern(key: string, pattern: string): boolean {
-  const keySegments = key.split('/')
-  const patternSegments = pattern.split('/')
-  const last = patternSegments.at(-1)
-  if (last === '**') {
-    const prefix = patternSegments.slice(0, -1)
-    return keySegments.length > prefix.length && prefix.every((segment, index) => segment === keySegments[index])
-  }
-  if (keySegments.length !== patternSegments.length) return false
-  return patternSegments.every((segment, index) => segment === '*' ? index === patternSegments.length - 1 : segment === keySegments[index])
-}
-
 /** The host serving a parsed target and the path below the host's prefix. */
 function matchHost(parsed: ParsedTarget, hosts: readonly HostSpec[]): { spec: HostSpec; rest: string } | undefined {
   let best: { spec: HostSpec; rest: string; prefix: number } | undefined
@@ -106,11 +89,10 @@ export function hostOf(input: string, hosts: readonly HostSpec[]): HostSpec | un
  * Resolve a repository target.
  * @param input - URL or `host/path`.
  * @param hosts - configured hosts.
- * @param patterns - configured repository patterns; empty allows every repository on the hosts.
  * @returns the host and repository path.
- * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no host or pattern admits it.
+ * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no host serves it.
  */
-export function resolveTarget(input: string, hosts: readonly HostSpec[], patterns: readonly string[]): ResolvedTarget {
+export function resolveTarget(input: string, hosts: readonly HostSpec[]): ResolvedTarget {
   const parsed = parse(input)
   if (parsed === undefined) throw new RepoError('invalid', `无法识别的仓库：${input}（填仓库网址、git 地址或 主机/路径）`)
   const best = matchHost(parsed, hosts)
@@ -120,9 +102,5 @@ export function resolveTarget(input: string, hosts: readonly HostSpec[], pattern
     throw new RepoError('invalid', best.spec.kind === 'github' ? `GitHub 仓库路径应为 owner/name：${input}` : `GitLab 仓库路径应为 group/project（可有多级 group）：${input}`)
   }
   const host = new URL(best.spec.url).host
-  const key = `${host}/${path}`.toLowerCase()
-  if (patterns.length > 0 && !patterns.some(pattern => matchesPattern(key, pattern))) {
-    throw new RepoError('not-allowed', `${host}/${path} 不在 dsh-repo 配置的仓库范围内`)
-  }
   return { spec: best.spec, kind: best.spec.kind, host, path, webUrl: `${best.spec.url}/${path}` }
 }

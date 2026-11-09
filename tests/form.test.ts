@@ -8,8 +8,8 @@ describe('settings form', () => {
     expect(draft.numbers).toMatchObject({ timeoutMs: '30', gitTimeoutMs: '600', maxFileBytes: '1024', maxDiffBytes: '512', perPage: '30' })
     expect(displayNumber('maxDiffBytes', 512 * 1024)).toBe('512 KiB')
     expect(fromDraft(draft)).toEqual({ ok: true, settings: DEFAULT_SETTINGS })
-    const edited = fromDraft({ ...draft, numbers: { ...draft.numbers, timeoutMs: '1.5', maxFileBytes: '2048' }, repos: ' GitHub.com/A/*\n\ngithub.com/a/*\n' })
-    expect(edited).toMatchObject({ ok: true, settings: { timeoutMs: 1500, limits: { maxFileBytes: 2 * 1024 * 1024 }, repos: ['github.com/a/*'] } })
+    const edited = fromDraft({ ...draft, numbers: { ...draft.numbers, timeoutMs: '1.5', maxFileBytes: '2048' } })
+    expect(edited).toMatchObject({ ok: true, settings: { timeoutMs: 1500, limits: { maxFileBytes: 2 * 1024 * 1024 } } })
   })
 
   it('rejects out-of-range numbers and a default page larger than the cap', () => {
@@ -28,7 +28,7 @@ describe('settings form', () => {
   it('compares drafts by the settings they save', () => {
     const draft = toDraft(DEFAULT_SETTINGS)
     expect(sameDraft(draft, toDraft(DEFAULT_SETTINGS))).toBe(true)
-    expect(sameDraft(draft, { ...draft, merge: true })).toBe(false)
+    expect(sameDraft(draft, { ...draft, deleteSourceBranch: false })).toBe(false)
   })
 
   it('takes local sync intervals in hours and shows sizes in binary units', () => {

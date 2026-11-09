@@ -5,7 +5,7 @@
  * @module dsh-repo/settings/contract
  */
 
-import type { ForgeKind, HostInfo, MirrorSettings } from '../contract.ts'
+import type { ForgeKind, HostInfo, LocalSyncSpec, MirrorSettings, RepoAccess, RepoFeature } from '../contract.ts'
 
 /** GET：{@link SettingsState}。 */
 export const STATE_ROUTE = '/dsh-repo/state'
@@ -21,10 +21,10 @@ export const SETTINGS_ROUTE = '/dsh-repo/settings'
 export const PICK_DIRECTORY_ROUTE = '/dsh-repo/pick-directory'
 /** DELETE：body `{ id }` 停止跟踪一个 PR/MR。 */
 export const WATCHES_ROUTE = '/dsh-repo/watches'
-/** POST：body {@link SyncInput} 添加本地同步；PUT：body `{ id, ...SyncInput }` 修改；DELETE：body `{ id }` 删除（本地目录里的文件保留）。 */
-export const SYNCS_ROUTE = '/dsh-repo/syncs'
-/** POST：body `{ id }` 立即同步一条本地同步，同步结束后响应。 */
-export const SYNC_RUN_ROUTE = '/dsh-repo/syncs/run'
+/** POST：body {@link RepoInput} 向仓库清单添加仓库；PUT：body `{ id, ...RepoInput }` 修改；DELETE：body `{ id }` 删除（本地同步目录里的文件保留）。改动引起的本地同步结束后响应。 */
+export const REPOS_ROUTE = '/dsh-repo/repos'
+/** POST：body `{ id }` 立即执行一个仓库的本地同步，同步结束后响应。 */
+export const REPO_SYNC_ROUTE = '/dsh-repo/repos/sync'
 /** GET：{@link MirrorUsage}，镜像目录里的仓库和占用空间。 */
 export const MIRROR_USAGE_ROUTE = '/dsh-repo/mirror-usage'
 
@@ -56,13 +56,19 @@ export const SETTING_BOUNDS = {
 export const SYNC_INTERVAL_BOUNDS = { min: 5, max: 30 * 24 * 60 } as const
 /** Interval of a local sync that names none: 12 hours. */
 export const DEFAULT_SYNC_INTERVAL_MINUTES = 12 * 60
-/** Most local syncs. */
-export const MAX_SYNCS = 50
+/** Most repositories in the catalog. */
+export const MAX_REPOS = 200
+/** Most features turned on for one repository. */
+export const MAX_REPO_FEATURES = 20
 
 /** Longest tool signature. */
 export const MAX_SIGNATURE_LENGTH = 500
-/** Most repository patterns. */
-export const MAX_REPO_PATTERNS = 200
+/** Labels of the catalog access levels, from the least. */
+export const ACCESS_LEVELS: readonly { readonly id: RepoAccess; readonly label: string }[] = [
+  { id: 'read', label: '只读' },
+  { id: 'write', label: '可改代码' },
+  { id: 'merge', label: '可合并' },
+]
 
 /** PR/MR activity a watch reports, named as in {@link WatchEventsWire}. */
 export const WATCH_EVENT_KINDS = ['ciFailed', 'ciPassed', 'comment', 'changesRequested', 'approved', 'conflict', 'pushed', 'merged', 'closed', 'idle'] as const
@@ -78,8 +84,6 @@ export type WatchEventsWire = Record<WatchEventKind, WatchAction>
 
 /** Complete run-time settings as sent to and from the settings page. */
 export interface RepoSettingsWire {
-  /** Reachable repository patterns; empty = every repository on the hosts. */
-  repos: string[]
   timeoutMs: number
   limits: {
     perPage: number
@@ -94,13 +98,11 @@ export interface RepoSettingsWire {
   tools: {
     enabled: boolean
     writes: 'ask' | 'allow' | 'off'
-    merge: boolean
     deleteSourceBranch: boolean
     signature: string
   }
   mirror: {
     gitTimeoutMs: number
-    otherHosts: boolean
   }
   watch: {
     enabled: boolean
@@ -137,29 +139,30 @@ export interface WatchInfo {
   pending: number
 }
 
-/** What a local sync keeps up to date: the head of a branch, expanded into a local directory. */
-export interface SyncInput {
-  /** HTTPS address, `file:` URL, or absolute path of the repository. */
+/** A catalog repository as the settings page submits it. */
+export interface RepoInput {
+  /** HTTPS address on a configured host, `file:` URL, or absolute path of the repository. */
   url: string
   /** Branch to follow; missing or empty follows the remote's default branch. */
   branch?: string
-  /** Absolute directory on the Host the files are expanded into; `~` expands to the home directory. */
-  dir: string
-  /** Minutes between two syncs; default {@link DEFAULT_SYNC_INTERVAL_MINUTES}. */
-  intervalMinutes?: number
+  access: RepoAccess
+  /** Ids of the features turned on. */
+  features: string[]
+  /** Local sync; omitted when no directory was ever entered. */
+  localSync?: {
+    enabled: boolean
+    /** Absolute directory on the Host; `~` expands to the home directory. Required while enabled. */
+    dir: string
+    /** Minutes between two syncs; default {@link DEFAULT_SYNC_INTERVAL_MINUTES}. */
+    intervalMinutes?: number
+  }
 }
 
-/** One local sync as the settings page lists it. */
-export interface SyncInfo {
-  id: string
-  url: string
-  /** Branch asked for; missing follows the remote's default branch. */
-  branch?: string
-  dir: string
-  intervalMinutes: number
+/** Where a repository's local sync stands. */
+export interface LocalSyncStatus {
   /** `queued`: waiting for another sync to finish; `running`: syncing now. */
   state: 'idle' | 'queued' | 'running'
-  /** Last successful sync: when, which commit, and the branch it resolved. */
+  /** Last successful sync into the current directory: when, which commit, and the branch it resolved. */
   syncedAt?: string
   commit?: string
   syncedBranch?: string
@@ -168,6 +171,23 @@ export interface SyncInfo {
   failedAt?: string
   /** When the next sync is due, while one is scheduled. */
   nextAt?: string
+}
+
+/** One catalog repository as the settings page lists it. */
+export interface RepoRow {
+  id: string
+  url: string
+  branch?: string
+  access: RepoAccess
+  features: string[]
+  localSync?: LocalSyncSpec
+  addedAt: string
+  /** `host/path`, or the local path; absent with {@link problem}. */
+  key?: string
+  /** Why the repository cannot be reached now, e.g. its host was removed. */
+  problem?: string
+  /** Present while the local sync is enabled. */
+  sync?: LocalSyncStatus
 }
 
 /** One repository in the mirror directory. */
@@ -224,8 +244,10 @@ export interface SettingsState {
   watches: readonly WatchInfo[]
   /** Whether this composition can start a turn of a Session, which PR/MR watching needs. */
   watchAvailable: boolean
-  /** Local syncs in the order they were added. */
-  syncs: readonly SyncInfo[]
+  /** The repository catalog in order. */
+  repos: readonly RepoRow[]
+  /** Features other plugins registered, in registration order. */
+  features: readonly RepoFeature[]
 }
 
 /** `POST /dsh-repo/pick-directory` response: the chosen path, or null when cancelled. */

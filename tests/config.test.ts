@@ -23,12 +23,12 @@ describe('resolveConfig', () => {
 
 describe('resolveSettings', () => {
   it('fills every missing field with its default', () => {
-    expect(DEFAULT_SETTINGS.tools).toEqual({ enabled: true, writes: 'ask', merge: false, deleteSourceBranch: true, signature: '' })
+    expect(DEFAULT_SETTINGS.tools).toEqual({ enabled: true, writes: 'ask', deleteSourceBranch: true, signature: '' })
     expect(resolveSettings({ limits: { perPage: 50 } })).toEqual({ ...DEFAULT_SETTINGS, limits: { ...DEFAULT_SETTINGS.limits, perPage: 50 } })
   })
 
   it('rejects bad values as invalid, naming each field', () => {
-    expect(() => resolveSettings({ repos: ['github.com/*/x'] })).toThrow(/仓库格式/)
+    expect(() => resolveSettings({ repos: ['github.com/a/*'] })).toThrow()
     expect(() => resolveSettings({ limits: { perPage: 80, maxPerPage: 50 } })).toThrow(/limits\.perPage/)
     expect(() => resolveSettings({ timeoutMs: 10 })).toThrow(expect.objectContaining({ code: 'invalid' }))
     expect(() => resolveSettings({ unknown: 1 })).toThrow()
@@ -36,8 +36,8 @@ describe('resolveSettings', () => {
 
   it('stores only the fields that differ from the defaults', () => {
     expect(settingsOverrides(DEFAULT_SETTINGS)).toEqual({})
-    const settings = resolveSettings({ repos: ['github.com/a/*'], tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
-    expect(settingsOverrides(settings)).toEqual({ repos: ['github.com/a/*'], tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
+    const settings = resolveSettings({ tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
+    expect(settingsOverrides(settings)).toEqual({ tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
     expect(resolveSettings(settingsOverrides(settings))).toEqual(settings)
     const watch = resolveSettings({ watch: { idleDays: 3, events: { comment: 'note' } } })
     expect(watch.watch).toMatchObject({ enabled: true, idleDays: 3, activeIntervalMs: 60_000, events: { comment: 'note', ciFailed: 'wake', merged: 'wake', idle: 'wake' } })

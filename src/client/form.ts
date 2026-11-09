@@ -6,7 +6,7 @@
  * @module dsh-repo/client/form
  */
 
-import { MAX_REPO_PATTERNS, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
+import { MAX_SIGNATURE_LENGTH, SETTING_BOUNDS, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
 import type { RepoSettingsWire, WatchAction, WatchEventKind } from '../settings/contract.ts'
 
 /** Integer settings, named as in {@link SETTING_BOUNDS}. */
@@ -72,22 +72,19 @@ export const WRITE_MODES: readonly { readonly id: RepoSettingsWire['tools']['wri
   { id: 'off', label: '关闭' },
 ]
 
-/** Editable form of {@link RepoSettingsWire}: numbers as typed text in display units, repositories one per line. */
+/** Editable form of {@link RepoSettingsWire}: numbers as typed text in display units. */
 export interface SettingsDraft {
-  readonly repos: string
   readonly numbers: Readonly<Record<NumberKey, string>>
   readonly enabled: boolean
   readonly writes: RepoSettingsWire['tools']['writes']
-  readonly merge: boolean
   readonly deleteSourceBranch: boolean
   readonly signature: string
-  readonly otherHosts: boolean
   readonly watchEnabled: boolean
   readonly watchEvents: Readonly<Record<WatchEventKind, WatchAction>>
 }
 
-/** Field of a rejected draft: an integer setting or the repository list. */
-export type DraftField = NumberKey | 'repos' | 'signature'
+/** Field of a rejected draft: an integer setting or the signature. */
+export type DraftField = NumberKey | 'signature'
 
 /** Drop float noise from `stored / scale` (e.g. 0.30000000000000004). */
 function tidy(value: number): number {
@@ -144,14 +141,11 @@ export function toDraft(settings: RepoSettingsWire): SettingsDraft {
   const numbers = {} as Record<NumberKey, string>
   for (const key of Object.keys(NUMBER_FIELDS) as NumberKey[]) numbers[key] = String(tidy(storedNumber(settings, key) / NUMBER_FIELDS[key].scale))
   return {
-    repos: settings.repos.join('\n'),
     numbers,
     enabled: settings.tools.enabled,
     writes: settings.tools.writes,
-    merge: settings.tools.merge,
     deleteSourceBranch: settings.tools.deleteSourceBranch,
     signature: settings.tools.signature,
-    otherHosts: settings.mirror.otherHosts,
     watchEnabled: settings.watch.enabled,
     watchEvents: { ...settings.watch.events },
   }
@@ -193,14 +187,11 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
     else errors[key] = parsed.message
   }
   if (errors.perPage === undefined && errors.maxPerPage === undefined && numbers.perPage > numbers.maxPerPage) errors.perPage = '默认每页条数不能大于每页上限'
-  const repos = [...new Set(draft.repos.split('\n').map(line => line.trim().toLowerCase()).filter(line => line !== ''))]
-  if (repos.length > MAX_REPO_PATTERNS) errors.repos = `最多 ${MAX_REPO_PATTERNS} 条`
   if (draft.signature.length > MAX_SIGNATURE_LENGTH) errors.signature = `签名最多 ${MAX_SIGNATURE_LENGTH} 个字符`
   if (Object.keys(errors).length > 0) return { ok: false, errors }
   return {
     ok: true,
     settings: {
-      repos,
       timeoutMs: numbers.timeoutMs,
       limits: {
         perPage: numbers.perPage,
@@ -212,8 +203,8 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
         maxLogBytes: numbers.maxLogBytes,
         maxCiFailures: numbers.maxCiFailures,
       },
-      tools: { enabled: draft.enabled, writes: draft.writes, merge: draft.merge, deleteSourceBranch: draft.deleteSourceBranch, signature: draft.signature },
-      mirror: { gitTimeoutMs: numbers.gitTimeoutMs, otherHosts: draft.otherHosts },
+      tools: { enabled: draft.enabled, writes: draft.writes, deleteSourceBranch: draft.deleteSourceBranch, signature: draft.signature },
+      mirror: { gitTimeoutMs: numbers.gitTimeoutMs },
       watch: {
         enabled: draft.watchEnabled,
         activeIntervalMs: numbers.activeIntervalMs,

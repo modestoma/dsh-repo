@@ -10,7 +10,7 @@ import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
 import type { AuthorizeEvent, CommitTrailersEvent } from '../src/contract.ts'
 import type { ParallelDispatch } from '../src/events.ts'
-import { credentials, fakeHttp, mirrorLimits, testConfig, TOKENS, withMirrors } from './helpers.ts'
+import { allow, credentials, fakeHttp, mirrorLimits, testConfig, TOKENS, withMirrors } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 const BOT = { name: 'Bot', email: 'bot@example.com' }
@@ -72,6 +72,7 @@ describe('workspaces', () => {
   it('opens a writable checkout whose git metadata stays in the mirror and reports changes against the base', async () => {
     const { bare, commit } = origin()
     const { root, sandbox, service } = setup()
+    await allow(service, [bare])
     const dir = join(sandbox, 'topic', 'app')
     const info = await service.openWorkspace(bare, { dir })
     expect(info).toEqual({ url: bare, dir: realpathSync(dir), baseBranch: 'main', baseCommit: commit })
@@ -103,6 +104,7 @@ describe('workspaces', () => {
   it('starts from a given commit or branch', async () => {
     const { bare, commit } = origin()
     const { sandbox, service } = setup()
+    await allow(service, [bare])
     const info = await service.openWorkspace(bare, { dir: join(sandbox, 'dev'), baseBranch: 'dev', commit })
     expect(info).toMatchObject({ baseBranch: 'dev', baseCommit: commit })
     await expect(service.openWorkspace(bare, { dir: join(sandbox, 'x'), commit: 'abc' })).rejects.toMatchObject({ code: 'invalid' })
@@ -113,6 +115,7 @@ describe('workspaces', () => {
   it('commits and pushes to a new branch only, then keeps pushing to that branch without forcing', async () => {
     const { bare, commit } = origin()
     const { sandbox, service } = setup()
+    await allow(service, [bare])
     const dir = join(sandbox, 'app')
     await service.openWorkspace(bare, { dir })
     await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', author: BOT })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('没有改动') })
@@ -152,6 +155,7 @@ describe('workspaces', () => {
   it('continues an existing remote branch: starts from its head and pushes fast-forward commits to it', async () => {
     const { bare, commit } = origin()
     const { sandbox, service } = setup()
+    await allow(service, [bare])
     const first = join(sandbox, 'first')
     await service.openWorkspace(bare, { dir: first })
     writeFileSync(join(first, 'app.ts'), 'export const a = 2\n')
@@ -176,6 +180,7 @@ describe('workspaces', () => {
   it('refuses to continue the base or default branch, a missing branch, or a branch with a start commit', async () => {
     const { bare, commit } = origin()
     const { sandbox, service } = setup()
+    await allow(service, [bare])
     await expect(service.openWorkspace(bare, { dir: join(sandbox, 'a'), branch: 'main' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('合入目标') })
     await expect(service.openWorkspace(bare, { dir: join(sandbox, 'b'), branch: 'main', baseBranch: 'dev' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('默认分支') })
     await expect(service.openWorkspace(bare, { dir: join(sandbox, 'c'), branch: 'dev', commit })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('起点提交') })
@@ -187,6 +192,7 @@ describe('workspaces', () => {
   it('refuses a first push to an existing branch that already holds the same commit', async () => {
     const { bare } = origin()
     const { sandbox, service } = setup()
+    await allow(service, [bare])
     const one = join(sandbox, 'one')
     const two = join(sandbox, 'two')
     await service.openWorkspace(bare, { dir: one })
@@ -202,6 +208,7 @@ describe('workspaces', () => {
   it('refuses the remote default branch on the first push', async () => {
     const { bare } = origin()
     const { sandbox, service } = setup()
+    await allow(service, [bare])
     const dir = join(sandbox, 'dev')
     await service.openWorkspace(bare, { dir, baseBranch: 'dev' })
     writeFileSync(join(dir, 'app.ts'), 'x\n')
@@ -211,14 +218,20 @@ describe('workspaces', () => {
   it('needs a configured host with a token to push a remote address', async () => {
     const { bare } = origin()
     const { root, sandbox, service } = setup()
+    await allow(service, [bare])
     const dir = join(sandbox, 'app')
     await service.openWorkspace(bare, { dir })
     writeFileSync(join(dir, 'app.ts'), 'x\n')
     const mirror = mirrorOf(dir)
     expect(mirror.startsWith(realpathSync(root))).toBe(true)
     git(mirror, 'remote', 'set-url', 'origin', 'https://elsewhere.example.com/a/b.git')
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'unauthenticated' })
+    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'not-allowed' })
     git(mirror, 'remote', 'set-url', 'origin', 'https://github.com/modestoma/app.git')
+    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'not-allowed', message: expect.stringContaining('仓库清单') })
+    await allow(service, ['https://github.com/modestoma/app'], 'read')
+    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'not-allowed', message: expect.stringContaining('只读') })
+    const entry = service.catalog.find('https://github.com/modestoma/app')!
+    await service.catalog.update(entry.id, { url: entry.url, access: 'write', features: [] })
     await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'unauthenticated' })
   })
 
@@ -231,6 +244,7 @@ describe('workspaces', () => {
     })
     // Serve the github.com address from the local origin so the test stays offline.
     const remote = 'https://github.com/modestoma/app.git'
+    await allow(service, [remote])
     vi.stubEnv('GIT_CONFIG_COUNT', '1')
     vi.stubEnv('GIT_CONFIG_KEY_0', `url.${bare}.insteadOf`)
     vi.stubEnv('GIT_CONFIG_VALUE_0', remote)
@@ -291,6 +305,7 @@ describe('workspaces', () => {
       if (name === 'repo/commit-trailers') listener(args[0] as CommitTrailersEvent)
     }
     const { sandbox, service } = setup({}, runGit, parallel)
+    await allow(service, [bare])
     const dir = join(sandbox, 'app')
     await service.openWorkspace(bare, { dir })
     writeFileSync(join(dir, 'app.ts'), 'export const a = 2\n')
@@ -347,6 +362,7 @@ describe('workspaces', () => {
     })
     const { bare } = origin()
     const { sandbox, service } = setup()
+    await allow(service, [bare])
     const dir = join(sandbox, 'app')
     await service.openWorkspace(bare, { dir })
     writeFileSync(join(dir, '.gitattributes'), '*.bin filter=lfs diff=lfs merge=lfs -text\n')
@@ -361,6 +377,7 @@ describe('workspaces', () => {
   it('refuses directories that are not workspaces of this service, including forged links', async () => {
     const { bare } = origin()
     const { sandbox, service } = setup()
+    await allow(service, [bare])
     const real = join(sandbox, 'app')
     await service.openWorkspace(bare, { dir: real })
     await expect(service.workspaceChanges(join(sandbox, 'missing'))).rejects.toMatchObject({ code: 'not-found' })
@@ -388,6 +405,7 @@ describe('workspaces', () => {
   it('forgets the branches of deleted checkouts on the first sync of a later process', async () => {
     const { bare } = origin()
     const { sandbox, service, make } = setup()
+    await allow(service, [bare])
     const kept = join(sandbox, 'kept')
     const gone = join(sandbox, 'gone')
     await service.openWorkspace(bare, { dir: kept })

@@ -4,8 +4,8 @@
  * @module dsh-repo/client/api
  */
 
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_RUN_ROUTE, SYNCS_ROUTE, WATCHES_ROUTE } from '../settings/contract.ts'
-import type { HostAddRequest, MirrorUsage, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState, SyncInput } from '../settings/contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE } from '../settings/contract.ts'
+import type { HostAddRequest, MirrorUsage, MutationError, MutationOk, PickedDirectory, RepoInput, RepoSettingsWire, SettingsState } from '../settings/contract.ts'
 
 /**
  * Error text of a value thrown by a request.
@@ -132,40 +132,40 @@ export function stopWatch(id: string): Promise<SettingsState> {
 }
 
 /**
- * Add a local sync; responds after its first sync.
- * @param input - address, branch, directory, and interval.
+ * Add a repository to the catalog; responds after the first local sync it starts.
+ * @param input - address, branch, access, features, and local sync.
  * @returns the new state.
  */
-export function addSync(input: SyncInput): Promise<SettingsState> {
-  return mutate(SYNCS_ROUTE, 'POST', input)
+export function addRepo(input: RepoInput): Promise<SettingsState> {
+  return mutate(REPOS_ROUTE, 'POST', input)
 }
 
 /**
- * Change a local sync; responds after the sync a changed address, branch, or directory causes.
- * @param id - sync id.
+ * Change a catalog repository; responds after the local sync a changed address, branch, or directory starts.
+ * @param id - entry id.
  * @param input - the complete new fields.
  * @returns the new state.
  */
-export function updateSync(id: string, input: SyncInput): Promise<SettingsState> {
-  return mutate(SYNCS_ROUTE, 'PUT', { id, ...input })
+export function updateRepo(id: string, input: RepoInput): Promise<SettingsState> {
+  return mutate(REPOS_ROUTE, 'PUT', { id, ...input })
 }
 
 /**
- * Remove a local sync; its files stay.
- * @param id - sync id.
+ * Remove a repository from the catalog; files in its local sync directory stay.
+ * @param id - entry id.
  * @returns the new state.
  */
-export function removeSync(id: string): Promise<SettingsState> {
-  return mutate(SYNCS_ROUTE, 'DELETE', { id })
+export function removeRepo(id: string): Promise<SettingsState> {
+  return mutate(REPOS_ROUTE, 'DELETE', { id })
 }
 
 /**
- * Sync now; responds when the sync finished.
- * @param id - sync id.
+ * Run a repository's local sync now; responds when the sync finished.
+ * @param id - entry id.
  * @returns the new state.
  */
-export function runSync(id: string): Promise<SettingsState> {
-  return mutate(SYNC_RUN_ROUTE, 'POST', { id })
+export function syncRepo(id: string): Promise<SettingsState> {
+  return mutate(REPO_SYNC_ROUTE, 'POST', { id })
 }
 
 /** @returns the repositories in the mirror directory with their disk usage. */

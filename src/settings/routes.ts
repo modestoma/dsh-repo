@@ -14,8 +14,8 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { RepoService } from '../service.ts'
 import type { DirectoryPicker } from './directory-picker.ts'
 import { hostDirectoryPicker } from './directory-picker.ts'
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_RUN_ROUTE, SYNCS_ROUTE, WATCHES_ROUTE } from './contract.ts'
-import type { SettingsState, SyncInfo, SyncInput, WatchInfo } from './contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE } from './contract.ts'
+import type { LocalSyncStatus, RepoInput, RepoRow, SettingsState, WatchInfo } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -45,37 +45,69 @@ export interface WatchList {
 /** No watcher: nothing is watched. */
 const NO_WATCHES: WatchList = { active: false, list: () => [], remove: async () => false }
 
-const syncFields = {
+const repoFields = {
   url: z.string(),
   branch: z.string().optional(),
-  dir: z.string(),
-  intervalMinutes: z.number().optional(),
+  access: z.enum(['read', 'write', 'merge']),
+  features: z.array(z.string()),
+  localSync: z.object({ enabled: z.boolean(), dir: z.string(), intervalMinutes: z.number().optional() }).strict().optional(),
 }
-const syncAddSchema = z.object(syncFields).strict()
-const syncUpdateSchema = z.object({ id: z.string(), ...syncFields }).strict()
-const syncIdSchema = z.object({ id: z.string() }).strict()
+const repoAddSchema = z.object(repoFields).strict()
+const repoUpdateSchema = z.object({ id: z.string(), ...repoFields }).strict()
+const repoIdSchema = z.object({ id: z.string() }).strict()
 
 /** The local syncs as the settings page uses them. */
 export interface SyncList {
-  list(): SyncInfo[]
-  add(input: SyncInput): Promise<SyncInfo>
-  update(id: string, input: SyncInput): Promise<SyncInfo>
-  remove(id: string): Promise<boolean>
-  syncNow(id: string): Promise<SyncInfo>
+  /** @returns the status of a repository's enabled local sync, or undefined. */
+  status(id: string): LocalSyncStatus | undefined
+  /** Sync now; resolves when the attempt finished. */
+  syncNow(id: string): Promise<void>
+  /** @returns once the sync, or the deletion of a removed repository's progress, that a catalog change started finished. */
+  settled(id: string): Promise<void>
 }
 
-/** No syncer: nothing is synced, and changes are refused. */
+/** No syncer: nothing is synced, and syncing on demand is refused. */
 const NO_SYNCS: SyncList = {
-  list: () => [],
-  add: async () => { throw new HttpError(404, '当前组合没有本地同步') },
-  update: async () => { throw new HttpError(404, '当前组合没有本地同步') },
-  remove: async () => false,
+  status: () => undefined,
   syncNow: async () => { throw new HttpError(404, '当前组合没有本地同步') },
+  settled: async () => undefined,
 }
 
-function syncInput(body: z.output<typeof syncAddSchema>): SyncInput {
-  return { url: body.url, dir: body.dir, ...body.branch === undefined ? {} : { branch: body.branch }, ...body.intervalMinutes === undefined ? {} : { intervalMinutes: body.intervalMinutes } }
+function repoInput(body: z.output<typeof repoAddSchema>): RepoInput {
+  const { localSync } = body
+  return {
+    url: body.url,
+    ...body.branch === undefined ? {} : { branch: body.branch },
+    access: body.access,
+    features: body.features,
+    ...localSync === undefined ? {} : { localSync: { enabled: localSync.enabled, dir: localSync.dir, ...localSync.intervalMinutes === undefined ? {} : { intervalMinutes: localSync.intervalMinutes } } },
+  }
 }
+
+/**
+ * The settings page's rows of the catalog.
+ * @param service - the `dshRepos` implementation.
+ * @param syncs - the local syncs.
+ * @returns every entry with its key or problem and its local sync status.
+ */
+export function repoRows(service: RepoService, syncs: SyncList = NO_SYNCS): RepoRow[] {
+  return service.catalog.entries().map((entry) => {
+    const own = service.catalog.keyOf(entry)
+    const sync = syncs.status(entry.id)
+    return {
+      id: entry.id,
+      url: entry.url,
+      ...entry.branch === undefined ? {} : { branch: entry.branch },
+      access: entry.access,
+      features: [...entry.features],
+      ...entry.localSync === undefined ? {} : { localSync: { ...entry.localSync } },
+      addedAt: entry.addedAt,
+      ...'key' in own ? { key: own.key.startsWith('local:') ? own.key.slice('local:'.length) : own.key } : { problem: own.problem },
+      ...sync === undefined ? {} : { sync },
+    }
+  })
+}
+
 /** The service validates the settings fields and reports every bad one. */
 const settingsBodySchema = z.record(z.string(), z.unknown())
 
@@ -188,7 +220,7 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
  * @param picker - the Host's directory dialog.
  * @param watches - the PR/MR watcher.
  * @param syncs - the local syncs.
- * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, whether a directory dialog is available, the watched PRs/MRs, and the local syncs.
+ * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, whether a directory dialog is available, the watched PRs/MRs, the catalog with local sync status, and the registered features.
  */
 export async function settingsState(service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): Promise<SettingsState> {
   return {
@@ -200,7 +232,8 @@ export async function settingsState(service: RepoService, picker: DirectoryPicke
     pickerAvailable: picker.available,
     watches: watches.list(),
     watchAvailable: watches.active,
-    syncs: syncs.list(),
+    repos: repoRows(service, syncs),
+    features: service.catalog.registeredFeatures(),
   }
 }
 
@@ -275,25 +308,30 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
     }),
     server.register({
       kind: 'exact',
-      path: SYNCS_ROUTE,
+      path: REPOS_ROUTE,
       handler: guarded(gate, ['POST', 'PUT', 'DELETE'], async (req, res) => {
         const method = req.method?.toUpperCase()
         if (method === 'DELETE') {
-          if (!await syncs.remove((await readJsonBody(req, syncIdSchema)).id)) throw new HttpError(404, '没有这条本地同步，可能已经删除')
-        } else if (method === 'PUT') {
-          const { id, ...body } = await readJsonBody(req, syncUpdateSchema)
-          await syncs.update(id, syncInput(body))
+          const { id } = await readJsonBody(req, repoIdSchema)
+          if (await service.catalog.remove(id) === undefined) throw new HttpError(404, '仓库清单中没有这个仓库，可能已经删除')
+          await syncs.settled(id)
         } else {
-          await syncs.add(syncInput(await readJsonBody(req, syncAddSchema)))
+          const entry = method === 'PUT'
+            ? await (async () => {
+              const { id, ...body } = await readJsonBody(req, repoUpdateSchema)
+              return await service.catalog.update(id, repoInput(body))
+            })()
+            : await service.catalog.add(repoInput(await readJsonBody(req, repoAddSchema)))
+          await syncs.settled(entry.id)
         }
         await reply(res)
       }),
     }),
     server.register({
       kind: 'exact',
-      path: SYNC_RUN_ROUTE,
+      path: REPO_SYNC_ROUTE,
       handler: guarded(gate, ['POST'], async (req, res) => {
-        await syncs.syncNow((await readJsonBody(req, syncIdSchema)).id)
+        await syncs.syncNow((await readJsonBody(req, repoIdSchema)).id)
         await reply(res)
       }),
     }),

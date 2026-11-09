@@ -4,9 +4,10 @@
  * 用 GitHub 官方 SDK（Octokit）和 GitLab 文档推荐的 GitBeaker 抹平
  * GitHub（含 GitHub Enterprise Server）与 GitLab（含自建实例）的差异：
  * 对其他插件提供 `dshRepos` 服务（类型见 `dsh-repo/contract`），
- * 对模型提供代码、issue、PR/MR 工具，写操作逐次经用户审批；还可以把
- * 仓库分支定时展开到本机目录（本地同步）。Web 组合中另在左侧栏
- * 「代码仓库」提供整页设置（见 `dsh-repo/client`）。
+ * 对模型提供代码、issue、PR/MR 工具，写操作逐次经用户审批。只有仓库清单中的
+ * 仓库可以访问，每个仓库按清单里的权限（只读、可改代码、可合并）限制操作，
+ * 并可把分支定时展开到本机目录（本地同步）；其他插件可以登记按仓库开关的功能。
+ * Web 组合中另在左侧栏「代码仓库」提供整页设置（见 `dsh-repo/client`）。
  *
  * @module dsh-repo
  */
@@ -26,7 +27,7 @@ import { mountSettingsRoutes } from './settings/routes.ts'
 import { createTools, toolOffered } from './tools.ts'
 import { hostDelivery } from './watch/delivery.ts'
 import { SyncStore } from './sync/store.ts'
-import { LocalSyncer } from './sync/syncer.ts'
+import { LocalSyncer, syncRecords } from './sync/syncer.ts'
 import { WatchStore } from './watch/store.ts'
 import { ChangeWatcher } from './watch/watcher.ts'
 import { authorize } from './events.ts'
@@ -49,7 +50,12 @@ export type { ProviderFactory, RepoServiceDeps } from './service.ts'
 export { GithubProvider } from './providers/github.ts'
 export { GitlabProvider } from './providers/gitlab.ts'
 export type { Provider } from './providers/types.ts'
-export { hostOf, matchesPattern, resolveTarget } from './target.ts'
+export { hostOf, resolveTarget } from './target.ts'
+export { RepoCatalog, accessLabel, catalogKey } from './catalog/catalog.ts'
+export type { CatalogDeps } from './catalog/catalog.ts'
+export { ACCESS_ORDER, allows, catalogEntrySchema, checkFeature, checkInput, publicRepo } from './catalog/entry.ts'
+export type { CatalogEntry, CheckedInput } from './catalog/entry.ts'
+export { overlaps, realPathOf, within } from './paths.ts'
 export { createTools, toolOffered } from './tools.ts'
 export { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, SETTING_BOUNDS, STATE_ROUTE } from './settings/contract.ts'
 export type { HostAddRequest, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState } from './settings/contract.ts'
@@ -61,9 +67,9 @@ export { ACTIVITY_SOURCE, RESOLVE_AGENT_EVENT, activityMessage, hostDelivery } f
 export type { DeliveryOutcome, WatchDelivery } from './watch/delivery.ts'
 export { WatchStore } from './watch/store.ts'
 export { SyncStore } from './sync/store.ts'
-export type { SyncRecord } from './sync/store.ts'
-export { LocalSyncer, RETRY_MS } from './sync/syncer.ts'
-export type { SyncerDeps, SyncService } from './sync/syncer.ts'
+export type { SyncProgress } from './sync/store.ts'
+export { LocalSyncer, RETRY_MS, syncRecords } from './sync/syncer.ts'
+export type { SyncerDeps, SyncRecord, SyncService } from './sync/syncer.ts'
 export { measureMirrors, treeSize } from './mirror/usage.ts'
 export type { OriginReader } from './mirror/usage.ts'
 export { ChangeWatcher } from './watch/watcher.ts'
@@ -74,8 +80,9 @@ export { WATCH_EVENT_KINDS, WATCHES_ROUTE } from './settings/contract.ts'
 export type { WatchAction, WatchEventKind, WatchInfo } from './settings/contract.ts'
 export type { ActivityItem, ActivityRequest, ChangeActivity } from './providers/types.ts'
 export type { SyncList, WatchList } from './settings/routes.ts'
-export { DEFAULT_SYNC_INTERVAL_MINUTES, MAX_SYNCS, MIRROR_USAGE_ROUTE, SYNC_INTERVAL_BOUNDS, SYNC_RUN_ROUTE, SYNCS_ROUTE } from './settings/contract.ts'
-export type { MirrorUsage, MirrorUsageEntry, SyncInfo, SyncInput } from './settings/contract.ts'
+export { repoRows } from './settings/routes.ts'
+export { ACCESS_LEVELS, DEFAULT_SYNC_INTERVAL_MINUTES, MAX_REPO_FEATURES, MAX_REPOS, MIRROR_USAGE_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SYNC_INTERVAL_BOUNDS } from './settings/contract.ts'
+export type { LocalSyncStatus, MirrorUsage, MirrorUsageEntry, RepoInput, RepoRow } from './settings/contract.ts'
 export { syncIndexDir, syncsFile } from './config.ts'
 
 export { ACCESS_AUTHORIZE_EVENT, COMMIT_TRAILERS_EVENT, authorize, collectDetails } from './events.ts'
@@ -105,11 +112,11 @@ export interface RepoPluginOptions {
 }
 
 /**
- * Provide the `dshRepos` service, start the PR/MR watcher and the local
- * syncs, mount the settings routes while the Host serves the Web, and
- * register the model tools, each offered only while at least one host is
- * configured or added and the current tool settings allow it
- * (`repo_mr_watch` also needs watching to be active). Writes made for a
+ * Provide the `dshRepos` service, start the PR/MR watcher and the catalog's
+ * local syncs, mount the settings routes while the Host serves the Web, and
+ * register the model tools, each offered only while the catalog holds a
+ * repository whose access the tool needs and the current tool settings allow
+ * it (`repo_mr_watch` also needs watching to be active). Writes made for a
  * Session go through the `access/authorize` listeners first, and pushes
  * collect `repo/commit-trailers` (see `dsh-repo/events`).
  * @param ctx - plugin context.
@@ -120,7 +127,7 @@ export interface RepoPluginOptions {
 export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOptions = {}): void {
   const resolved = resolveConfig(config)
   const env = options.env ?? process.env
-  const hosts = new HostStore(resolved.hosts, hostsFile(resolved, env))
+  const hosts = new HostStore(resolved.hosts, hostsFile(resolved, env), ctx.logger)
   const git = options.git ?? runGit
   const mirrors = new MirrorStore({
     git,
@@ -163,6 +170,8 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   }, 'dsh-repo: PR/MR watcher')
   const syncer = new LocalSyncer({
     service,
+    records: () => syncRecords(service.catalog.entries()),
+    ids: () => new Set(service.catalog.entries().map(entry => entry.id)),
     git,
     store: new SyncStore(syncsFile(hosts.file), ctx.logger),
     indexDir: syncIndexDir(hosts.file),
@@ -171,21 +180,26 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
   })
   ctx.effect(() => {
     syncer.start()
-    return () => { void syncer.stop() }
+    const unlisten = service.onReposChange(() => { syncer.reconcile() })
+    return () => {
+      unlisten()
+      void syncer.stop()
+    }
   }, 'dsh-repo: local syncs')
   mountSettingsRoutes(ctx, service, watcher, syncer)
-  if (!service.configured) ctx.logger?.info?.('dsh-repo: 还没有主机，代码仓库工具在添加主机后提供')
+  if (service.catalog.entries().length === 0) ctx.logger?.info?.('dsh-repo: 仓库清单为空，代码仓库工具在「代码仓库 → 仓库」添加仓库后提供')
   const tools = createTools({
     service,
     settings: () => service.settings.tools,
     approval: () => ctx.get?.('approval') as HostApproval | undefined,
     workingDirectory: () => ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined,
     authorize: event => authorize(parallel, event),
+    allowed: (repo, level) => { service.catalog.require(repo, level) },
     watch: watcher,
   })
   for (const { definition, access } of tools) {
     ctx.effect(() => ctx.tools.register(definition, {
-      when: () => service.configured && toolOffered(access, service.settings.tools) && (access !== 'watch' || watcher.active),
+      when: () => toolOffered(access, service.settings.tools, service.catalog.highestAccess()) && (access !== 'watch' || watcher.active),
     }), `dsh-repo: ${definition.name}`)
   }
 }
