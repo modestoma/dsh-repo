@@ -922,6 +922,12 @@ function WorkspaceSettings({ form, state, run, onError }: { form: FormProps; sta
     void pickDirectory().then((path) => { if (path !== null) setDirDraft(path) }, (error: unknown) => { onError(messageOf(error)) })
   }
   const listening = state.workspace.proxyListening
+  const configuredPort = state.settings.workspace.proxyPort
+  // A failed bind leaves the new port saved, so the save bar has nothing to save; saving the same settings again restarts the proxy.
+  const proxyOff = state.workspace.available && (listening === undefined || (configuredPort !== 0 && listening !== configuredPort))
+  const retryProxy = (): void => {
+    void run(() => saveSettings(state.settings), (next) => next.workspace.proxyListening === undefined ? { kind: 'error', text: '代理仍然没有运行' } : { kind: 'ok', text: `代理已监听 127.0.0.1:${next.workspace.proxyListening}` })
+  }
   return (
     <Section title="工作区">
       <Row label="工作区目录" summary="「工作区」里新建的工作区放在这个目录下，不存在会自动创建。会话里用工具新建的工作区放在会话自己的目录里，不受影响。" block>
@@ -934,7 +940,10 @@ function WorkspaceSettings({ form, state, run, onError }: { form: FormProps; sta
       </Row>
       <NumberRow field="proxyPort" {...form} />
       <Row label="代理状态" summary="端口改动保存后代理立即换到新端口，已有工作区一起改过去。">
-        {listening === undefined ? <span className="dr__pill dr__pill--bad"><span className="dr__dot" />没有运行</span> : <span className="dr__pill dr__pill--ok"><span className="dr__dot" />监听 127.0.0.1:{listening}</span>}
+        <div className="dr__inline">
+          {listening === undefined ? <span className="dr__pill dr__pill--bad"><span className="dr__dot" />没有运行</span> : <span className={`dr__pill ${proxyOff ? 'dr__pill--warn' : 'dr__pill--ok'}`}><span className="dr__dot" />监听 127.0.0.1:{listening}{proxyOff ? `，设置的是 ${configuredPort}` : ''}</span>}
+          {proxyOff ? <button type="button" className="dr__btn" disabled={busy} onClick={retryProxy}>重试</button> : null}
+        </div>
       </Row>
       <Row label="提交姓名" summary="写进新工作区的 git 配置，和邮箱一起填；都留空时用主机令牌账号的名字和邮箱。" error={errors.commitName}>
         <ResetLink shown={current.commitName !== defaults.commitName} busy={busy} onReset={() => { edit({ commitName: defaults.commitName }) }} />
