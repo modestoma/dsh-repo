@@ -10,7 +10,7 @@ import { dirname, join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { ForgeKind } from './contract.ts'
 import { RepoError } from './errors.ts'
-import { MAX_IDENTITY_LENGTH, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS } from './settings/contract.ts'
+import { forgeKindInfo, MAX_IDENTITY_LENGTH, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS } from './settings/contract.ts'
 import type { RepoSettingsWire } from './settings/contract.ts'
 
 
@@ -53,7 +53,8 @@ const hostSchema = z.object({
   tokenRef: z.string().trim().regex(TOKEN_REF_PATTERN, '令牌名称只能包含字母、数字和下划线，且不能以数字开头（它是凭据库中的键名，不是令牌本身）'),
   alias: z.string().trim().max(64).optional(),
 }).strict().superRefine((host, issues) => {
-  if (host.kind === 'gitlab' && host.apiUrl !== undefined) issues.addIssue({ code: 'custom', path: ['apiUrl'], message: 'apiUrl 只用于 GitHub；GitLab 的接口地址由 url 推出' })
+  const info = forgeKindInfo(host.kind)
+  if (info.apiUrl === undefined && host.apiUrl !== undefined) issues.addIssue({ code: 'custom', path: ['apiUrl'], message: `${info.label} 的接口地址由 url 推出，不能设置 apiUrl` })
 })
 
 const limitsSchema = z.object({
@@ -264,17 +265,6 @@ export function resolveConfig(config: unknown): RepoConfig {
   const parsed = pluginConfigSchema.safeParse(config)
   if (parsed.success) return parsed.data
   throw new Error(`dsh-repo 配置不合法：${parsed.error.issues.map(issue => `${issue.path.join('.') || '(根)'}：${issue.message}`).join('；')}`)
-}
-
-/**
- * The REST API base URL of a host.
- * @param host - configured host.
- * @returns `https://api.github.com` for github.com, `<url>/api/v3` for GitHub Enterprise Server, and the host URL itself for GitLab (GitBeaker appends `/api/v4`).
- */
-export function apiBaseUrl(host: { readonly kind: ForgeKind; readonly url: string; readonly apiUrl?: string | undefined }): string {
-  if (host.kind === 'gitlab') return host.url
-  if (host.apiUrl !== undefined) return host.apiUrl
-  return new URL(host.url).host === 'github.com' ? 'https://api.github.com' : `${host.url}/api/v3`
 }
 
 /**

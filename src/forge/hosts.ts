@@ -8,12 +8,10 @@
  */
 
 import type { CommitAuthor, HostCreate, HostInfo, HostsChange, RepoTarget, TokenStatus } from '../contract.ts'
-import { apiBaseUrl } from '../config.ts'
 import type { HostSpec } from '../config.ts'
 import { RepoError, toRepoError } from '../errors.ts'
 import type { HostCredentials, HostLogger } from '../host.ts'
-import { GithubProvider } from '../providers/github.ts'
-import { GitlabProvider } from '../providers/gitlab.ts'
+import { forgeOf } from '../providers/forges.ts'
 import type { Provider } from '../providers/types.ts'
 import { isAcceptedToken, MAX_TOKEN_LENGTH } from '../settings/store.ts'
 import type { SettingsStore } from '../settings/store.ts'
@@ -23,10 +21,8 @@ import type { ResolvedTarget } from '../target.ts'
 /** Builds the provider of one host; tests substitute it. */
 export type ProviderFactory = (spec: HostSpec, token: () => Promise<string>, timeoutMs: number) => Provider
 
-/** Default factory: Octokit for GitHub, GitBeaker for GitLab. */
-export const defaultProviderFactory: ProviderFactory = (spec, token, timeoutMs) => spec.kind === 'github'
-  ? new GithubProvider(apiBaseUrl(spec), token)
-  : new GitlabProvider(apiBaseUrl(spec), token, timeoutMs)
+/** Default factory: the provider of the host's family. */
+export const defaultProviderFactory: ProviderFactory = (spec, token, timeoutMs) => forgeOf(spec.kind).createProvider(spec, token, timeoutMs)
 
 /** Credentials of a configured host for git over HTTPS. */
 export interface HostGitCredentials {
@@ -35,11 +31,6 @@ export interface HostGitCredentials {
   /** HTTP username git sends with the token. */
   readonly username: string
   readonly token: string
-}
-
-/** HTTP username git sends with a host's token. */
-function gitUsername(kind: HostSpec['kind']): string {
-  return kind === 'gitlab' ? 'oauth2' : 'x-access-token'
 }
 
 /** Rejects with the signal's reason once it aborts. */
@@ -212,7 +203,7 @@ export class HostRegistry {
    */
   async gitCredentials(url: string): Promise<HostGitCredentials> {
     const spec = this.hostOf(url)
-    return { hostUrl: spec.url, username: gitUsername(spec.kind), token: await this.token(spec) }
+    return { hostUrl: spec.url, username: forgeOf(spec.kind).gitUsername, token: await this.token(spec) }
   }
 
   /**

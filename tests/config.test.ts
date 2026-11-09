@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_SETTINGS, apiBaseUrl, resolveConfig, resolveSettings, settingsOverrides } from '../src/config.ts'
+import { DEFAULT_SETTINGS, resolveConfig, resolveSettings, settingsOverrides } from '../src/config.ts'
+import { forgeOf } from '../src/providers/forges.ts'
 
 describe('resolveConfig', () => {
   it('accepts an omitted config with safe defaults', () => {
@@ -47,11 +48,16 @@ describe('resolveSettings', () => {
   })
 })
 
-describe('apiBaseUrl', () => {
-  it('derives the REST base of github.com, GitHub Enterprise Server, and GitLab', () => {
-    expect(apiBaseUrl({ kind: 'github', url: 'https://github.com' })).toBe('https://api.github.com')
-    expect(apiBaseUrl({ kind: 'github', url: 'https://ghe.example.com' })).toBe('https://ghe.example.com/api/v3')
-    expect(apiBaseUrl({ kind: 'github', url: 'https://ghe.example.com', apiUrl: 'https://api.ghe.example.com' })).toBe('https://api.ghe.example.com')
-    expect(apiBaseUrl({ kind: 'gitlab', url: 'https://code.example.com/gitlab' })).toBe('https://code.example.com/gitlab')
+describe('forge adapters', () => {
+  it('derive the REST base of github.com, GitHub Enterprise Server, and GitLab', () => {
+    expect(forgeOf('github').apiBaseUrl({ url: 'https://github.com' })).toBe('https://api.github.com')
+    expect(forgeOf('github').apiBaseUrl({ url: 'https://ghe.example.com' })).toBe('https://ghe.example.com/api/v3')
+    expect(forgeOf('github').apiBaseUrl({ url: 'https://ghe.example.com', apiUrl: 'https://api.ghe.example.com' })).toBe('https://api.ghe.example.com')
+    expect(forgeOf('gitlab').apiBaseUrl({ url: 'https://code.example.com/gitlab' })).toBe('https://code.example.com/gitlab')
+  })
+
+  it('name each family\'s git username and PR/MR label', () => {
+    expect([forgeOf('github').gitUsername, forgeOf('github').mrLabel(12)]).toEqual(['x-access-token', 'PR #12'])
+    expect([forgeOf('gitlab').gitUsername, forgeOf('gitlab').mrLabel(12)]).toEqual(['oauth2', 'MR !12'])
   })
 })

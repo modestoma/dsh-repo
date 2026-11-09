@@ -1,7 +1,7 @@
 /**
  * GitHub provider on the official `@octokit/rest` SDK: github.com and GitHub
- * Enterprise Server (`<url>/api/v3`). Pull requests are this module's change
- * requests.
+ * Enterprise Server (`<url>/api/v3`). Pull requests are this module's PRs/MRs.
+ * {@link githubForge} is the family's adapter.
  *
  * @module dsh-repo/providers/github
  */
@@ -12,8 +12,9 @@ import type {
   IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
-import { capFailures, errorText, nextPage, okBody, titleOf, truncateBytes } from './types.ts'
-import type { ActivityItem, ActivityRequest, Call, MrActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
+import { forgeKindInfo } from '../settings/contract.ts'
+import { capFailures, errorText, joinRepoPath, nextPage, okBody, pathSegments, titleOf, truncateBytes } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ForgeAdapter, MrActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitHub's largest page. */
 const PAGE = 100
@@ -735,4 +736,22 @@ export class GithubProvider implements Provider {
     const { data } = await this.octokit.rest.issues.listComments({ ...split(ref.path), issue_number: number, per_page: call.limits.maxComments, request: { signal: call.signal } })
     return data.map(comment)
   }
+}
+
+/** The GitHub family: repositories are `owner/name`, git authenticates as `x-access-token`. */
+export const githubForge: ForgeAdapter = {
+  kind: 'github',
+  title: forgeKindInfo('github').label,
+  gitUsername: 'x-access-token',
+  pathHint: 'owner/name',
+  apiBaseUrl: (host) => {
+    if (host.apiUrl !== undefined) return host.apiUrl
+    return new URL(host.url).host === 'github.com' ? 'https://api.github.com' : `${host.url}/api/v3`
+  },
+  repoPath: (rest) => {
+    const segments = pathSegments(rest).slice(0, 2)
+    return segments.length === 2 ? joinRepoPath(segments) : undefined
+  },
+  mrLabel: number => `PR #${number}`,
+  createProvider: (spec, token) => new GithubProvider(githubForge.apiBaseUrl(spec), token),
 }
