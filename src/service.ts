@@ -1,8 +1,11 @@
 /**
- * The `dshRepos` service: resolves each target against the configured hosts,
- * requires it to be in the repository catalog with enough access, validates
- * arguments, attaches the call deadline, delegates to the host family's
- * provider, and turns every failure into a {@link RepoError}.
+ * The repository engine behind the `dshRepos` service, the tools, the
+ * watcher, the local syncs, and the settings page: resolves each target
+ * against the configured hosts, requires it to be in the repository catalog
+ * with enough access, validates arguments, attaches the call deadline,
+ * delegates to the host family's provider, and turns every failure into a
+ * {@link RepoError}. Approval and `access/authorize` are not done here but in
+ * the operation registry (`dsh-repo/operations`).
  *
  * Tokens are read through `ctx.credentials` and settings from the settings
  * file's store on every request, so a rotated token or a saved setting takes
@@ -15,25 +18,21 @@ import { constants } from 'node:fs'
 import { access, mkdir } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type {
-  CallOptions, CatalogRepo, ChangeCreate, ChangeInfo, CiActionResult, CiJob, CiJobLog, CiLogOptions, CiRunListOptions, CiTarget, CommitAuthor, CommitDetails, CommitTrailer, ChangeListOptions, ChangeUpdate, DshRepoService, IssueCreate, IssueListOptions, IssueUpdate,
-  HostCreate, HostInfo, HostsChange, MergedBranchDeletion, MergeOptions, MirrorSettings, MirrorState, MirrorSyncOptions, MirrorTreeEntry, Page, PageOptions, RepoAccess, RepoAddOptions, RepoAddResult, RepoFeature, RepoRef, RepoTarget,
-  SnapshotLease, TokenStatus, WorkspaceChanges, WorkspaceInfo, WorkspaceOpenOptions, WorkspacePushOptions, WorkspacePushResult,
+  CallOptions, CatalogRepo, CiActionResult, CiJob, CiJobLog, CommitAuthor, HostCreate, HostInfo, HostsChange, MergedBranchDeletion, MergeMethod, MrInfo, MrState, Page, RepoAccess,
+  RepoAddResult, RepoFeature, RepoRef, RepoTarget, TokenStatus,
 } from './contract.ts'
 import { readLog } from './ci/log.ts'
 import { RepoCatalog } from './catalog/catalog.ts'
 import { publicRepo } from './catalog/entry.ts'
 import { apiBaseUrl, DEFAULT_SETTINGS, resolveSettings } from './config.ts'
 import type { HostSpec, RepoSettings } from './config.ts'
-import type { MirrorUsage } from './settings/contract.ts'
+import type { MirrorSettings, MirrorUsage } from './settings/contract.ts'
 import { RepoError, toRepoError } from './errors.ts'
-import { authorize, collectDetails } from './events.ts'
-import type { ParallelDispatch } from './events.ts'
 import type { HostCredentials, HostLogger } from './host.ts'
 import { HostStore, isAcceptedToken, MAX_TOKEN_LENGTH } from './hosts.ts'
 import { credentialEnvironment } from './mirror/git.ts'
 import { checkMirrorDir } from './mirror/root.ts'
-import type { MirrorStore } from './mirror/store.ts'
-import type { WorkspaceStore } from './mirror/workspace.ts'
+import type { MirrorState, MirrorStore } from './mirror/store.ts'
 import { GithubProvider } from './providers/github.ts'
 import { GitlabProvider } from './providers/gitlab.ts'
 import type { ActivityRequest, Call, ChangeActivity, Paging, Provider } from './providers/types.ts'
@@ -53,15 +52,96 @@ export const defaultProviderFactory: ProviderFactory = (spec, token, timeoutMs) 
 
 const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
 
-/** Pages of change requests from one branch read before giving up. */
+/** Paging as list calls pass it. */
+export interface PageOptions extends CallOptions {
+  readonly page?: number
+  readonly perPage?: number
+}
+
+/** Filters of a CI run listing; `change` is a pull/merge request number. */
+export interface CiRunListOptions extends PageOptions {
+  readonly ref?: string
+  readonly sha?: string
+  readonly change?: number
+  readonly state?: 'pending' | 'running' | 'success' | 'failure' | 'canceled'
+}
+
+/** A run or a job to retry or cancel. */
+export type CiTarget = { readonly runId: number; readonly jobId?: undefined } | { readonly jobId: number; readonly runId?: undefined }
+
+/** Options of {@link RepoService.ciJobLog}. */
+export interface CiLogOptions extends CallOptions {
+  readonly search?: readonly string[]
+  readonly context?: number
+  readonly section?: string
+  readonly beforeLine?: number
+}
+
+/** Fields of a new pull/merge request. */
+export interface MrCreateFields extends CallOptions {
+  readonly title: string
+  readonly body?: string
+  readonly sourceBranch: string
+  readonly targetBranch?: string
+  readonly draft?: boolean
+  readonly labels?: readonly string[]
+  readonly assignees?: readonly string[]
+  /** GitLab: tick "delete source branch" so GitLab deletes it on merge. */
+  readonly deleteSourceBranch?: boolean
+}
+
+/** Fields to change on a pull/merge request. */
+export interface MrUpdateFields extends CallOptions {
+  readonly title?: string
+  readonly body?: string
+  readonly state?: 'open' | 'closed'
+  readonly targetBranch?: string
+  readonly labels?: readonly string[]
+  readonly assignees?: readonly string[]
+}
+
+/** Fields of a new issue. */
+export interface IssueCreateFields extends CallOptions {
+  readonly title: string
+  readonly body?: string
+  readonly labels?: readonly string[]
+  readonly assignees?: readonly string[]
+}
+
+/** Fields to change on an issue. */
+export interface IssueUpdateFields extends CallOptions {
+  readonly title?: string
+  readonly body?: string
+  readonly state?: 'open' | 'closed'
+  readonly labels?: readonly string[]
+  readonly assignees?: readonly string[]
+}
+
+/** A merge request after validation. */
+export interface MergeFields extends CallOptions {
+  readonly headSha: string
+  readonly method?: MergeMethod
+  readonly deleteSourceBranch?: boolean
+}
+
+/** Credentials of a configured host for git over HTTPS. */
+export interface HostGitCredentials {
+  /** Normalized host address. */
+  readonly hostUrl: string
+  /** HTTP username git sends with the token. */
+  readonly username: string
+  readonly token: string
+}
+
+/** Pages of pull/merge requests from one branch read before giving up. */
 const MAX_BRANCH_CHANGE_PAGES = 10
 
-/** Every change request, in any state, from a branch of the repository. */
-async function allChangesFrom(provider: Provider, ref: RepoRef, branch: string, call: Call): Promise<ChangeInfo[]> {
-  const found: ChangeInfo[] = []
+/** Every pull/merge request, in any state, from a branch of the repository. */
+async function allChangesFrom(provider: Provider, ref: RepoRef, branch: string, call: Call): Promise<MrInfo[]> {
+  const found: MrInfo[] = []
   for (let page: number | undefined = 1; page !== undefined;) {
     if (page > MAX_BRANCH_CHANGE_PAGES) throw new RepoError('too-large', `分支 ${branch} 上的 PR/MR 超过 ${MAX_BRANCH_CHANGE_PAGES * call.limits.maxPerPage} 个`)
-    const result: Page<ChangeInfo> = await provider.listChanges(ref, { page, perPage: call.limits.maxPerPage, state: 'all', sourceBranch: branch }, call)
+    const result: Page<MrInfo> = await provider.listChanges(ref, { page, perPage: call.limits.maxPerPage, state: 'all', sourceBranch: branch }, call)
     found.push(...result.items)
     page = result.nextPage
   }
@@ -108,27 +188,6 @@ function ciTarget(target: CiTarget): { readonly kind: 'run' | 'job'; readonly id
   return { kind, id, label: kind === 'run' ? `流水线 ${id}` : `作业 ${id}` }
 }
 
-/** Most trailers one push may add besides `DSH-Session:`. */
-const MAX_TRAILERS = 20
-const TRAILER_TOKEN = /^[A-Za-z][A-Za-z0-9-]{0,63}$/
-
-/**
- * Validate extra commit trailers, trimming each value.
- * @param trailers - trailers from the caller or the `repo/commit-trailers` listeners.
- * @returns the trimmed trailers.
- * @throws {RepoError} `invalid` naming the first bad trailer.
- */
-function checkTrailers(trailers: readonly CommitTrailer[]): CommitTrailer[] {
-  if (trailers.length > MAX_TRAILERS) throw new RepoError('invalid', `提交尾注最多 ${MAX_TRAILERS} 条，收到 ${trailers.length} 条`)
-  return trailers.map(({ token, value }) => {
-    if (!TRAILER_TOKEN.test(token)) throw new RepoError('invalid', `提交尾注名只能是字母开头的字母、数字和 -，最长 64 个字符：${JSON.stringify(token)}`)
-    if (token.toLowerCase() === 'dsh-session') throw new RepoError('invalid', 'DSH-Session 尾注由 dsh-repo 自己写入，不能另外添加')
-    const trimmed = value.trim()
-    if (trimmed === '' || trimmed.length > 200 || /[\u0000-\u001f\u007f]/.test(trimmed)) throw new RepoError('invalid', `提交尾注 ${token} 的值不能为空、超过 200 个字符或包含换行等控制字符`)
-    return { token, value: trimmed }
-  })
-}
-
 /** Rejects with the signal's reason once it aborts. */
 function abortion(signal: AbortSignal): Promise<never> {
   return new Promise((_resolve, reject) => {
@@ -142,26 +201,6 @@ function gitUsername(kind: HostSpec['kind']): string {
   return kind === 'gitlab' ? 'oauth2' : 'x-access-token'
 }
 
-/**
- * A commit author as given.
- * @throws {RepoError} `invalid` for an empty name or one with `<`, `>`, or a newline, or an empty email or one with `<`, `>`, or whitespace.
- */
-function checkAuthor(author: CommitAuthor): CommitAuthor {
-  if (!/^[^<>\n]+$/.test(author.name.trim())) throw new RepoError('invalid', '提交作者名不能为空，也不能包含 < > 或换行')
-  if (!/^[^<>\s]+$/.test(author.email.trim())) throw new RepoError('invalid', '提交作者邮箱不能为空，也不能包含 < > 或空白')
-  return author
-}
-
-/**
- * A Session id as a `DSH-Session:` trailer value and an `access/authorize` subject.
- * @throws {RepoError} `invalid` when empty, over 200 characters, or containing control characters.
- */
-function requireSession(session: string): string {
-  const trimmed = session.trim()
-  if (trimmed === '' || trimmed.length > 200 || /[\u0000-\u001f\u007f]/.test(trimmed)) throw new RepoError('invalid', '会话 id 不能为空、超过 200 个字符或包含换行等控制字符')
-  return trimmed
-}
-
 /** Collaborators of the service. */
 export interface RepoServiceDeps {
   /** DSH credential store; tokens are resolved per request. */
@@ -170,8 +209,6 @@ export interface RepoServiceDeps {
   readonly hosts: HostStore
   /** Local mirrors. */
   readonly mirrors: MirrorStore
-  /** Writable checkouts of mirror commits. */
-  readonly workspaces: WorkspaceStore
   readonly factory?: ProviderFactory
   /**
    * Roots the mirror directory may not be or lie in; see `forbiddenMirrorRoots`.
@@ -181,27 +218,25 @@ export interface RepoServiceDeps {
   readonly forbiddenMirrorRoots: readonly string[]
   /** Reports a throwing {@link RepoService.onHostsChange} listener. */
   readonly logger?: HostLogger
-  /** `ctx.parallel`, which dispatches `access/authorize` and `repo/commit-trailers`; absent means no listeners. */
-  readonly parallel?: ParallelDispatch
 }
 
-/** The service implementation. */
-export class RepoService implements DshRepoService {
-  readonly version = 5 as const
+/** The repository engine. */
+export class RepoService {
   /** The repository catalog every call is checked against. */
   readonly catalog: RepoCatalog
+  /** Configured and added hosts, the stored directories, and the run-time settings. */
+  readonly hosts: HostStore
+  /** Local mirrors. */
+  readonly mirrors: MirrorStore
   private readonly providers = new Map<string, Provider>()
-  private readonly parallel: ParallelDispatch | undefined
   private readonly credentials: HostCredentials
-  private readonly hosts: HostStore
-  private readonly mirrors: MirrorStore
-  private readonly workspaces: WorkspaceStore
   private readonly factory: ProviderFactory
   private readonly logger: HostLogger | undefined
   private readonly forbiddenMirrorRoots: readonly string[]
   /** Why the stored mirror directory is not in use, while it was rejected at construction. */
   private mirrorProblem: string | undefined
   private readonly hostListeners = new Set<(change: HostsChange) => void>()
+  private readonly settingsListeners = new Set<(next: RepoSettings, previous: RepoSettings) => Promise<void>>()
   /** Commit identity of each host's token account, keyed by host URL and checked against the token it was read with. */
   private readonly identities = new Map<string, { readonly token: string; readonly author: Promise<CommitAuthor> }>()
 
@@ -215,10 +250,8 @@ export class RepoService implements DshRepoService {
     this.credentials = deps.credentials
     this.hosts = deps.hosts
     this.mirrors = deps.mirrors
-    this.workspaces = deps.workspaces
     this.factory = deps.factory ?? defaultProviderFactory
     this.logger = deps.logger
-    this.parallel = deps.parallel
     this.forbiddenMirrorRoots = deps.forbiddenMirrorRoots
     this.catalog = new RepoCatalog({ store: deps.hosts, mirrorDir: () => this.mirrors.root, ...deps.logger === undefined ? {} : { logger: deps.logger } })
     const stored = deps.hosts.mirrorDir()
@@ -254,13 +287,33 @@ export class RepoService implements DshRepoService {
    * rebuilt so the API deadline applies to their HTTP clients too.
    * @param input - complete settings from the settings page.
    * @returns the settings now in effect.
-   * @throws {RepoError} `invalid` naming every bad field, `unavailable` when the file cannot be written.
+   * @throws {RepoError} `invalid` naming every bad field, `unavailable` when the file cannot be written or a {@link onSettingsChange} listener failed after the save.
    */
   async updateSettings(input: unknown): Promise<RepoSettings> {
+    const previous = this.settings
     const next = input === undefined ? DEFAULT_SETTINGS : resolveSettings(input)
     await this.hosts.setSettings(next)
     this.providers.clear()
+    const failures: string[] = []
+    for (const listener of this.settingsListeners) {
+      try {
+        await listener(next, previous)
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error))
+      }
+    }
+    if (failures.length > 0) throw new RepoError('unavailable', `设置已保存，但没有全部生效：${failures.join('；')}`)
     return next
+  }
+
+  /**
+   * Run a listener after every saved settings change, awaited by {@link updateSettings}.
+   * @param listener - receives the new and the previous settings; a rejection is reported to the saving caller.
+   * @returns a function that removes the listener.
+   */
+  onSettingsChange(listener: (next: RepoSettings, previous: RepoSettings) => Promise<void>): () => void {
+    this.settingsListeners.add(listener)
+    return () => { this.settingsListeners.delete(listener) }
   }
 
   /** Whether any host is configured or added. */
@@ -286,13 +339,16 @@ export class RepoService implements DshRepoService {
     return this.catalog.onChange(listener)
   }
 
-  async addRepo(url: string, options: RepoAddOptions = {}): Promise<RepoAddResult> {
-    const session = options.session === undefined ? undefined : requireSession(options.session)
-    options.signal?.throwIfAborted()
-    const { session: _session, signal: _signal, ...fields } = options
-    return await this.catalog.ensure(url, fields, async (summary) => {
-      if (session !== undefined) await authorize(this.parallel, { session, level: 'admin', action: 'addRepo', summary })
-    })
+  /**
+   * Add a repository to the catalog, or turn features on for its entry.
+   * @param url - address.
+   * @param options - branch, access, and features of the entry.
+   * @param confirm - runs with the Chinese summary only when something changes, before the change; throwing cancels it.
+   * @returns the outcome and the entry.
+   * @throws {RepoError} see `DshRepoService.repoAdd`.
+   */
+  async addRepo(url: string, options: { readonly branch?: string; readonly access?: RepoAccess; readonly features?: readonly string[] }, confirm: (summary: string) => Promise<void>): Promise<RepoAddResult> {
+    return await this.catalog.ensure(url, options, confirm)
   }
 
   async repoInfo(repo: RepoTarget, options: CallOptions = {}) {
@@ -327,12 +383,14 @@ export class RepoService implements DshRepoService {
     return await this.run(repo, options, `读取文件 ${path}`, 'read', (provider, ref, call) => provider.readFile(ref, path, options.ref, call))
   }
 
-  async listIssues(repo: RepoTarget, options: IssueListOptions = {}) {
+  async listIssues(repo: RepoTarget, options: PageOptions & { readonly state?: 'open' | 'closed' | 'all'; readonly labels?: readonly string[]; readonly assignee?: string; readonly search?: string } = {}) {
+    const search = options.search?.trim()
     const query = {
       ...this.paging(options),
       state: options.state ?? 'open',
       ...options.labels === undefined ? {} : { labels: options.labels },
       ...options.assignee === undefined ? {} : { assignee: options.assignee },
+      ...search === undefined || search === '' ? {} : { search },
     }
     return await this.run(repo, options, '列出 issue', 'read', (provider, ref, call) => provider.listIssues(ref, query, call))
   }
@@ -342,12 +400,12 @@ export class RepoService implements DshRepoService {
     return await this.run(repo, options, `读取 issue #${number}`, 'read', (provider, ref, call) => provider.getIssue(ref, number, call))
   }
 
-  async createIssue(repo: RepoTarget, fields: IssueCreate) {
+  async createIssue(repo: RepoTarget, fields: IssueCreateFields) {
     requireText(fields.title, '标题')
     return await this.run(repo, fields, '创建 issue', 'write', (provider, ref, call) => provider.createIssue(ref, fields, call))
   }
 
-  async updateIssue(repo: RepoTarget, number: number, update: IssueUpdate) {
+  async updateIssue(repo: RepoTarget, number: number, update: IssueUpdateFields) {
     requireNumber(number)
     if (update.title !== undefined) requireText(update.title, '标题')
     return await this.run(repo, update, `更新 issue #${number}`, 'write', (provider, ref, call) => provider.updateIssue(ref, number, update, call))
@@ -359,7 +417,7 @@ export class RepoService implements DshRepoService {
     return await this.run(repo, options, `评论 issue #${number}`, 'write', (provider, ref, call) => provider.commentIssue(ref, number, body, call))
   }
 
-  async listChanges(repo: RepoTarget, options: ChangeListOptions = {}) {
+  async listChanges(repo: RepoTarget, options: PageOptions & { readonly state?: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string } = {}) {
     const query = {
       ...this.paging(options),
       state: options.state ?? 'open',
@@ -470,24 +528,19 @@ export class RepoService implements DshRepoService {
     return await this.run(repo, options, `取消${label}`, 'write', (provider, ref, call) => kind === 'run' ? provider.cancelRun(ref, id, call) : provider.cancelJob(ref, id, call))
   }
 
-  async createChange(repo: RepoTarget, change: ChangeCreate) {
+  async createChange(repo: RepoTarget, change: MrCreateFields) {
     requireText(change.title, '标题')
     requireBranch(change.sourceBranch, '源分支名')
     if (change.targetBranch !== undefined) requireBranch(change.targetBranch, '目标分支名')
-    const { host, path } = this.target(repo, 'write')
-    if (change.session !== undefined) {
-      const session = requireSession(change.session)
-      await authorize(this.parallel, { session, level: 'code-write', action: 'createChange', summary: `在 ${host}/${path} 创建 PR/MR：${change.sourceBranch} → ${change.targetBranch ?? '默认分支'}，标题：${change.title}` })
-    }
     return await this.run(repo, change, '创建 PR/MR', 'write', async (provider, ref, call) => {
       const targetBranch = change.targetBranch ?? (await provider.repoInfo(ref, call)).defaultBranch
       if (targetBranch === change.sourceBranch) throw new RepoError('invalid', '源分支和目标分支不能相同')
-      const { signal: _signal, session: _session, ...fields } = change
+      const { signal: _signal, ...fields } = change
       return await provider.createChange(ref, { ...fields, targetBranch, draft: change.draft === true, deleteSourceBranch: change.deleteSourceBranch === true }, call)
     })
   }
 
-  async updateChange(repo: RepoTarget, number: number, update: ChangeUpdate) {
+  async updateChange(repo: RepoTarget, number: number, update: MrUpdateFields) {
     requireNumber(number)
     if (update.title !== undefined) requireText(update.title, '标题')
     if (update.targetBranch !== undefined) requireBranch(update.targetBranch, '目标分支名')
@@ -500,7 +553,7 @@ export class RepoService implements DshRepoService {
     return await this.run(repo, options, `评论 PR/MR #${number}`, 'write', (provider, ref, call) => provider.commentChange(ref, number, body, call))
   }
 
-  async mergeChange(repo: RepoTarget, number: number, options: MergeOptions) {
+  async mergeChange(repo: RepoTarget, number: number, options: MergeFields) {
     requireNumber(number)
     if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(options.headSha)) throw new RepoError('invalid', `headSha 必须是完整的提交号：${options.headSha}`)
     const request = { headSha: options.headSha, ...options.method === undefined ? {} : { method: options.method }, deleteSourceBranch: options.deleteSourceBranch === true }
@@ -521,7 +574,7 @@ export class RepoService implements DshRepoService {
       const merged = changes.find(change => change.state === 'merged' && change.headSha === head.commit)
       if (merged === undefined) throw new RepoError('conflict', `${branch} 的最新提交 ${head.commit.slice(0, 12)} 没有通过已合并的 PR/MR 合入，可能还有没合入的工作，不删除`)
       await provider.deleteBranch(ref, branch, call)
-      return { branch, commit: head.commit, change: { number: merged.number, webUrl: merged.webUrl } }
+      return { branch, commit: head.commit, mr: { number: merged.number, webUrl: merged.webUrl } }
     })
   }
 
@@ -617,80 +670,38 @@ export class RepoService implements DshRepoService {
     return await this.mirrors.usage()
   }
 
-  async syncMirror(url: string, options: MirrorSyncOptions = {}): Promise<MirrorState> {
+  /**
+   * Clone or fetch the mirror of a catalog address and resolve a branch head.
+   * @param url - catalog address.
+   * @param options - branch (default: the remote's default branch) and cancellation.
+   * @returns the mirror state.
+   * @throws {RepoError} `not-allowed` outside the catalog, `unavailable` while no mirror directory is set, and the mirror's failures.
+   */
+  async syncMirror(url: string, options: { readonly branch?: string; readonly signal?: AbortSignal } = {}): Promise<MirrorState> {
     const env = await this.mirrorAuth(url)
     return await this.mirrors.sync(url, options.branch, env, options.signal)
   }
 
-  async readMirrorFile(url: string, commit: string, path: string, options: CallOptions = {}): Promise<string | undefined> {
-    requireRepoPath(path, '文件路径')
-    this.catalog.require(url, 'read')
-    return await this.mirrors.readFile(url, commit, path, options.signal)
+  /**
+   * Whether an address is served by a configured host, so its API is reachable.
+   * @param url - accepted git address.
+   * @returns false for local paths, `file:` URLs, and unconfigured hosts.
+   */
+  gitHost(url: string): boolean {
+    return !isAbsolute(url) && !url.startsWith('file:') && hostOf(url, this.hosts.all()) !== undefined
   }
 
-  async listMirrorTree(url: string, commit: string, path: string, options: CallOptions = {}): Promise<readonly MirrorTreeEntry[]> {
-    const directory = path.replace(/^\/+|\/+$/g, '')
-    if (directory !== '') requireRepoPath(directory, '目录')
-    this.catalog.require(url, 'read')
-    return await this.mirrors.listTree(url, commit, directory, options.signal)
-  }
-
-  async acquireSnapshot(url: string, commit: string, options: CallOptions = {}): Promise<SnapshotLease> {
-    this.catalog.require(url, 'read')
-    return await this.mirrors.acquire(url, commit, options.signal)
-  }
-
-  async openWorkspace(url: string, options: WorkspaceOpenOptions): Promise<WorkspaceInfo> {
-    const { branch, signal } = options
-    if (options.commit !== undefined && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(options.commit)) throw new RepoError('invalid', `起点提交必须是完整的十六进制提交 id：${options.commit}`)
-    if (branch !== undefined) {
-      requireBranch(branch, '分支名')
-      if (options.commit !== undefined) throw new RepoError('invalid', `接着分支 ${branch} 修改时从它的最新提交开始，不能再指定起点提交`)
-    }
-    if (!isAbsolute(options.dir)) throw new RepoError('invalid', `工作区目录必须是绝对路径：${options.dir}`)
-    const env = await this.mirrorAuth(url)
-    const base = await this.mirrors.sync(url, options.baseBranch, env, signal)
-    if (branch === undefined) return await this.workspaces.open(url, options.dir, { commit: options.commit ?? base.commit, baseBranch: base.branch }, env, signal)
-    if (branch === base.branch) throw new RepoError('invalid', `分支 ${branch} 是合入目标，不能同时作为要接着修改的分支`)
-    const defaultBranch = options.baseBranch === undefined ? base.branch : await this.mirrors.remoteDefaultBranch(url, env, signal)
-    if (branch === defaultBranch) throw new RepoError('invalid', `不能接着默认分支 ${branch} 修改；从默认分支开始时用 baseBranch，推送到新分支`)
-    const head = await this.mirrors.sync(url, branch, env, signal)
-    return await this.workspaces.open(url, options.dir, { commit: head.commit, baseBranch: base.branch, branch }, env, signal)
-  }
-
-  async workspaceChanges(dir: string, options: CallOptions = {}): Promise<WorkspaceChanges> {
-    return await this.workspaces.changes(dir, options.signal)
-  }
-
-  async pushWorkspace(dir: string, options: WorkspacePushOptions = {}): Promise<WorkspacePushResult> {
-    if (options.branch !== undefined) requireBranch(options.branch, '分支名')
-    if (options.author !== undefined) checkAuthor(options.author)
-    const session = options.session === undefined ? undefined : requireSession(options.session)
-    const own = options.trailers === undefined ? undefined : checkTrailers(options.trailers)
-    const { url } = await this.workspaces.locate(dir)
-    this.catalog.require(url, 'write')
-    let details: CommitDetails | undefined
-    if (session !== undefined) {
-      await authorize(this.parallel, { session, level: 'code-write', action: 'pushWorkspace', summary: `推送工作区 ${dir}${options.branch === undefined ? '' : ` 到新分支 ${options.branch}`}` })
-      details = await collectDetails(this.parallel, { session, dir })
-    }
-    const added = details === undefined || details.trailers.length === 0 ? undefined : checkTrailers([...own ?? [], ...details.trailers])
-    const trailers = added ?? own
-    const env = await this.mirrorAuth(url, true)
-    const chosen = details?.author === undefined ? options.author : checkAuthor(details.author)
-    const given = chosen === undefined ? undefined : { name: chosen.name.trim(), email: chosen.email.trim() }
-    const committer = await this.tokenIdentity(url, options.signal) ?? given
-    const author = given ?? committer
-    return await this.workspaces.push(dir, {
-      env,
-      ...options.branch === undefined ? {} : { branch: options.branch },
-      ...options.message === undefined ? {} : { message: options.message },
-      ...author === undefined ? {} : { author },
-      ...committer === undefined ? {} : { committer },
-      ...session === undefined ? {} : { session },
-      ...trailers === undefined || trailers.length === 0 ? {} : { trailers },
-      ...options.signal === undefined ? {} : { signal: options.signal },
-    }, async (remote, branch) => (await this.mirrors.remoteDefaultBranch(remote, env, options.signal)) === branch)
+  /**
+   * Credentials git uses to reach a catalog address under a configured host.
+   * @param url - accepted git address in the catalog.
+   * @returns the credentials, or undefined for a local path or `file:` URL.
+   * @throws {RepoError} `not-allowed` without a configured host, `unauthenticated` without a token.
+   */
+  async gitCredentials(url: string): Promise<HostGitCredentials | undefined> {
+    if (isAbsolute(url) || url.startsWith('file:')) return undefined
+    const spec = hostOf(url, this.hosts.all())
+    if (spec === undefined) throw new RepoError('not-allowed', `${url} 不属于已配置的主机`)
+    return { hostUrl: spec.url, username: gitUsername(spec.kind), token: await this.token(spec) }
   }
 
   /**
@@ -700,24 +711,22 @@ export class RepoService implements DshRepoService {
    * @param push - whether the command writes, which needs `write` access.
    * @throws {RepoError} `invalid` for an unsupported address, `not-allowed` outside the catalog or below the access the command needs, `unauthenticated` when the host's token is unset.
    */
-  private async mirrorAuth(url: string, push = false): Promise<Record<string, string>> {
+  async mirrorAuth(url: string, push = false): Promise<Record<string, string>> {
     this.mirrors.dirOf(url)
     this.catalog.require(url, push ? 'write' : 'read')
-    if (isAbsolute(url) || url.startsWith('file:')) return {}
-    const spec = hostOf(url, this.hosts.all())
-    if (spec === undefined) throw new RepoError('not-allowed', `${url} 不属于已配置的主机`)
-    return credentialEnvironment(spec.url, gitUsername(spec.kind), await this.token(spec))
+    const credentials = await this.gitCredentials(url)
+    return credentials === undefined ? {} : credentialEnvironment(credentials.hostUrl, credentials.username, credentials.token)
   }
 
   /**
    * Commit identity of the token account of the host `url` belongs to; read
    * once per token value.
-   * @param url - accepted git address that passed {@link mirrorAuth} for a push.
+   * @param url - accepted git address under a configured host.
    * @param signal - caller cancellation of the wait.
    * @returns the identity, or `undefined` for a local address.
    * @throws {RepoError} classified failure of the host's current-user API.
    */
-  private async tokenIdentity(url: string, signal: AbortSignal | undefined): Promise<CommitAuthor | undefined> {
+  async tokenIdentity(url: string, signal: AbortSignal | undefined): Promise<CommitAuthor | undefined> {
     const spec = hostOf(url, this.hosts.all())
     if (spec === undefined) return undefined
     const token = await this.token(spec)

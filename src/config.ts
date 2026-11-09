@@ -10,7 +10,7 @@ import { dirname, join, resolve } from 'node:path'
 import { z } from 'zod'
 import type { ForgeKind } from './contract.ts'
 import { RepoError } from './errors.ts'
-import { MAX_SIGNATURE_LENGTH, SETTING_BOUNDS } from './settings/contract.ts'
+import { MAX_IDENTITY_LENGTH, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS } from './settings/contract.ts'
 import type { RepoSettingsWire } from './settings/contract.ts'
 
 
@@ -78,8 +78,17 @@ const limitsSchema = z.object({
 })
 
 const mirrorSchema = z.object({
-  /** Timeout of one git command (clone, fetch, worktree, push). */
+  /** Timeout of one git command (clone, fetch, push). */
   gitTimeoutMs: bounded('gitTimeoutMs').default(10 * 60 * 1000),
+}).strict()
+
+const workspaceSchema = z.object({
+  /** Port of the local git proxy on 127.0.0.1; 0 picks a free port once and keeps it. */
+  proxyPort: bounded('proxyPort').default(0),
+  /** Commit name written into every new workspace's git configuration; empty uses the host token account's name. */
+  commitName: z.string().trim().max(MAX_IDENTITY_LENGTH).refine(value => !/[<>\n]/.test(value), '提交姓名不能包含 < > 或换行').default(''),
+  /** Commit email written into every new workspace's git configuration; empty uses the host token account's email. */
+  commitEmail: z.string().trim().max(MAX_IDENTITY_LENGTH).refine(value => !/[<>\s]/.test(value), '提交邮箱不能包含 < > 或空白').default(''),
 }).strict()
 
 const toolsSchema = z.object({
@@ -149,6 +158,7 @@ export const repoSettingsSchema = z.object({
   limits: limitsSchema.prefault({}),
   tools: toolsSchema.prefault({}),
   mirror: mirrorSchema.prefault({}),
+  workspace: workspaceSchema.prefault({}),
   watch: watchSchema.prefault({}),
 }).strict()
 
@@ -196,6 +206,7 @@ export function settingsOverrides(settings: RepoSettings): SettingsOverrides {
   const limits = changedFields(settings.limits, DEFAULT_SETTINGS.limits)
   const tools = changedFields(settings.tools, DEFAULT_SETTINGS.tools)
   const mirror = changedFields(settings.mirror, DEFAULT_SETTINGS.mirror)
+  const workspace = changedFields(settings.workspace, DEFAULT_SETTINGS.workspace)
   const events = changedFields(settings.watch.events, DEFAULT_SETTINGS.watch.events)
   const { events: _events, ...watchFields } = settings.watch
   const { events: _defaultEvents, ...defaultWatchFields } = DEFAULT_SETTINGS.watch
@@ -206,6 +217,7 @@ export function settingsOverrides(settings: RepoSettings): SettingsOverrides {
     ...limits === undefined ? {} : { limits },
     ...tools === undefined ? {} : { tools },
     ...mirror === undefined ? {} : { mirror },
+    ...workspace === undefined ? {} : { workspace },
     ...watch === undefined ? {} : { watch },
   }
 }

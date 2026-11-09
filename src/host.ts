@@ -177,6 +177,14 @@ export interface SessionStore {
   flush(session: LiveAgent['session']): Promise<boolean>
 }
 
+/**
+ * The optional `ctx.sandbox` slice (`@deepseek-ai/dsh-sandbox`): wrap argv so
+ * it runs confined to a file policy; it fails instead of running unconfined.
+ */
+export interface SandboxConfiner {
+  confine(argv: readonly string[], policy: { readonly mode: 'read-only' | 'workspace-write'; readonly workspaceRoot: string }, signal?: AbortSignal): Promise<{ readonly argv: readonly string[] }>
+}
+
 /** The plugin context slice this plugin uses. */
 export interface HostContext {
   readonly tools: ToolRegistry

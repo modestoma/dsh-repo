@@ -9,7 +9,7 @@ import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
 import { SyncStore } from '../src/sync/store.ts'
 import { LocalSyncer, RETRY_MS, syncRecords } from '../src/sync/syncer.ts'
-import { credentials, hostStore, mirrorLimits, testConfig, testSettings, withMirrors } from './helpers.ts'
+import { credentials, hostStore, mirrorLimits, testConfig, testSettings } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
 
@@ -58,7 +58,7 @@ function setup(now?: () => number) {
     forbiddenMirrorRoots: [],
     credentials: credentials({}),
     hosts: hostStore(testConfig(), root, testSettings()),
-    ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(1024 * 1024, 1000) })),
+    mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
   })
   const { catalog } = service
   const make = (): LocalSyncer => {

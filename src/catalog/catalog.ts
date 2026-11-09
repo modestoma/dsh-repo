@@ -23,7 +23,7 @@ import { randomBytes } from 'node:crypto'
 import { isAbsolute, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { HostSpec } from '../config.ts'
-import type { RepoAccess, RepoAddOptions, RepoAddResult, RepoFeature, RepoTarget } from '../contract.ts'
+import type { RepoAccess, RepoAddResult, RepoFeature, RepoTarget } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import type { HostLogger } from '../host.ts'
 import type { HostStore } from '../hosts.ts'
@@ -246,7 +246,7 @@ export class RepoCatalog {
    * @returns the outcome and the entry.
    * @throws {RepoError} `invalid`, `not-allowed`, `conflict` for another branch, `too-large`, `unavailable`, and whatever `authorize` rejects with.
    */
-  async ensure(url: string, options: Omit<RepoAddOptions, 'session' | 'signal'>, authorize: (summary: string) => Promise<void>): Promise<RepoAddResult> {
+  async ensure(url: string, options: { readonly branch?: string; readonly access?: RepoAccess; readonly features?: readonly string[] }, authorize: (summary: string) => Promise<void>): Promise<RepoAddResult> {
     const trimmed = url.trim()
     const branch = options.branch?.trim()
     if (branch !== undefined && branch !== '') requireBranch(branch, '分支名')

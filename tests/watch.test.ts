@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } fro
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ChangeInfo, ChangeStatus, CiJob } from '../src/contract.ts'
+import type { MrInfo, MrStatus, CiJob } from '../src/contract.ts'
 import type { ActivityItem, ChangeActivity } from '../src/providers/types.ts'
 import type { HostContext, LiveAgent, UserMessage } from '../src/host.ts'
 import { detect, freshCursor, renderMessage, watchId } from '../src/watch/activity.ts'
@@ -17,7 +17,7 @@ const SHA = 'a'.repeat(40)
 const OTHER = 'b'.repeat(40)
 const START = Date.parse('2026-11-01T02:00:00.000Z')
 
-function change(overrides: Partial<ChangeInfo> = {}): ChangeInfo {
+function change(overrides: Partial<MrInfo> = {}): MrInfo {
   return {
     number: 5, title: 'Fix timeout', body: '', state: 'open', draft: false, sourceBranch: 'fix', targetBranch: 'main', headSha: SHA,
     author: { username: 'bot' }, labels: [], assignees: [], createdAt: '2026-11-01T01:00:00Z', updatedAt: '2026-11-01T01:00:00Z',
@@ -25,7 +25,7 @@ function change(overrides: Partial<ChangeInfo> = {}): ChangeInfo {
   }
 }
 
-function status(overall: ChangeStatus['overall'], failed: string[] = [], sha = SHA): ChangeStatus {
+function status(overall: MrStatus['overall'], failed: string[] = [], sha = SHA): MrStatus {
   return { headSha: sha, overall, checks: failed.map(name => ({ name, state: 'failure' as const })) }
 }
 
@@ -33,7 +33,7 @@ function item(id: string, createdAt: string, overrides: Partial<ActivityItem> = 
   return { id, kind: 'comment', author: { username: 'alice' }, body: `comment ${id}`, createdAt, ...overrides }
 }
 
-function activity(overrides: Omit<Partial<ChangeActivity>, 'change'> & { change?: Partial<ChangeInfo> } = {}): ChangeActivity {
+function activity(overrides: Omit<Partial<ChangeActivity>, 'change'> & { change?: Partial<MrInfo> } = {}): ChangeActivity {
   const { change: changeOverrides, ...rest } = overrides
   return { change: change(changeOverrides), conflict: false, ...rest }
 }
@@ -66,7 +66,7 @@ describe('detect', () => {
   })
 
   it('keeps reading CI while checks still run after one failed, and reports a same-head rerun', () => {
-    const running = (failed: string[], pending: string[], passed: string[] = []): ChangeStatus => ({
+    const running = (failed: string[], pending: string[], passed: string[] = []): MrStatus => ({
       headSha: SHA,
       overall: failed.length > 0 ? 'failure' : pending.length > 0 ? 'pending' : 'success',
       checks: [

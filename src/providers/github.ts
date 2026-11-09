@@ -8,12 +8,12 @@
 
 import { Octokit } from '@octokit/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CheckState, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiRunListOptions, CiState, CommentInfo, CommitAuthor, CommitInfo,
+  BranchInfo, MrInfo, MrState, MrStatus, CheckInfo, CheckState, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiState, CommentInfo, CommitAuthor, CommitInfo,
   IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { capFailures, errorText, nextPage, okBody, titleOf, truncateBytes } from './types.ts'
-import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Paging, Provider, TokenSource } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ChangeActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitHub's largest page. */
 const PAGE = 100
@@ -82,8 +82,8 @@ interface GithubPull {
   readonly html_url: string
 }
 
-function pull(value: GithubPull): ChangeInfo {
-  const state: ChangeState = value.merged_at !== null ? 'merged' : value.state === 'closed' ? 'closed' : 'open'
+function pull(value: GithubPull): MrInfo {
+  const state: MrState = value.merged_at !== null ? 'merged' : value.state === 'closed' ? 'closed' : 'open'
   return {
     number: value.number,
     title: value.title,
@@ -145,7 +145,7 @@ function ciState(status: string | null, conclusion: string | null | undefined): 
   }
 }
 
-/** {@link CiRunListOptions.state} as a workflow run status filter. */
+/** {@link CiRunQuery.state} as a workflow run status filter. */
 const RUN_STATUS = { pending: 'queued', running: 'in_progress', success: 'success', failure: 'failure', canceled: 'cancelled' } as const
 
 /** The workflow run and job of a GitHub Actions check run, read off its URL. */
@@ -343,7 +343,19 @@ export class GithubProvider implements Provider {
     return { path, ref: target, binary: false, ...truncateBytes(raw, call.limits.maxFileBytes) }
   }
 
-  async listIssues(ref: RepoRef, query: { page: number; perPage: number; state: 'open' | 'closed' | 'all'; labels?: readonly string[]; assignee?: string }, call: Call) {
+  async listIssues(ref: RepoRef, query: { page: number; perPage: number; state: 'open' | 'closed' | 'all'; labels?: readonly string[]; assignee?: string; search?: string }, call: Call) {
+    if (query.search !== undefined) {
+      // The issues endpoint has no text filter; the search API does, with the same filters as qualifiers.
+      const qualifiers = [
+        `repo:${ref.path}`,
+        'is:issue',
+        ...query.state === 'all' ? [] : [`state:${query.state}`],
+        ...(query.labels ?? []).map(label => `label:"${label.replace(/"/g, '')}"`),
+        ...query.assignee === undefined ? [] : [`assignee:${query.assignee}`],
+      ]
+      const { data } = await this.octokit.rest.search.issuesAndPullRequests({ q: `${query.search} ${qualifiers.join(' ')}`, page: query.page, per_page: query.perPage, request: { signal: call.signal } })
+      return { items: data.items.filter(entry => entry.pull_request === undefined).map(entry => issue(entry as Parameters<typeof issue>[0])), ...nextPage(query, data.items.length) }
+    }
     const { data } = await this.octokit.rest.issues.listForRepo({
       ...split(ref.path),
       state: query.state,
@@ -398,7 +410,7 @@ export class GithubProvider implements Provider {
     return comment(data)
   }
 
-  async listChanges(ref: RepoRef, query: { page: number; perPage: number; state: ChangeState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
+  async listChanges(ref: RepoRef, query: { page: number; perPage: number; state: MrState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
     const repo = split(ref.path)
     const { data } = await this.octokit.rest.pulls.list({
       ...repo,
@@ -464,7 +476,7 @@ export class GithubProvider implements Provider {
     return items.filter(item => item.createdAt >= since).sort((a, b) => a.createdAt.localeCompare(b.createdAt))
   }
 
-  private async statusOf(repo: { owner: string; repo: string }, change: { readonly head: { readonly sha: string }; readonly mergeable?: boolean | null }, signal: AbortSignal): Promise<ChangeStatus> {
+  private async statusOf(repo: { owner: string; repo: string }, change: { readonly head: { readonly sha: string }; readonly mergeable?: boolean | null }, signal: AbortSignal): Promise<MrStatus> {
     const sha = change.head.sha
     const [runs, statuses] = await Promise.all([
       this.allPages(page => this.octokit.rest.checks.listForRef({ ...repo, ref: sha, per_page: PAGE, page, request: { signal } }).then(response => response.data.check_runs), 'CI 检查'),
@@ -568,7 +580,7 @@ export class GithubProvider implements Provider {
   }
 
   /** A change request selects the runs of its current head commit. */
-  async listRuns(ref: RepoRef, query: Paging & Pick<CiRunListOptions, 'ref' | 'sha' | 'change' | 'state'>, call: Call) {
+  async listRuns(ref: RepoRef, query: Paging & CiRunQuery, call: Call) {
     const repo = split(ref.path)
     const sha = query.change === undefined
       ? query.sha

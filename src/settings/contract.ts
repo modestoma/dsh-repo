@@ -5,7 +5,15 @@
  * @module dsh-repo/settings/contract
  */
 
-import type { ForgeKind, HostInfo, LocalSyncSpec, MirrorSettings, RepoAccess, RepoFeature } from '../contract.ts'
+import type { ForgeKind, HostInfo, LocalSyncSpec, RepoAccess, RepoFeature } from '../contract.ts'
+
+/** Where local mirrors live; there is no default. */
+export interface MirrorSettings {
+  /** Absolute directory holding the mirrors and snapshots; undefined while none is chosen or the stored choice is unusable. */
+  readonly dir: string | undefined
+  /** Why the directory stored in the settings file is not in use; absent otherwise. */
+  readonly problem?: string
+}
 
 /** GET：{@link SettingsState}。 */
 export const STATE_ROUTE = '/dsh-repo/state'
@@ -50,6 +58,7 @@ export const SETTING_BOUNDS = {
   idleDays: { min: 1, max: 90 },
   dailyWakeLimit: { min: 1, max: 100 },
   maxWatches: { min: 1, max: 500 },
+  proxyPort: { min: 0, max: 65_535 },
 } as const satisfies Record<string, { readonly min: number; readonly max: number }>
 
 /** Inclusive range of a local sync's interval, in minutes. */
@@ -63,6 +72,9 @@ export const MAX_REPO_FEATURES = 20
 
 /** Longest tool signature. */
 export const MAX_SIGNATURE_LENGTH = 500
+
+/** Longest workspace commit name or email. */
+export const MAX_IDENTITY_LENGTH = 200
 /** Labels of the catalog access levels, from the least. */
 export const ACCESS_LEVELS: readonly { readonly id: RepoAccess; readonly label: string }[] = [
   { id: 'read', label: '只读' },
@@ -103,6 +115,11 @@ export interface RepoSettingsWire {
   }
   mirror: {
     gitTimeoutMs: number
+  }
+  workspace: {
+    proxyPort: number
+    commitName: string
+    commitEmail: string
   }
   watch: {
     enabled: boolean

@@ -6,7 +6,7 @@
  */
 
 import type {
-  BranchInfo, ChangeDetail, CommitAuthor, ChangeDiff, ChangeInfo, ChangeState, ChangeStatus, CiActionResult, CiJob, CiRun, CiRunDetail, CiRunListOptions, CommentInfo, CommitInfo,
+  BranchInfo, MrDetail, CommitAuthor, MrDiff, MrInfo, MrState, MrStatus, CiActionResult, CiJob, CiRun, CiRunDetail, CommentInfo, CommitInfo,
   FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, RepoUser, TreeListing,
 } from '../contract.ts'
 import type { RepoLimits } from '../config.ts'
@@ -24,6 +24,14 @@ export interface Paging {
   readonly perPage: number
 }
 
+/** Filters of a CI run listing after validation; `change` is a pull/merge request number. */
+export interface CiRunQuery {
+  readonly ref?: string
+  readonly sha?: string
+  readonly change?: number
+  readonly state?: 'pending' | 'running' | 'success' | 'failure' | 'canceled'
+}
+
 /** One code host family. Methods throw SDK errors or {@link RepoError}; the service classifies them. */
 export interface Provider {
   /** Commit identity of the account that owns the token. */
@@ -37,25 +45,25 @@ export interface Provider {
   listTree(ref: RepoRef, query: { readonly ref?: string; readonly path: string; readonly recursive: boolean }, call: Call): Promise<TreeListing>
   readFile(ref: RepoRef, path: string, at: string | undefined, call: Call): Promise<FileContent>
 
-  listIssues(ref: RepoRef, query: Paging & { readonly state: IssueState | 'all'; readonly labels?: readonly string[]; readonly assignee?: string }, call: Call): Promise<Page<IssueInfo>>
+  listIssues(ref: RepoRef, query: Paging & { readonly state: IssueState | 'all'; readonly labels?: readonly string[]; readonly assignee?: string; readonly search?: string }, call: Call): Promise<Page<IssueInfo>>
   getIssue(ref: RepoRef, number: number, call: Call): Promise<IssueDetail>
   createIssue(ref: RepoRef, issue: IssueFields & { readonly title: string }, call: Call): Promise<IssueInfo>
   updateIssue(ref: RepoRef, number: number, update: IssueFields & { readonly state?: IssueState }, call: Call): Promise<IssueInfo>
   commentIssue(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
 
-  listChanges(ref: RepoRef, query: Paging & { readonly state: ChangeState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string }, call: Call): Promise<Page<ChangeInfo>>
-  getChange(ref: RepoRef, number: number, call: Call): Promise<ChangeDetail>
-  changeDiff(ref: RepoRef, number: number, call: Call): Promise<ChangeDiff>
-  changeStatus(ref: RepoRef, number: number, call: Call): Promise<ChangeStatus>
-  createChange(ref: RepoRef, change: IssueFields & { readonly title: string; readonly sourceBranch: string; readonly targetBranch: string; readonly draft: boolean; readonly deleteSourceBranch: boolean }, call: Call): Promise<ChangeInfo>
-  updateChange(ref: RepoRef, number: number, update: IssueFields & { readonly state?: 'open' | 'closed'; readonly targetBranch?: string }, call: Call): Promise<ChangeInfo>
+  listChanges(ref: RepoRef, query: Paging & { readonly state: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string }, call: Call): Promise<Page<MrInfo>>
+  getChange(ref: RepoRef, number: number, call: Call): Promise<MrDetail>
+  changeDiff(ref: RepoRef, number: number, call: Call): Promise<MrDiff>
+  changeStatus(ref: RepoRef, number: number, call: Call): Promise<MrStatus>
+  createChange(ref: RepoRef, change: IssueFields & { readonly title: string; readonly sourceBranch: string; readonly targetBranch: string; readonly draft: boolean; readonly deleteSourceBranch: boolean }, call: Call): Promise<MrInfo>
+  updateChange(ref: RepoRef, number: number, update: IssueFields & { readonly state?: 'open' | 'closed'; readonly targetBranch?: string }, call: Call): Promise<MrInfo>
   commentChange(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
   /** With `deleteSourceBranch`, the result reports the source branch; a failed deletion does not throw. */
   mergeChange(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod; readonly deleteSourceBranch: boolean }, call: Call): Promise<MergeResult>
   /** One poll for a watch: always the change request, CI and comments only as `request` asks. */
   changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity>
 
-  listRuns(ref: RepoRef, query: Paging & Pick<CiRunListOptions, 'ref' | 'sha' | 'change' | 'state'>, call: Call): Promise<Page<CiRun>>
+  listRuns(ref: RepoRef, query: Paging & CiRunQuery, call: Call): Promise<Page<CiRun>>
   /** The run with every job; failures are read only for a failed run. */
   getRun(ref: RepoRef, id: number, call: Call): Promise<CiRunDetail>
   /** Failed jobs of a run, for a watch's CI failure message. */
@@ -141,11 +149,11 @@ export interface ActivityItem {
 
 /** One poll of a change request. */
 export interface ChangeActivity {
-  readonly change: ChangeInfo
+  readonly change: MrInfo
   /** Whether the change request conflicts with its target branch. */
   readonly conflict: boolean
   /** Present when CI was read. */
-  readonly status?: ChangeStatus
+  readonly status?: MrStatus
   /** Present when comments and reviews were read: those created at or after `since`, oldest first. */
   readonly items?: readonly ActivityItem[]
 }

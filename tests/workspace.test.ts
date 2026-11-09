@@ -1,420 +1,339 @@
-import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+/**
+ * Workspaces end to end: a local bare repository stands in for the remote, the
+ * proxy listens on 127.0.0.1, and plain git in the workspace goes through it.
+ */
+import { execFile, execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { HostStore } from '../src/hosts.ts'
+import type { AuthorizeEvent } from '../src/contract.ts'
 import { runGit } from '../src/mirror/git.ts'
-import type { GitRunner } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import type { AuthorizeEvent, CommitTrailersEvent } from '../src/contract.ts'
-import type { ParallelDispatch } from '../src/events.ts'
-import { allow, credentials, fakeHttp, mirrorLimits, testConfig, TOKENS, withMirrors } from './helpers.ts'
+import { WorkspaceManager } from '../src/workspace/manager.ts'
+import type { WorkspaceGit } from '../src/workspace/manager.ts'
+import { GitProxy } from '../src/workspace/proxy.ts'
+import { WorkspaceRegistry } from '../src/workspace/registry.ts'
+import { catalogEntries, credentials, hostStore, mirrorLimits, testConfig, testSettings } from './helpers.ts'
 
 const AUTHOR = { GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
-const BOT = { name: 'Bot', email: 'bot@example.com' }
+const TIMEOUT = 30_000
+const execFileAsync = promisify(execFile)
 
-/** Whether the machine has Git LFS. */
-const HAS_LFS = (() => {
-  try {
-    execFileSync('git', ['lfs', 'version'], { stdio: 'ignore' })
-    return true
-  } catch {
-    // No `git lfs` command on this machine.
-    return false
-  }
-})()
+/**
+ * Run git as a user would, without the test author unless the workspace sets
+ * one. Asynchronous: the proxy answers from this process's event loop.
+ */
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync('git', args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, encoding: 'utf8' })
+  return stdout.trim()
+}
 
-function git(cwd: string, ...args: string[]): string {
+function gitAs(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, env: { ...process.env, ...AUTHOR }, encoding: 'utf8' }).trim()
 }
 
-/** A bare origin with `main` (default, two files) and `dev`. */
-function origin(): { bare: string; commit: string } {
-  const work = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-src-'))
-  git(work, 'init', '--quiet', '--initial-branch=main')
-  writeFileSync(join(work, 'app.ts'), 'export const a = 1\n')
-  writeFileSync(join(work, 'old.txt'), 'old\n')
-  git(work, 'add', '.')
-  git(work, 'commit', '--quiet', '-m', 'init')
-  git(work, 'branch', 'dev')
-  const bare = `${work}.git`
-  git(tmpdir(), 'clone', '--quiet', '--bare', work, bare)
-  return { bare, commit: git(work, 'rev-parse', 'HEAD') }
+/** git that may fail, with its exit code and combined output. */
+async function tryGit(cwd: string, ...args: string[]): Promise<{ status: number; output: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync('git', args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, encoding: 'utf8' })
+    return { status: 0, output: `${stdout}${stderr}` }
+  } catch (error) {
+    const failed = error as { code?: number; stdout?: string; stderr?: string }
+    return { status: typeof failed.code === 'number' ? failed.code : -1, output: `${failed.stdout ?? ''}${failed.stderr ?? ''}` }
+  }
 }
 
-function setup(tokens: Record<string, string> = {}, git: GitRunner = runGit, parallel?: ParallelDispatch) {
-  const root = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-'))
-  const config = testConfig()
-  const make = () => new RepoService({
-    forbiddenMirrorRoots: [],
-    credentials: credentials(tokens),
-    hosts: new HostStore(config.hosts, join(root, 'hosts.json')),
-    ...withMirrors(new MirrorStore({ git, root: join(root, 'mirrors'), limits: mirrorLimits(1024, 100) }), git, 200),
-    ...parallel === undefined ? {} : { parallel },
-  })
-  const sandbox = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-session-'))
-  return { root, sandbox, service: make(), make }
+/** A bare repository with `main` and `dev` holding one commit. */
+function upstream(root: string): { bare: string; commit: string } {
+  const work = join(root, 'seed')
+  mkdirSync(work)
+  gitAs(work, 'init', '--quiet', '--initial-branch=main')
+  writeFileSync(join(work, 'README.md'), 'hello\n')
+  gitAs(work, 'add', '.')
+  gitAs(work, 'commit', '--quiet', '-m', 'init')
+  gitAs(work, 'branch', 'dev')
+  const bare = join(root, 'upstream.git')
+  gitAs(root, 'clone', '--quiet', '--bare', work, bare)
+  return { bare, commit: gitAs(work, 'rev-parse', 'HEAD') }
 }
 
-afterEach(() => {
-  vi.unstubAllGlobals()
-  vi.unstubAllEnvs()
+const proxies: GitProxy[] = []
+
+afterEach(async () => {
+  for (const proxy of proxies.splice(0)) await proxy.stop()
 })
 
-/** The mirror directory behind a workspace checkout. */
-function mirrorOf(dir: string): string {
-  return readFileSync(join(dir, '.git'), 'utf8').replace(/^gitdir: /, '').trim().replace(/\/\.git\/worktrees\/.*$/, '')
+async function setup(options: { parallel?: (name: string, ...args: unknown[]) => Promise<void> } = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'dsh-repo-ws-')))
+  const { bare, commit } = upstream(root)
+  const service = new RepoService({
+    forbiddenMirrorRoots: [],
+    credentials: credentials({}),
+    hosts: hostStore(testConfig(), root, testSettings(), catalogEntries([bare], 'write')),
+    mirrors: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
+  })
+  const registry = new WorkspaceRegistry(join(root, 'workspaces.json'))
+  const pushed: string[][] = []
+  const proxy = new GitProxy({
+    service,
+    registry,
+    ...options.parallel === undefined ? {} : { parallel: options.parallel },
+    onPushed: (_record, branches) => { pushed.push([...branches]) },
+  })
+  proxies.push(proxy)
+  await proxy.start(0)
+  const workspaceGit: WorkspaceGit = async (dir, args, runOptions) => await runGit(args, { cwd: dir, ...runOptions })
+  const manager = new WorkspaceManager({ service, registry, git: runGit, workspaceGit, proxy: () => proxy.port === undefined ? undefined : { port: proxy.port } })
+  const sessions = join(root, 'sessions')
+  mkdirSync(sessions)
+  return { root, bare, commit, service, registry, proxy, manager, pushed, sessions }
 }
 
-describe('workspaces', () => {
-  it('opens a writable checkout whose git metadata stays in the mirror and reports changes against the base', async () => {
-    const { bare, commit } = origin()
-    const { root, sandbox, service } = setup()
-    await allow(service, [bare])
-    const dir = join(sandbox, 'topic', 'app')
-    const info = await service.openWorkspace(bare, { dir })
-    expect(info).toEqual({ url: bare, dir: realpathSync(dir), baseBranch: 'main', baseCommit: commit })
-    expect(readFileSync(join(dir, '.git'), 'utf8')).toContain(realpathSync(join(root, 'mirrors')))
-    await expect(service.openWorkspace(bare, { dir })).rejects.toMatchObject({ code: 'invalid' })
-    await expect(service.openWorkspace(bare, { dir: 'relative/app' })).rejects.toMatchObject({ code: 'invalid' })
-
-    writeFileSync(join(dir, 'app.ts'), 'export const a = 2\nexport const b = 3\n')
-    writeFileSync(join(dir, 'new.ts'), 'export {}\n')
-    writeFileSync(join(dir, 'blob.bin'), Buffer.from([0, 1, 2, 0]))
-    writeFileSync(join(dir, 'tab\tname.txt'), 'a\nb\n')
-    writeFileSync(join(dir, 'tab\tblob.bin'), Buffer.from([0, 1]))
-    rmSync(join(dir, 'old.txt'))
-    const changes = await service.workspaceChanges(join(dir))
-    expect(changes.uncommitted).toBe(true)
-    expect(changes.commits).toEqual([])
-    expect(changes.files).toEqual(expect.arrayContaining([
-      { path: 'app.ts', status: 'modified', binary: false, additions: 2, deletions: 1 },
-      { path: 'new.ts', status: 'added', binary: false, additions: 1, deletions: 0 },
-      { path: 'old.txt', status: 'deleted', binary: false, additions: 0, deletions: 1 },
-      { path: 'blob.bin', status: 'added', binary: true },
-      { path: 'tab\tname.txt', status: 'added', binary: false, additions: 2, deletions: 0 },
-      { path: 'tab\tblob.bin', status: 'added', binary: true },
-    ]))
-    expect(changes.diff).toContain('+export const b = 3')
-    expect(changes.truncated).toBe(true)
+describe('workspace creation', () => {
+  it('clones a catalog repository on a new branch whose origin goes through the proxy with the workspace secret', async () => {
+    const { bare, commit, manager, registry, proxy, sessions, root } = await setup()
+    const path = join(sessions, 'app')
+    const info = await manager.create({ repo: bare, path, session: 'Sess-1234567890' })
+    expect(info).toEqual({ id: expect.stringMatching(/^[0-9a-f]{16}$/), repo: bare, path, base: 'main', baseCommit: commit, branch: 'dsh/sess1234', session: 'Sess-1234567890', createdAt: expect.any(String) })
+    expect(info).not.toHaveProperty('secret')
+    expect(readFileSync(join(path, 'README.md'), 'utf8')).toBe('hello\n')
+    expect(await git(path, 'symbolic-ref', '--short', 'HEAD')).toBe('dsh/sess1234')
+    expect(await git(path, 'config', 'remote.origin.url')).toBe(bare)
+    expect(await git(path, 'config', `url.http://127.0.0.1:${proxy.port}/w/${info.id}/repo.git.insteadOf`)).toBe(bare)
+    expect(await git(path, 'config', `branch.dsh/sess1234.merge`)).toBe('refs/heads/dsh/sess1234')
+    expect(existsSync(join(path, '.git', 'objects', 'info', 'alternates'))).toBe(true)
+    const record = registry.get(info.id)!
+    expect(record.secret).toMatch(/^[0-9a-f]{48}$/)
+    expect(await git(path, 'config', '--get-all', `credential.http://127.0.0.1:${proxy.port}.helper`)).toContain(record.secret)
+    expect(statSync(join(root, 'workspaces.json')).mode & 0o777).toBe(0o600)
+    // The secret stays out of the remote URL the model sees.
+    expect(await git(path, 'remote', '-v')).not.toContain(record.secret)
   })
 
-  it('starts from a given commit or branch', async () => {
-    const { bare, commit } = origin()
-    const { sandbox, service } = setup()
-    await allow(service, [bare])
-    const info = await service.openWorkspace(bare, { dir: join(sandbox, 'dev'), baseBranch: 'dev', commit })
-    expect(info).toMatchObject({ baseBranch: 'dev', baseCommit: commit })
-    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'x'), commit: 'abc' })).rejects.toMatchObject({ code: 'invalid' })
-    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'y'), commit: 'f'.repeat(40) })).rejects.toMatchObject({ code: 'not-found' })
-    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'z'), baseBranch: 'nope' })).rejects.toMatchObject({ code: 'not-found' })
+  it('starts from a commit on the base, or continues an existing branch, and refuses unusable branches and directories', async () => {
+    const { bare, commit, manager, sessions, root } = await setup()
+    const seed = join(root, 'seed')
+    writeFileSync(join(seed, 'next.txt'), 'next\n')
+    gitAs(seed, 'add', '.')
+    gitAs(seed, 'commit', '--quiet', '-m', 'next')
+    gitAs(seed, 'push', '--quiet', bare, 'main')
+    const head = gitAs(seed, 'rev-parse', 'HEAD')
+    const older = await manager.create({ repo: bare, path: join(sessions, 'older'), commit, branch: 'fix/older' })
+    expect(older).toMatchObject({ base: 'main', baseCommit: commit, branch: 'fix/older' })
+    expect(existsSync(join(sessions, 'older', 'next.txt'))).toBe(false)
+    gitAs(seed, 'push', '--quiet', bare, 'HEAD:refs/heads/feature/x')
+    const continued = await manager.create({ repo: bare, path: join(sessions, 'continued'), branch: 'feature/x', base: 'dev' })
+    expect(continued).toMatchObject({ base: 'dev', baseCommit: head, branch: 'feature/x' })
+    await expect(manager.create({ repo: bare, path: join(sessions, 'a'), branch: 'feature/x', commit })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(manager.create({ repo: bare, path: join(sessions, 'b'), branch: 'main' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('默认分支') })
+    await expect(manager.create({ repo: bare, path: join(sessions, 'c'), base: 'dev', branch: 'dev' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('合入目标') })
+    await expect(manager.create({ repo: bare, path: join(sessions, 'd'), base: 'dev', commit: head })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('不在分支 dev 上') })
+    await expect(manager.create({ repo: bare, path: join(sessions, 'older'), branch: 'x' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('不是空目录') })
+    await expect(manager.create({ repo: bare, path: join(sessions, 'older', 'inner'), branch: 'x' })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(manager.create({ repo: bare, path: 'relative', branch: 'x' })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(manager.create({ repo: join(root, 'elsewhere.git'), path: join(sessions, 'e') })).rejects.toMatchObject({ code: 'not-allowed' })
+    expect(existsSync(join(sessions, 'b'))).toBe(false)
   })
 
-  it('commits and pushes to a new branch only, then keeps pushing to that branch without forcing', async () => {
-    const { bare, commit } = origin()
-    const { sandbox, service } = setup()
-    await allow(service, [bare])
-    const dir = join(sandbox, 'app')
-    await service.openWorkspace(bare, { dir })
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', author: BOT })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('没有改动') })
-    writeFileSync(join(dir, 'app.ts'), 'export const a = 2\n')
-    await expect(service.pushWorkspace(dir, { message: 'm' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('分支名') })
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('提交说明') })
-    await expect(service.pushWorkspace(dir, { branch: 'main', message: 'm' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('起点分支') })
-    await expect(service.pushWorkspace(dir, { branch: 'dev', message: 'm', author: BOT })).rejects.toMatchObject({ code: 'conflict' })
-    expect(git(bare, 'rev-parse', 'dev')).toBe(commit)
-    expect(await service.workspaceChanges(dir)).toMatchObject({ uncommitted: true, commits: [] })
+  it('refuses to create a workspace while the proxy is stopped', async () => {
+    const { bare, proxy, manager, sessions } = await setup()
+    await proxy.stop()
+    await expect(manager.create({ repo: bare, path: join(sessions, 'x') })).rejects.toMatchObject({ code: 'unavailable', message: expect.stringContaining('代理') })
+  })
+})
 
-    const pushed = await service.pushWorkspace(dir, { branch: 'fix/a', message: 'fix: a', author: BOT })
-    expect(pushed).toMatchObject({ url: bare, branch: 'fix/a', baseBranch: 'main', committed: true, author: BOT, created: true })
-    expect(git(bare, 'rev-parse', 'fix/a')).toBe(pushed.commit)
-    expect(git(bare, 'log', '-1', '--format=%an <%ae> %cn %s', 'fix/a')).toBe('Bot <bot@example.com> Bot fix: a')
-    expect(git(bare, 'rev-parse', 'fix/a^')).toBe(commit)
+describe('plain git through the proxy', () => {
+  it('fetches and pushes the workspace branch, records the Session in commits, and refuses the default branch and deletions', async () => {
+    const events: AuthorizeEvent[] = []
+    const { bare, manager, sessions, pushed, root } = await setup({ parallel: async (_name, event) => { events.push(event as AuthorizeEvent) } })
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, session: 's1', branch: 'fix/a' })
+    await git(path, 'config', 'user.name', 'Dev')
+    await git(path, 'config', 'user.email', 'dev@example.com')
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    await git(path, 'add', '.')
+    await git(path, 'commit', '--quiet', '-m', 'feat: a')
+    expect(await git(path, 'log', '-1', '--format=%B')).toBe('feat: a\n\nDSH-Session: s1')
+    await git(path, 'push', '--quiet', 'origin', 'HEAD')
+    expect(gitAs(bare, 'rev-parse', 'fix/a')).toBe(await git(path, 'rev-parse', 'HEAD'))
+    expect(pushed).toEqual([['fix/a']])
+    expect(events).toEqual([{ session: 's1', level: 'code-write', action: 'git-push', summary: expect.stringContaining('fix/a') }])
 
-    const after = await service.workspaceChanges(dir)
-    expect(after).toMatchObject({ uncommitted: false, workspace: { branch: 'fix/a' }, commits: [{ sha: pushed.commit, subject: 'fix: a' }] })
-    await expect(service.pushWorkspace(dir, { branch: 'fix/b', message: 'm' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('fix/a') })
+    // Someone else pushes to the same branch: a plain fetch through the proxy sees it.
+    const seed = join(root, 'seed')
+    gitAs(seed, 'fetch', '--quiet', bare, 'fix/a')
+    gitAs(seed, 'checkout', '--quiet', '-B', 'fix/a', 'FETCH_HEAD')
+    writeFileSync(join(seed, 'b.txt'), 'b\n')
+    gitAs(seed, 'add', '.')
+    gitAs(seed, 'commit', '--quiet', '-m', 'theirs')
+    gitAs(seed, 'push', '--quiet', bare, 'fix/a')
+    await git(path, 'pull', '--quiet', '--rebase')
+    expect(existsSync(join(path, 'b.txt'))).toBe(true)
 
-    writeFileSync(join(dir, 'more.ts'), 'export {}\n')
-    const second = await service.pushWorkspace(dir, { message: 'feat: more', author: BOT })
-    expect(second).toMatchObject({ branch: 'fix/a', committed: true, created: false })
-    expect(git(bare, 'rev-parse', 'fix/a')).toBe(second.commit)
-
-    const other = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-other-'))
-    git(other, 'clone', '--quiet', '--branch', 'fix/a', bare, '.')
-    writeFileSync(join(other, 'theirs.ts'), 'x\n')
-    git(other, 'add', '.')
-    git(other, 'commit', '--quiet', '-m', 'theirs')
-    git(other, 'push', '--quiet', 'origin', 'fix/a')
-    writeFileSync(join(dir, 'mine.ts'), 'y\n')
-    await expect(service.pushWorkspace(dir, { message: 'mine', author: BOT })).rejects.toMatchObject({ code: 'conflict' })
+    const main = await tryGit(path, 'push', 'origin', 'HEAD:main')
+    expect(main.status).not.toBe(0)
+    expect(main.output).toContain('dsh-repo')
+    const deletion = await tryGit(path, 'push', 'origin', ':fix/a')
+    expect(deletion.status).not.toBe(0)
+    expect(deletion.output).toContain('dsh-repo')
+    const tag = await tryGit(path, 'push', 'origin', 'HEAD:refs/tags/v1')
+    expect(tag.status).not.toBe(0)
+    expect(gitAs(bare, 'rev-parse', 'main')).not.toBe(await git(path, 'rev-parse', 'HEAD'))
   })
 
-  it('continues an existing remote branch: starts from its head and pushes fast-forward commits to it', async () => {
-    const { bare, commit } = origin()
-    const { sandbox, service } = setup()
-    await allow(service, [bare])
-    const first = join(sandbox, 'first')
-    await service.openWorkspace(bare, { dir: first })
-    writeFileSync(join(first, 'app.ts'), 'export const a = 2\n')
-    const pushed = await service.pushWorkspace(first, { branch: 'fix/a', message: 'fix: a', author: BOT })
+  it('refuses a push the access/authorize listeners reject, and requests without the workspace secret', async () => {
+    const { bare, manager, sessions, proxy, registry } = await setup({ parallel: async () => { throw new AggregateError([new Error('没有改代码权限')]) } })
+    const path = join(sessions, 'app')
+    const info = await manager.create({ repo: bare, path, session: 's1', branch: 'fix/a' })
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    await git(path, 'add', '.')
+    await git(path, '-c', 'user.name=x', '-c', 'user.email=x@example.com', 'commit', '--quiet', '-m', 'a')
+    const refused = await tryGit(path, 'push', 'origin', 'HEAD')
+    expect(refused.status).not.toBe(0)
+    expect(refused.output).toContain('没有改代码权限')
+    expect((await tryGit(bare, 'rev-parse', '--verify', '--quiet', 'refs/heads/fix/a')).status).not.toBe(0)
 
-    const dir = join(sandbox, 'again')
-    const info = await service.openWorkspace(bare, { dir, branch: 'fix/a' })
-    expect(info).toEqual({ url: bare, dir: realpathSync(dir), baseBranch: 'main', baseCommit: pushed.commit, branch: 'fix/a' })
-    expect(readFileSync(join(dir, 'app.ts'), 'utf8')).toBe('export const a = 2\n')
-    expect(await service.workspaceChanges(dir)).toMatchObject({ workspace: { branch: 'fix/a' }, commits: [], files: [] })
-    await expect(service.pushWorkspace(dir, { message: 'm', author: BOT })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('没有改动') })
-
-    writeFileSync(join(dir, 'more.ts'), 'export {}\n')
-    await expect(service.pushWorkspace(dir, { branch: 'fix/b', message: 'm', author: BOT })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('fix/a') })
-    const more = await service.pushWorkspace(dir, { message: 'fix: more', author: BOT })
-    expect(more).toMatchObject({ branch: 'fix/a', baseBranch: 'main', committed: true, created: false })
-    expect(git(bare, 'rev-parse', 'fix/a')).toBe(more.commit)
-    expect(git(bare, 'rev-parse', 'fix/a^')).toBe(pushed.commit)
-    expect(git(bare, 'rev-parse', 'main')).toBe(commit)
+    const base = `http://127.0.0.1:${proxy.port}/w/${info.id}/repo.git/info/refs?service=git-upload-pack`
+    expect((await fetch(base)).status).toBe(401)
+    const wrong = await fetch(base, { headers: { authorization: `Basic ${Buffer.from('dsh:wrong').toString('base64')}` } })
+    expect(wrong.status).toBe(401)
+    const right = await fetch(base, { headers: { authorization: `Basic ${Buffer.from(`dsh:${registry.get(info.id)!.secret}`).toString('base64')}` } })
+    expect(right.status).toBe(200)
+    expect((await fetch(`http://127.0.0.1:${proxy.port}/w/ffffffffffffffff/repo.git/info/refs?service=git-upload-pack`)).status).toBe(404)
   })
 
-  it('refuses to continue the base or default branch, a missing branch, or a branch with a start commit', async () => {
-    const { bare, commit } = origin()
-    const { sandbox, service } = setup()
-    await allow(service, [bare])
-    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'a'), branch: 'main' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('合入目标') })
-    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'b'), branch: 'main', baseBranch: 'dev' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('默认分支') })
-    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'c'), branch: 'dev', commit })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('起点提交') })
-    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'd'), branch: 'nope' })).rejects.toMatchObject({ code: 'not-found' })
-    await expect(service.openWorkspace(bare, { dir: join(sandbox, 'e'), branch: '-x' })).rejects.toMatchObject({ code: 'invalid' })
-    expect(await service.openWorkspace(bare, { dir: join(sandbox, 'f'), branch: 'dev' })).toMatchObject({ baseBranch: 'main', branch: 'dev', baseCommit: commit })
+  it('points every workspace at a new proxy port', async () => {
+    const { bare, manager, sessions, proxy } = await setup()
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, branch: 'fix/a' })
+    const previous = proxy.port!
+    const port = await proxy.start(0)
+    await manager.moveProxy(port, previous)
+    expect(await git(path, 'config', '--get-regexp', '^url\\.')).not.toContain(`:${previous}/`)
+    expect((await tryGit(path, 'fetch', '--quiet', 'origin')).status).toBe(0)
+  })
+})
+
+describe('workspace status, push, and removal', () => {
+  it('reports changes against the start commit without touching the index', async () => {
+    const { bare, manager, sessions } = await setup()
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, branch: 'fix/a' })
+    writeFileSync(join(path, 'README.md'), 'hello\nworld\n')
+    writeFileSync(join(path, 'new.txt'), 'new\n')
+    const record = await manager.locate(join(path))
+    const status = await manager.status(record, undefined, 4096, TIMEOUT)
+    expect(status).toMatchObject({ currentBranch: 'fix/a', commits: [], unpushed: 0, uncommitted: true, truncated: false })
+    expect(status.files).toEqual([
+      { path: 'README.md', status: 'modified', binary: false, additions: 1, deletions: 0 },
+      { path: 'new.txt', status: 'added', binary: false, additions: 1, deletions: 0 },
+    ])
+    expect(status.diff).toContain('+world')
+    expect(await git(path, 'status', '--porcelain')).toBe('M README.md\n?? new.txt')
+    expect((await manager.status(record, undefined, 10, TIMEOUT)).truncated).toBe(true)
   })
 
-  it('refuses a first push to an existing branch that already holds the same commit', async () => {
-    const { bare } = origin()
-    const { sandbox, service } = setup()
-    await allow(service, [bare])
-    const one = join(sandbox, 'one')
-    const two = join(sandbox, 'two')
-    await service.openWorkspace(bare, { dir: one })
-    await service.openWorkspace(bare, { dir: two })
-    writeFileSync(join(one, 'app.ts'), 'same\n')
-    const pushed = await service.pushWorkspace(one, { branch: 'topic', message: 'same', author: BOT })
-    git(two, 'fetch', '--quiet', 'origin', pushed.commit)
-    git(two, 'reset', '--quiet', '--hard', pushed.commit)
-    await expect(service.pushWorkspace(two, { branch: 'topic', author: BOT })).rejects.toMatchObject({ code: 'conflict' })
-    expect((await service.workspaceChanges(two)).workspace.branch).toBeUndefined()
+  it('commits with the given identities and trailers, pushes to a new branch, then fast-forwards it', async () => {
+    const { bare, commit, manager, sessions, pushed } = await setup()
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, session: 's1', branch: 'fix/a' })
+    const record = await manager.locate(path)
+    await expect(manager.push(record, {}, TIMEOUT)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('没有改动') })
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    await expect(manager.push(record, {}, TIMEOUT)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('提交说明') })
+    const author = { name: '张三', email: 'zhang@example.com' }
+    const committer = { name: 'bot', email: 'bot@example.com' }
+    const first = await manager.push(record, { message: 'fix: a', author, committer, session: 's1', trailers: [{ token: 'Feishu-User', value: '张三 <u_1>' }] }, TIMEOUT)
+    expect(first).toEqual({ commit: expect.stringMatching(/^[0-9a-f]{40}$/), committed: true, author, created: true })
+    expect(gitAs(bare, 'rev-parse', 'fix/a')).toBe(first.commit)
+    expect(gitAs(bare, 'rev-parse', 'fix/a^')).toBe(commit)
+    expect(gitAs(bare, 'log', '-1', '--format=%an <%ae>|%cn <%ce>|%B', 'fix/a').trim()).toBe('张三 <zhang@example.com>|bot <bot@example.com>|fix: a\n\nDSH-Session: s1\nFeishu-User: 张三 <u_1>')
+    expect(pushed).toEqual([['fix/a']])
+
+    expect(await manager.push(record, {}, TIMEOUT)).toEqual({ commit: first.commit, committed: false, created: false })
+    writeFileSync(join(path, 'b.txt'), 'b\n')
+    const second = await manager.push(record, { message: 'feat: b', committer }, TIMEOUT)
+    expect(second).toMatchObject({ committed: true, created: false, author: committer })
+    expect(gitAs(bare, 'rev-parse', 'fix/a^')).toBe(first.commit)
+    const status = await manager.status(record, undefined, 4096, TIMEOUT)
+    expect(status.commits.map(entry => entry.subject)).toEqual(['fix: a', 'feat: b'])
+    expect(status.unpushed).toBe(0)
   })
 
-  it('refuses the remote default branch on the first push', async () => {
-    const { bare } = origin()
-    const { sandbox, service } = setup()
-    await allow(service, [bare])
-    const dir = join(sandbox, 'dev')
-    await service.openWorkspace(bare, { dir, baseBranch: 'dev' })
-    writeFileSync(join(dir, 'app.ts'), 'x\n')
-    await expect(service.pushWorkspace(dir, { branch: 'main', message: 'm', author: BOT })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('默认分支') })
+  it('refuses to overwrite a branch someone else moved unless forced with lease, and undoes its own commit on failure', async () => {
+    const { bare, manager, sessions, root } = await setup()
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, branch: 'fix/a' })
+    const record = await manager.locate(path)
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    const committer = { name: 'bot', email: 'bot@example.com' }
+    const first = await manager.push(record, { message: 'a', committer }, TIMEOUT)
+    const seed = join(root, 'seed')
+    gitAs(seed, 'fetch', '--quiet', bare, 'fix/a')
+    gitAs(seed, 'checkout', '--quiet', '-B', 'fix/a', 'FETCH_HEAD')
+    writeFileSync(join(seed, 'theirs.txt'), 'theirs\n')
+    gitAs(seed, 'add', '.')
+    gitAs(seed, 'commit', '--quiet', '-m', 'theirs')
+    gitAs(seed, 'push', '--quiet', bare, 'fix/a')
+    writeFileSync(join(path, 'b.txt'), 'b\n')
+    await expect(manager.push(record, { message: 'b', committer }, TIMEOUT)).rejects.toMatchObject({ code: 'conflict' })
+    expect(await git(path, 'rev-parse', 'HEAD')).toBe(first.commit)
+    expect(await git(path, 'status', '--porcelain')).toContain('b.txt')
+    // The lease is the remote branch as the workspace last fetched it.
+    await git(path, 'fetch', '--quiet', 'origin')
+    const forced = await manager.push(record, { message: 'b', committer, forceWithLease: true }, TIMEOUT)
+    expect(gitAs(bare, 'rev-parse', 'fix/a')).toBe(forced.commit)
+    expect(gitAs(bare, 'rev-parse', 'fix/a^')).toBe(first.commit)
   })
 
-  it('needs a configured host with a token to push a remote address', async () => {
-    const { bare } = origin()
-    const { root, sandbox, service } = setup()
-    await allow(service, [bare])
-    const dir = join(sandbox, 'app')
-    await service.openWorkspace(bare, { dir })
-    writeFileSync(join(dir, 'app.ts'), 'x\n')
-    const mirror = mirrorOf(dir)
-    expect(mirror.startsWith(realpathSync(root))).toBe(true)
-    git(mirror, 'remote', 'set-url', 'origin', 'https://elsewhere.example.com/a/b.git')
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'not-allowed' })
-    git(mirror, 'remote', 'set-url', 'origin', 'https://github.com/modestoma/app.git')
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'not-allowed', message: expect.stringContaining('仓库清单') })
-    await allow(service, ['https://github.com/modestoma/app'], 'read')
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'not-allowed', message: expect.stringContaining('只读') })
-    const entry = service.catalog.find('https://github.com/modestoma/app')!
-    await service.catalog.update(entry.id, { url: entry.url, access: 'write', features: [] })
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'unauthenticated' })
-  })
-
-  it('commits as the account that owns the host token and records the session', async () => {
-    const { bare, commit } = origin()
-    const checkouts: Readonly<Record<string, string>>[] = []
-    const { sandbox, service } = setup(TOKENS, async (args, options) => {
-      if (args[0] === 'worktree' && args[1] === 'add') checkouts.push(options.env ?? {})
-      return await runGit(args, options)
-    })
-    // Serve the github.com address from the local origin so the test stays offline.
-    const remote = 'https://github.com/modestoma/app.git'
-    await allow(service, [remote])
-    vi.stubEnv('GIT_CONFIG_COUNT', '1')
-    vi.stubEnv('GIT_CONFIG_KEY_0', `url.${bare}.insteadOf`)
-    vi.stubEnv('GIT_CONFIG_VALUE_0', remote)
-    const dir = join(sandbox, 'app')
-    expect(await service.openWorkspace(remote, { dir })).toMatchObject({ url: remote, baseCommit: commit })
-    // Checkout runs the Git LFS smudge filter, which may download with the host token.
-    expect(checkouts).toEqual([expect.objectContaining({ DSH_REPO_GIT_TOKEN: 'gh-token' })])
-    let reads = 0
-    const { requests } = fakeHttp([{ method: 'GET', path: '/user', reply: () => {
-      reads += 1
-      return reads === 1 ? { status: 403, body: { message: 'Resource not accessible by personal access token' } } : { body: { login: 'shared-bot', id: 42, name: null, email: null } }
-    } }])
-
-    writeFileSync(join(dir, 'app.ts'), 'export const a = 2\n')
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', session: 'a\nb' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('会话') })
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm' })).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('令牌账号') })
-    expect(await service.workspaceChanges(dir)).toMatchObject({ uncommitted: true, commits: [] })
-
-    for (const [trailer, reason] of [
-      [{ token: 'Feishu User', value: 'x' }, '尾注名'],
-      [{ token: 'dsh-session', value: 'x' }, 'DSH-Session'],
-      [{ token: 'Feishu-User', value: 'a\nb' }, '控制字符'],
-      [{ token: 'Feishu-User', value: '  ' }, '不能为空'],
-    ] as const) {
-      await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', trailers: [trailer] })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining(reason) })
-    }
-    const many = Array.from({ length: 21 }, (_, index) => ({ token: `T${index}`, value: 'x' }))
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', trailers: many })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('最多 20 条') })
-
-    const pushed = await service.pushWorkspace(dir, {
-      branch: 'fix/a', message: 'fix: a\n\nWhy.', session: 'sess-1', trailers: [{ token: 'Feishu-User', value: ' 张三 <u_1> ' }],
-    })
-    expect(requests[1]?.headers.get('authorization')).toBe('token gh-token')
-    expect(git(bare, 'log', '-1', '--format=%an <%ae>|%cn <%ce>', 'fix/a')).toBe('shared-bot <42+shared-bot@users.noreply.github.com>|shared-bot <42+shared-bot@users.noreply.github.com>')
-    expect(pushed.author).toEqual({ name: 'shared-bot', email: '42+shared-bot@users.noreply.github.com' })
-    expect(git(bare, 'log', '-1', '--format=%B', 'fix/a')).toBe('fix: a\n\nWhy.\n\nDSH-Session: sess-1\nFeishu-User: 张三 <u_1>')
-    expect(git(bare, 'rev-parse', 'fix/a^')).toBe(commit)
-
-    writeFileSync(join(dir, 'more.ts'), 'export {}\n')
-    const second = await service.pushWorkspace(dir, { message: 'feat: more', author: BOT })
-    expect(git(bare, 'log', '-1', '--format=%an <%ae>|%cn <%ce>|%B', 'fix/a').trim()).toBe('Bot <bot@example.com>|shared-bot <42+shared-bot@users.noreply.github.com>|feat: more')
-    expect(second).toMatchObject({ committed: true, author: BOT })
-    expect(second.commit).not.toBe(pushed.commit)
-    writeFileSync(join(dir, 'last.ts'), 'export {}\n')
-    await service.pushWorkspace(dir, { message: 'feat: last' })
-    expect(git(bare, 'log', '-1', '--format=%an', 'fix/a')).toBe('shared-bot')
-    expect(reads).toBe(2)
-  })
-
-  it('asks access/authorize and collects repo/commit-trailers for a Session push, the listener author winning', async () => {
-    const { bare } = origin()
-    const events: Array<[string, unknown]> = []
-    let listener: (event: CommitTrailersEvent) => void = () => {}
-    let refuse: string | undefined
-    const parallel: ParallelDispatch = async (name, ...args) => {
-      events.push([name, args[0]])
-      if (name === 'access/authorize' && refuse !== undefined) throw new AggregateError([new Error(refuse)])
-      if (name === 'repo/commit-trailers') listener(args[0] as CommitTrailersEvent)
-    }
-    const { sandbox, service } = setup({}, runGit, parallel)
-    await allow(service, [bare])
-    const dir = join(sandbox, 'app')
-    await service.openWorkspace(bare, { dir })
-    writeFileSync(join(dir, 'app.ts'), 'export const a = 2\n')
-
-    // No session: nobody is asked, the caller's author and trailers stand.
-    await expect(service.pushWorkspace(dir, { branch: 'main', message: 'm', author: BOT })).rejects.toMatchObject({ code: 'invalid' })
-    expect(events).toEqual([])
-
-    refuse = '发起人没有改代码权限'
-    await expect(service.pushWorkspace(dir, { branch: 'fix/a', message: 'm', session: 's1', author: BOT })).rejects.toMatchObject({ code: 'forbidden', message: 'pushWorkspace 未获授权，没有执行：发起人没有改代码权限' })
-    expect(events).toEqual([['access/authorize', { session: 's1', level: 'code-write', action: 'pushWorkspace', summary: `推送工作区 ${dir} 到新分支 fix/a` }]])
-    expect(await service.workspaceChanges(dir)).toMatchObject({ uncommitted: true, commits: [] })
-    events.length = 0
-    refuse = undefined
-
-    listener = event => { event.setAuthor('张三', 'zhang@example.com'); event.add('Feishu-User', '张三 <u_1>') }
-    const pushed = await service.pushWorkspace(dir, { branch: 'fix/a', message: 'fix: a', session: 's1', author: BOT, trailers: [{ token: 'Reviewed-By', value: 'bot' }] })
-    expect(events.map(([name]) => name)).toEqual(['access/authorize', 'repo/commit-trailers'])
-    expect(events[1]?.[1]).toMatchObject({ session: 's1', dir: realpathSync(dir) })
-    expect(pushed).toMatchObject({ committed: true, author: { name: '张三', email: 'zhang@example.com' } })
-    // A local address has no token account, so the effective author also commits.
-    expect(git(bare, 'log', '-1', '--format=%an <%ae>|%cn <%ce>|%B', 'fix/a').trim()).toBe('张三 <zhang@example.com>|张三 <zhang@example.com>|fix: a\n\nDSH-Session: s1\nReviewed-By: bot\nFeishu-User: 张三 <u_1>')
-
-    // The listener's author is validated like the caller's; a second author or a throwing listener commits nothing.
-    writeFileSync(join(dir, 'more.ts'), 'export {}\n')
-    listener = event => { event.setAuthor('a<b', 'x@example.com') }
-    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('提交作者名') })
-    listener = event => { event.setAuthor('张三', 'zhang@example.com'); event.setAuthor('李四', 'li@example.com') }
-    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('2 个提交作者') })
-    listener = () => { throw new Error('directory down') }
-    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1' })).rejects.toMatchObject({ code: 'unavailable', message: expect.stringContaining('directory down') })
-    listener = event => { event.add('Feishu User', 'x') }
-    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('尾注名') })
-    expect(await service.workspaceChanges(dir)).toMatchObject({ uncommitted: true, commits: [{ subject: 'fix: a' }] })
-
-    // Without listener contributions the caller's author stands; the listeners' trailers count toward the limit of 20.
-    listener = () => {}
-    const second = await service.pushWorkspace(dir, { message: 'feat: more', session: 's1', author: BOT })
-    expect(second).toMatchObject({ committed: true, author: BOT })
-    writeFileSync(join(dir, 'last.ts'), 'export {}\n')
-    listener = event => { for (let index = 0; index < 11; index += 1) event.add(`L${index}`, 'x') }
-    const many = Array.from({ length: 10 }, (_, index) => ({ token: `T${index}`, value: 'x' }))
-    await expect(service.pushWorkspace(dir, { message: 'm', session: 's1', trailers: many })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('最多 20 条') })
-    const authorizeEvent: AuthorizeEvent = { session: 's1', level: 'code-write', action: 'pushWorkspace', summary: `推送工作区 ${dir}` }
-    expect(events.filter(([name]) => name === 'access/authorize').at(-1)?.[1]).toEqual(authorizeEvent)
-  })
-
-  it.skipIf(!HAS_LFS)('uploads the Git LFS objects of pushed commits', async () => {
-    const lfs = { 'filter.lfs.clean': 'git-lfs clean -- %f', 'filter.lfs.smudge': 'git-lfs smudge -- %f', 'filter.lfs.process': 'git-lfs filter-process', 'filter.lfs.required': 'true' }
-    vi.stubEnv('GIT_CONFIG_COUNT', String(Object.keys(lfs).length))
-    Object.entries(lfs).forEach(([key, value], index) => {
-      vi.stubEnv(`GIT_CONFIG_KEY_${index}`, key)
-      vi.stubEnv(`GIT_CONFIG_VALUE_${index}`, value)
-    })
-    const { bare } = origin()
-    const { sandbox, service } = setup()
-    await allow(service, [bare])
-    const dir = join(sandbox, 'app')
-    await service.openWorkspace(bare, { dir })
-    writeFileSync(join(dir, '.gitattributes'), '*.bin filter=lfs diff=lfs merge=lfs -text\n')
-    writeFileSync(join(dir, 'model.bin'), 'large content\n')
-    const pushed = await service.pushWorkspace(dir, { branch: 'lfs', message: 'add model', author: BOT })
-    expect(git(bare, 'cat-file', '-p', `${pushed.commit}:model.bin`)).toContain('version https://git-lfs.github.com/spec/v1')
-    const clone = mkdtempSync(join(tmpdir(), 'dsh-repo-ws-lfs-'))
-    git(clone, 'clone', '--quiet', '--branch', 'lfs', bare, '.')
-    expect(readFileSync(join(clone, 'model.bin'), 'utf8')).toBe('large content\n')
-  })
-
-  it('refuses directories that are not workspaces of this service, including forged links', async () => {
-    const { bare } = origin()
-    const { sandbox, service } = setup()
-    await allow(service, [bare])
-    const real = join(sandbox, 'app')
-    await service.openWorkspace(bare, { dir: real })
-    await expect(service.workspaceChanges(join(sandbox, 'missing'))).rejects.toMatchObject({ code: 'not-found' })
-
-    const plain = join(sandbox, 'plain')
+  it('locates workspaces only from their records, removes them after unsaved work is confirmed, and forgets deleted ones', async () => {
+    const { bare, manager, sessions, root } = await setup()
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, branch: 'fix/a' })
+    mkdirSync(join(path, 'src'))
+    expect((await manager.locate(join(path, 'src'))).path).toBe(path)
+    const plain = join(root, 'plain')
     mkdirSync(plain)
-    git(plain, 'init', '--quiet')
-    await expect(service.workspaceChanges(plain)).rejects.toMatchObject({ code: 'not-found' })
+    await git(plain, 'init', '--quiet')
+    await expect(manager.locate(plain)).rejects.toMatchObject({ code: 'not-found' })
+    await expect(manager.locate(join(root, 'missing'))).rejects.toMatchObject({ code: 'not-found' })
 
-    const borrowed = join(sandbox, 'borrowed')
-    mkdirSync(borrowed)
-    writeFileSync(join(borrowed, '.git'), readFileSync(join(real, '.git'), 'utf8'))
-    await expect(service.pushWorkspace(borrowed, { branch: 'x', message: 'm' })).rejects.toMatchObject({ code: 'not-found', message: expect.stringContaining('不一致') })
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    const record = await manager.locate(path)
+    await expect(manager.remove(record, false, undefined, TIMEOUT)).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('未提交') })
+    expect(await manager.remove(record, true, undefined, TIMEOUT)).toEqual({ discardedCommits: 0, discardedChanges: true })
+    expect(existsSync(path)).toBe(false)
+    expect(await manager.list()).toEqual([])
 
-    // A repository the agent controls, laid out like a mirror worktree.
-    const fake = join(sandbox, 'fake')
-    git(sandbox, 'clone', '--quiet', bare, fake)
-    const forged = join(sandbox, 'forged')
-    git(fake, 'worktree', 'add', '--quiet', '-b', 'dsh-repo/ws-0123456789abcdef', forged)
-    git(fake, 'config', 'dsh-repo-workspace.0123456789abcdef.baseBranch', 'main')
-    git(fake, 'config', 'dsh-repo-workspace.0123456789abcdef.baseCommit', git(fake, 'rev-parse', 'HEAD'))
-    await expect(service.workspaceChanges(forged)).rejects.toMatchObject({ code: 'not-found', message: expect.stringContaining('镜像') })
+    const other = join(sessions, 'other')
+    await manager.create({ repo: bare, path: other, branch: 'fix/b' })
+    execFileSync('rm', ['-rf', other])
+    expect(await manager.list()).toEqual([])
+    await expect(manager.locate(other)).rejects.toMatchObject({ code: 'not-found' })
   })
+})
 
-  it('forgets the branches of deleted checkouts on the first sync of a later process', async () => {
-    const { bare } = origin()
-    const { sandbox, service, make } = setup()
-    await allow(service, [bare])
-    const kept = join(sandbox, 'kept')
-    const gone = join(sandbox, 'gone')
-    await service.openWorkspace(bare, { dir: kept })
-    await service.openWorkspace(bare, { dir: gone })
-    const mirror = mirrorOf(kept)
-    expect(git(mirror, 'for-each-ref', '--format=%(refname)', 'refs/heads/dsh-repo/').split('\n')).toHaveLength(2)
-    rmSync(gone, { recursive: true })
-    await make().syncMirror(bare)
-    expect(git(mirror, 'for-each-ref', '--format=%(refname)', 'refs/heads/dsh-repo/').split('\n')).toHaveLength(1)
-    expect((await service.workspaceChanges(kept)).files).toEqual([])
+describe('workspace git confinement', () => {
+  it('runs git inside a workspace through the workspace runner without repository hooks', async () => {
+    const { bare, service, registry, proxy, sessions } = await setup()
+    const calls: string[][] = []
+    const workspaceGit: WorkspaceGit = async (dir, args, runOptions) => {
+      calls.push([...args])
+      return await runGit(args, { cwd: dir, ...runOptions })
+    }
+    const manager = new WorkspaceManager({ service, registry, git: runGit, workspaceGit, proxy: () => ({ port: proxy.port! }) })
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, branch: 'fix/a' })
+    const marker = join(sessions, 'hook-ran')
+    writeFileSync(join(path, '.git', 'hooks', 'pre-push'), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 })
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    await manager.push(await manager.locate(path), { message: 'a', committer: { name: 'bot', email: 'bot@example.com' } }, TIMEOUT)
+    expect(calls.some(args => args.includes('push'))).toBe(true)
+    expect(calls.every(args => args.includes('core.hooksPath=/dev/null'))).toBe(true)
+    expect(existsSync(marker)).toBe(false)
+    vi.restoreAllMocks()
   })
 })

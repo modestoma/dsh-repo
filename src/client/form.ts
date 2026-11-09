@@ -42,6 +42,7 @@ export const NUMBER_FIELDS: Readonly<Record<NumberKey, NumberField>> = {
   idleDays: { key: 'idleDays', label: '无动态停止跟踪', summary: '停止时通知会话一次', unit: '天', scale: 1 },
   dailyWakeLimit: { key: 'dailyWakeLimit', label: '每天唤醒上限', summary: '每个 PR/MR；超出后动态只记入会话，不再唤醒', unit: '次', scale: 1 },
   maxWatches: { key: 'maxWatches', label: '同时跟踪上限', summary: '超出时结束最久没有动态的一个', unit: '个', scale: 1 },
+  proxyPort: { key: 'proxyPort', label: '本机 git 代理端口', summary: '工作区里的 git 经 127.0.0.1 的这个端口访问远端；0 表示自动选一个并沿用', unit: '', scale: 1 },
 }
 
 /** Every kind of PR/MR activity with its label, in page order. */
@@ -81,6 +82,8 @@ export interface SettingsDraft {
   readonly signature: string
   readonly watchEnabled: boolean
   readonly watchEvents: Readonly<Record<WatchEventKind, WatchAction>>
+  readonly commitName: string
+  readonly commitEmail: string
 }
 
 /** Field of a rejected draft: an integer setting or the signature. */
@@ -118,6 +121,8 @@ export function storedNumber(settings: RepoSettingsWire, key: NumberKey): number
     case 'dailyWakeLimit':
     case 'maxWatches':
       return settings.watch[key]
+    case 'proxyPort':
+      return settings.workspace.proxyPort
   }
 }
 
@@ -129,7 +134,7 @@ export function storedNumber(settings: RepoSettingsWire, key: NumberKey): number
  */
 export function displayNumber(key: NumberKey, stored: number): string {
   const field = NUMBER_FIELDS[key]
-  return `${tidy(stored / field.scale)} ${field.unit}`
+  return field.unit === '' ? String(tidy(stored / field.scale)) : `${tidy(stored / field.scale)} ${field.unit}`
 }
 
 /**
@@ -148,6 +153,8 @@ export function toDraft(settings: RepoSettingsWire): SettingsDraft {
     signature: settings.tools.signature,
     watchEnabled: settings.watch.enabled,
     watchEvents: { ...settings.watch.events },
+    commitName: settings.workspace.commitName,
+    commitEmail: settings.workspace.commitEmail,
   }
 }
 
@@ -205,6 +212,7 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
       },
       tools: { enabled: draft.enabled, writes: draft.writes, deleteSourceBranch: draft.deleteSourceBranch, signature: draft.signature },
       mirror: { gitTimeoutMs: numbers.gitTimeoutMs },
+      workspace: { proxyPort: numbers.proxyPort, commitName: draft.commitName.trim(), commitEmail: draft.commitEmail.trim() },
       watch: {
         enabled: draft.watchEnabled,
         activeIntervalMs: numbers.activeIntervalMs,

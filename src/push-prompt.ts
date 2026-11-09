@@ -1,5 +1,5 @@
 /**
- * Approval text of `repo_workspace_push`: one headline, then `label：value`
+ * Approval text of `repo_workspace_push` / `workspacePush`: one headline, then `label：value`
  * lines (repository, starting point, commit message, totals) and indented
  * per-file lines. Approval answerers show it as-is, so every line stands on
  * its own and the file list stays short: renames that move a whole directory
@@ -8,7 +8,7 @@
  * @module dsh-repo/push-prompt
  */
 
-import type { WorkspaceChanges, WorkspaceFileChange } from './contract.ts'
+import type { WorkspaceFileChange, WorkspacePushParams, WorkspaceStatus } from './contract.ts'
 
 /** Approval text in each supported language. */
 export interface PushPrompt { readonly zh: string; readonly en: string }
@@ -115,42 +115,46 @@ function entryLine(entry: Entry, language: 'zh' | 'en'): string {
 
 /**
  * Approval text of a push.
- * @param changes - the workspace's changes relative to its base commit.
- * @param branch - the remote branch the push targets.
- * @param message - the commit message for uncommitted changes, when given.
+ * @param status - the workspace's changes relative to its start commit.
+ * @param params - commit message, force, and the request to open.
+ * @param created - whether the remote branch does not exist yet.
  * @returns the text in Chinese and English.
  */
-export function pushPrompt(changes: WorkspaceChanges, branch: string, message: string | undefined): PushPrompt {
-  const ws = changes.workspace
-  const fresh = ws.branch === undefined
-  const additions = changes.files.reduce((sum, file) => sum + (file.additions ?? 0), 0)
-  const deletions = changes.files.reduce((sum, file) => sum + (file.deletions ?? 0), 0)
+export function pushPrompt(status: WorkspaceStatus, params: WorkspacePushParams, created: boolean): PushPrompt {
+  const ws = status.workspace
+  const additions = status.files.reduce((sum, file) => sum + (file.additions ?? 0), 0)
+  const deletions = status.files.reduce((sum, file) => sum + (file.deletions ?? 0), 0)
   const counts = lineCounts(additions, deletions)
-  const list = entries(changes.files)
+  const list = entries(status.files)
   const shown = list.slice(0, FILE_LINES)
   const hidden = list.length - shown.length
+  const message = params.message
   const subject = message?.split('\n', 1)[0] ?? ''
   const bodyLines = message === undefined ? 0 : message.split('\n').slice(1).filter(line => line.trim() !== '').length
-  const commit = changes.uncommitted && message !== undefined
-  const base = `${ws.baseBranch} @ ${ws.baseCommit.slice(0, 12)}`
+  const commit = status.uncommitted && message !== undefined
+  const base = `${ws.base} @ ${ws.baseCommit.slice(0, 12)}`
+  const mr = params.mr
+  const target = mr?.target ?? ws.base
 
   const zh = [
-    `推送工作区改动到${fresh ? '新' : ''}分支 ${branch}`,
-    `仓库：${ws.url}`,
+    `推送工作区到${created ? '新' : ''}分支 ${ws.branch}${params.forceWithLease === true ? '（必要时覆盖远端分支）' : ''}`,
+    `仓库：${ws.repo}`,
     `起点：${base}`,
     ...commit ? [`提交说明：${subject}${bodyLines > 0 ? `（另有 ${bodyLines} 行正文）` : ''}`] : [],
-    ...changes.commits.length > 0 ? [`此前已推送：${changes.commits.length} 个提交`] : [],
-    `改动：${changes.files.length} 个文件${counts === '' ? '' : `，${counts}`}（相对起点）`,
+    ...status.commits.length > 0 ? [`已有提交：${status.commits.length} 个`] : [],
+    ...mr === undefined ? [] : [`没有打开中的 PR/MR 时创建${mr.draft === true ? '草稿 ' : ''}PR/MR：${ws.branch} → ${target}，标题：${mr.title}`],
+    `改动：${status.files.length} 个文件${counts === '' ? '' : `，${counts}`}（相对起点）`,
     ...shown.map(entry => entryLine(entry, 'zh')),
     ...hidden > 0 ? [`  …另有 ${hidden} 项`] : [],
   ]
   const en = [
-    `Push the workspace changes to ${fresh ? 'new ' : ''}branch ${branch}`,
-    `Repository: ${ws.url}`,
+    `Push the workspace to ${created ? 'new ' : ''}branch ${ws.branch}${params.forceWithLease === true ? ' (replacing the remote branch if needed)' : ''}`,
+    `Repository: ${ws.repo}`,
     `From: ${base}`,
     ...commit ? [`Commit message: ${subject}${bodyLines > 0 ? ` (+${bodyLines} body lines)` : ''}`] : [],
-    ...changes.commits.length > 0 ? [`Already pushed: ${changes.commits.length} commit(s)`] : [],
-    `Changes: ${changes.files.length} file(s)${counts === '' ? '' : `, ${counts}`} (since the starting point)`,
+    ...status.commits.length > 0 ? [`Commits: ${status.commits.length}`] : [],
+    ...mr === undefined ? [] : [`Unless one is open, open a ${mr.draft === true ? 'draft ' : ''}PR/MR: ${ws.branch} → ${target}, title: ${mr.title}`],
+    `Changes: ${status.files.length} file(s)${counts === '' ? '' : `, ${counts}`} (since the starting point)`,
     ...shown.map(entry => entryLine(entry, 'en')),
     ...hidden > 0 ? [`  …${hidden} more`] : [],
   ]

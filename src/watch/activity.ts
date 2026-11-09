@@ -6,13 +6,13 @@
  * @module dsh-repo/watch/activity
  */
 
-import type { ChangeInfo, ChangeState, ChangeStatus, CheckState, ForgeKind } from '../contract.ts'
+import type { MrInfo, MrState, MrStatus, CheckState, ForgeKind } from '../contract.ts'
 import type { ChangeActivity } from '../providers/types.ts'
 import type { WatchEventKind } from '../settings/contract.ts'
 
 /** What a watch knows about its PR/MR after the last poll. */
 export interface WatchCursor {
-  readonly state: ChangeState
+  readonly state: MrState
   readonly headSha: string
   /** When the head last moved; CI is read for a while after, since checks can start late. */
   readonly headMovedAt: string
@@ -142,7 +142,7 @@ export function watchId(host: string, path: string, number: number, session: str
  * @param now - local time.
  * @returns the cursor.
  */
-export function freshCursor(change: ChangeInfo, since: string, now: string): WatchCursor {
+export function freshCursor(change: MrInfo, since: string, now: string): WatchCursor {
   return { state: change.state, headSha: change.headSha, headMovedAt: now, checks: 'pending', failing: [], conflict: false, since, seen: [] }
 }
 
@@ -247,7 +247,7 @@ export function detect(record: WatchRecord, activity: ChangeActivity, now: strin
  * CI of a head as the cursor keeps it: `pending` while any check still runs,
  * even when another already failed, so later results are still read.
  */
-function settledChecks(status: ChangeStatus): CheckState {
+function settledChecks(status: MrStatus): CheckState {
   return status.checks.some(check => check.state === 'pending') ? 'pending' : status.overall
 }
 

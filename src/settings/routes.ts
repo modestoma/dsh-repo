@@ -119,6 +119,7 @@ const STATUS: Readonly<Record<RepoErrorCode, number>> = {
   'forbidden': 403,
   'not-found': 404,
   'conflict': 409,
+  'declined': 403,
   'rate-limited': 429,
   'too-large': 413,
   'unavailable': 503,
