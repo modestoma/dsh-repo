@@ -28,6 +28,7 @@ import { PassThrough, Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { createGunzip } from 'node:zlib'
 import { RepoError } from '../errors.ts'
+import { isBranchName } from '../refs.ts'
 import { authorize } from '../events.ts'
 import type { ParallelDispatch } from '../events.ts'
 import type { HostLogger } from '../host.ts'
@@ -56,7 +57,6 @@ interface PushCommand {
 /** Largest command section of a push read before the pack data. */
 const MAX_COMMAND_BYTES = 1024 * 1024
 const ZERO = /^0+$/
-const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
 
 function pktLine(payload: Buffer | string): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload
@@ -368,7 +368,7 @@ export class GitProxy {
       return `无法确认默认分支：${error instanceof Error ? error.message : String(error)}`
     }
     for (const command of commands) {
-      if (!command.ref.startsWith('refs/heads/') || !BRANCH.test(command.ref.slice('refs/heads/'.length))) return `只能推送分支，不能推送 ${command.ref}（标签等其他引用不经工作区推送）`
+      if (!command.ref.startsWith('refs/heads/') || !isBranchName(command.ref.slice('refs/heads/'.length))) return `只能推送分支，不能推送 ${command.ref}（标签等其他引用不经工作区推送）`
       const branch = command.ref.slice('refs/heads/'.length)
       if (ZERO.test(command.new)) return `不能删除远端分支 ${branch}`
       if (branch === defaultBranch) return `不能直接推送到默认分支 ${branch}；推送到别的分支后创建 PR/MR`

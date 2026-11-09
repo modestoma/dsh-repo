@@ -13,6 +13,7 @@ import { rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { z } from 'zod'
 import { RepoError } from '../errors.ts'
+import { COMMIT_ID } from '../refs.ts'
 import type { HostLogger } from '../host.ts'
 import { within } from '../paths.ts'
 
@@ -39,7 +40,7 @@ const recordSchema = z.object({
   path: z.string().min(1),
   repo: z.string().min(1),
   base: z.string().min(1),
-  baseCommit: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+  baseCommit: z.string().regex(COMMIT_ID),
   branch: z.string().min(1),
   secret: z.string().regex(/^[0-9a-f]{32,}$/),
   session: z.string().min(1).optional(),

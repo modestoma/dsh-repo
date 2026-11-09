@@ -26,6 +26,7 @@ import type {
 import type { RepoSettings } from './config.ts'
 import { allows } from './catalog/entry.ts'
 import { RepoError } from './errors.ts'
+import { COMMIT_ID } from './refs.ts'
 import { authorize, collectDetails } from './events.ts'
 import type { ParallelDispatch } from './events.ts'
 import type { Agent, HostApproval, WorkingDirectoryService } from './host.ts'
@@ -123,7 +124,7 @@ const page = z.number().int().min(1).optional().describe('1-based page, default 
 const perPage = z.number().int().min(1).max(100).optional().describe('Items per page')
 const labels = z.array(z.string().min(1)).optional()
 const assignees = z.array(z.string().min(1)).optional().describe('Usernames')
-const commit = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
+const commit = z.string().regex(COMMIT_ID)
 const runId = z.number().int().min(1).describe('CI run id: GitLab pipeline id or GitHub Actions workflow run id (from repo_ci_list, or runId in repo_mr_status checks)')
 const jobId = z.number().int().min(1).describe('CI job id (from repo_ci_get, or jobId in repo_mr_status checks)')
 const ciTarget = z.object({ repo, runId: runId.optional(), jobId: jobId.optional() }).strict()

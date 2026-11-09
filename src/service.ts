@@ -22,6 +22,7 @@ import type {
   RepoAddResult, RepoFeature, RepoRef, RepoTarget, TokenStatus,
 } from './contract.ts'
 import { readLog } from './ci/log.ts'
+import { requireBranch, requireCommit } from './refs.ts'
 import { RepoCatalog } from './catalog/catalog.ts'
 import { publicRepo } from './catalog/entry.ts'
 import { apiBaseUrl, DEFAULT_SETTINGS, resolveSettings } from './config.ts'
@@ -49,8 +50,6 @@ export type ProviderFactory = (spec: HostSpec, token: () => Promise<string>, tim
 export const defaultProviderFactory: ProviderFactory = (spec, token, timeoutMs) => spec.kind === 'github'
   ? new GithubProvider(apiBaseUrl(spec), token)
   : new GitlabProvider(apiBaseUrl(spec), token, timeoutMs)
-
-const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
 
 /** Paging as list calls pass it. */
 export interface PageOptions extends CallOptions {
@@ -148,10 +147,6 @@ async function allChangesFrom(provider: Provider, ref: RepoRef, branch: string, 
   return found
 }
 
-function requireBranch(value: string, label: string): void {
-  if (!BRANCH.test(value) || value.startsWith('/') || value === '@') throw new RepoError('invalid', `${label}不合法：${value}`)
-}
-
 function requireRepoPath(value: string, label: string): void {
   const segments = value.split('/')
   if (value === '' || value.startsWith('/') || segments.some(segment => segment === '' || segment === '.' || segment === '..') || /[\u0000-\u001f\u007f]/.test(value)) {
@@ -171,7 +166,6 @@ function requireId(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new RepoError('invalid', `${label}必须是正整数：${value}`)
 }
 
-const COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 /** Most search texts of one job log call. */
 const MAX_LOG_SEARCH = 20
 /** Longest search text or section filter. */
@@ -458,7 +452,7 @@ export class RepoService {
 
   async listCiRuns(repo: RepoTarget, options: CiRunListOptions = {}) {
     if (options.ref !== undefined) requireBranch(options.ref, 'ref')
-    if (options.sha !== undefined && !COMMIT.test(options.sha)) throw new RepoError('invalid', `sha 必须是完整的提交 id：${options.sha}`)
+    if (options.sha !== undefined) requireCommit(options.sha, 'sha ')
     if (options.change !== undefined) {
       requireNumber(options.change)
       if (options.ref !== undefined || options.sha !== undefined) throw new RepoError('invalid', '按 PR/MR 列出时不能再给 ref 或 sha')
@@ -555,7 +549,7 @@ export class RepoService {
 
   async mergeChange(repo: RepoTarget, number: number, options: MergeFields) {
     requireNumber(number)
-    if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(options.headSha)) throw new RepoError('invalid', `headSha 必须是完整的提交号：${options.headSha}`)
+    requireCommit(options.headSha.toLowerCase(), 'headSha ')
     const request = { headSha: options.headSha, ...options.method === undefined ? {} : { method: options.method }, deleteSourceBranch: options.deleteSourceBranch === true }
     return await this.run(repo, options, `合并 PR/MR #${number}`, 'merge', (provider, ref, call) => provider.mergeChange(ref, number, request, call))
   }

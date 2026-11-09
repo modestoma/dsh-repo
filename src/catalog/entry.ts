@@ -13,6 +13,7 @@ import { z } from 'zod'
 import { expandHome } from '../config.ts'
 import type { CatalogRepo, LocalSyncSpec, RepoAccess, RepoFeature } from '../contract.ts'
 import { RepoError } from '../errors.ts'
+import { isBranchName, requireBranch } from '../refs.ts'
 import { isAcceptedGitUrl } from '../mirror/store.ts'
 import { DEFAULT_SYNC_INTERVAL_MINUTES, MAX_REPO_FEATURES, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
 import type { RepoInput } from '../settings/contract.ts'
@@ -29,9 +30,6 @@ export const ACCESS_ORDER: readonly RepoAccess[] = ['read', 'write', 'merge']
 /** Feature ids: lowercase letters, digits, and `-`, starting with a letter. */
 export const FEATURE_ID = /^[a-z][a-z0-9-]{0,39}$/
 
-/** Branch names git accepts and that cannot be mistaken for options. */
-export const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
-
 const localSyncSchema = z.object({
   enabled: z.boolean(),
   dir: z.string().min(1).refine(isAbsolute, '本地同步目录必须是绝对路径'),
@@ -42,7 +40,7 @@ const localSyncSchema = z.object({
 export const catalogEntrySchema = z.object({
   id: z.string().regex(/^[0-9a-f]{12}$/),
   url: z.string().min(1).refine(isAcceptedGitUrl, '只支持 https 地址、file URL 或绝对路径'),
-  branch: z.string().regex(BRANCH).optional(),
+  branch: z.string().refine(isBranchName, '分支名不合法').optional(),
   access: z.enum(['read', 'write', 'merge']),
   features: z.array(z.string().regex(FEATURE_ID)).max(MAX_REPO_FEATURES),
   localSync: localSyncSchema.optional(),
@@ -57,16 +55,6 @@ export const catalogEntrySchema = z.object({
  */
 export function allows(granted: RepoAccess, needed: RepoAccess): boolean {
   return ACCESS_ORDER.indexOf(granted) >= ACCESS_ORDER.indexOf(needed)
-}
-
-/**
- * Validate a branch name.
- * @param value - candidate branch.
- * @param label - field name for the message.
- * @throws {RepoError} `invalid` for a name git refuses or one that looks like an option.
- */
-export function requireBranch(value: string, label: string): void {
-  if (!BRANCH.test(value) || value.startsWith('/') || value === '@') throw new RepoError('invalid', `${label}不合法：${value}`)
 }
 
 /**

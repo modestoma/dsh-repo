@@ -31,7 +31,8 @@ import { overlaps, realPathOf } from '../paths.ts'
 import { ACCESS_LEVELS, MAX_REPO_FEATURES, MAX_REPOS } from '../settings/contract.ts'
 import type { RepoInput } from '../settings/contract.ts'
 import { resolveTarget } from '../target.ts'
-import { allows, checkFeature, checkFeatureIds, checkInput, publicRepo, requireBranch } from './entry.ts'
+import { requireBranch } from '../refs.ts'
+import { allows, checkFeature, checkFeatureIds, checkInput, publicRepo } from './entry.ts'
 import type { CatalogEntry, CheckedInput } from './entry.ts'
 
 /** Collaborators of the catalog. */

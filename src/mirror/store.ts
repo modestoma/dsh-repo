@@ -26,6 +26,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { RepoError } from '../errors.ts'
+import { isCommitId, requireBranch, requireCommit } from '../refs.ts'
 import { MIRROR_DIR_UNSET } from './root.ts'
 import type { MirrorUsage } from '../settings/contract.ts'
 import { GitError } from './git.ts'
@@ -72,8 +73,6 @@ export interface MirrorSnapshot {
 }
 
 const URL_SCHEMES = new Set(['https:', 'file:'])
-const COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
-const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
 
 /**
  * Whether an address is one this store hands to `git clone`: an `https` or
@@ -237,7 +236,7 @@ export class MirrorStore {
    */
   async sync(url: string, branch: string | undefined, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<MirrorState> {
     const dir = this.dirOf(url)
-    if (branch !== undefined && !BRANCH.test(branch)) throw new RepoError('invalid', `分支名不合法：${branch}`)
+    if (branch !== undefined) requireBranch(branch, '分支名')
     return await serialize(this.syncLocks, dir, async () => {
       try {
         await this.update(url, dir, env, signal)
@@ -265,8 +264,9 @@ export class MirrorStore {
    */
   async resolveRef(url: string, ref: string, signal?: AbortSignal): Promise<string> {
     const dir = this.dirOf(url)
-    if (COMMIT.test(ref)) return (await this.existing(url, ref, signal), ref)
-    if (!BRANCH.test(ref)) throw new RepoError('invalid', `ref 不合法：${ref}`)
+    if (isCommitId(ref)) return (await this.existing(url, ref, signal), ref)
+    // Tags follow the same naming rules as branches.
+    requireBranch(ref, 'ref ')
     for (const candidate of [`refs/heads/${ref}`, `refs/tags/${ref}`]) {
       try {
         return (await this.git(['rev-parse', '--verify', '--quiet', `${candidate}^{commit}`], dir, {}, signal)).trim()
@@ -379,7 +379,7 @@ export class MirrorStore {
    */
   async existing(url: string, commit: string, signal?: AbortSignal): Promise<string> {
     const dir = this.dirOf(url)
-    if (!COMMIT.test(commit)) throw new RepoError('invalid', `提交必须是完整的十六进制提交 id：${commit}`)
+    requireCommit(commit, '提交')
     if (await pathKind(join(dir, 'objects')) === 'missing') throw new RepoError('not-found', `${url} 还没有镜像，先同步`)
     try {
       await this.git(['cat-file', '-e', `${commit}^{commit}`], dir, {}, signal)
