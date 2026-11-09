@@ -374,6 +374,18 @@ describe('workspace status, push, and removal', () => {
     expect(existsSync(path)).toBe(false)
     expect(await manager.list()).toEqual([])
 
+    // A commit only on another local branch counts, even with the workspace branch checked out and clean.
+    const side = join(sessions, 'side')
+    await manager.create({ repo: bare, path: side, branch: 'fix/c' })
+    await git(side, 'checkout', '--quiet', '-b', 'local-work')
+    writeFileSync(join(side, 'w.txt'), 'w\n')
+    await git(side, 'add', '.')
+    await git(side, '-c', 'user.name=Dev', '-c', 'user.email=dev@example.com', 'commit', '--quiet', '-m', 'local')
+    await git(side, 'checkout', '--quiet', 'fix/c')
+    const sideRecord = await manager.locate(side)
+    await expect(manager.remove(sideRecord, false, undefined, TIMEOUT)).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('1 个未推送的提交') })
+    expect(await manager.remove(sideRecord, true, undefined, TIMEOUT)).toEqual({ discardedCommits: 1, discardedChanges: false })
+
     const other = join(sessions, 'other')
     await manager.create({ repo: bare, path: other, branch: 'fix/b' })
     execFileSync('rm', ['-rf', other])

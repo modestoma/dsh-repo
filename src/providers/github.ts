@@ -346,15 +346,18 @@ export class GithubProvider implements Provider {
   async listIssues(ref: RepoRef, query: { page: number; perPage: number; state: 'open' | 'closed' | 'all'; labels?: readonly string[]; assignee?: string; search?: string }, call: Call) {
     if (query.search !== undefined) {
       // The issues endpoint has no text filter; the search API does, with the same filters as qualifiers.
+      // Every search word is quoted, so qualifiers such as `repo:` in it stay text and cannot widen the scope.
+      const words = query.search.split(/\s+/).map(word => word.replace(/"/g, '')).filter(word => word !== '').map(word => `"${word}"`)
       const qualifiers = [
         `repo:${ref.path}`,
         'is:issue',
         ...query.state === 'all' ? [] : [`state:${query.state}`],
         ...(query.labels ?? []).map(label => `label:"${label.replace(/"/g, '')}"`),
-        ...query.assignee === undefined ? [] : [`assignee:${query.assignee}`],
+        ...query.assignee === undefined ? [] : [`assignee:"${query.assignee.replace(/"/g, '')}"`],
       ]
-      const { data } = await this.octokit.rest.search.issuesAndPullRequests({ q: `${query.search} ${qualifiers.join(' ')}`, page: query.page, per_page: query.perPage, request: { signal: call.signal } })
-      return { items: data.items.filter(entry => entry.pull_request === undefined).map(entry => issue(entry as Parameters<typeof issue>[0])), ...nextPage(query, data.items.length) }
+      const { data } = await this.octokit.rest.search.issuesAndPullRequests({ q: [...words, ...qualifiers].join(' '), page: query.page, per_page: query.perPage, request: { signal: call.signal } })
+      const own = `/repos/${ref.path}`.toLowerCase()
+      return { items: data.items.filter(entry => entry.pull_request === undefined && entry.repository_url.toLowerCase().endsWith(own)).map(entry => issue(entry as Parameters<typeof issue>[0])), ...nextPage(query, data.items.length) }
     }
     const { data } = await this.octokit.rest.issues.listForRepo({
       ...split(ref.path),

@@ -399,7 +399,7 @@ export class WorkspaceManager {
   /**
    * Delete a workspace's directory and record.
    * @param record - located workspace.
-   * @param force - delete despite uncommitted changes or unpushed commits.
+   * @param force - delete despite uncommitted changes or commits only this clone holds, on any local branch.
    * @param signal - cancellation.
    * @param timeoutMs - timeout of one git command.
    * @returns what was discarded.
@@ -411,7 +411,7 @@ export class WorkspaceManager {
       let discardedCommits = 0
       try {
         discardedChanges = (await this.inside(record, ['status', '--porcelain', '-z'], timeoutMs, signal)) !== ''
-        discardedCommits = await this.unpushed(record, signal, timeoutMs)
+        discardedCommits = await this.localOnly(record, signal, timeoutMs)
       } catch (error) {
         // A workspace git cannot read any more holds nothing that can be saved.
         if (!force) throw gitFailure(error, `检查工作区 ${record.path} `)
@@ -496,6 +496,11 @@ export class WorkspaceManager {
       known = false
     }
     return Number((await this.inside(record, ['rev-list', '--count', `${known ? tracking : record.baseCommit}..HEAD`], timeoutMs, signal)).trim())
+  }
+
+  /** Commits on `HEAD` or any local branch that no remote-tracking branch and no base history holds. */
+  private async localOnly(record: WorkspaceRecord, signal: AbortSignal | undefined, timeoutMs: number): Promise<number> {
+    return Number((await this.inside(record, ['rev-list', '--count', 'HEAD', '--branches', '--not', '--remotes', record.baseCommit], timeoutMs, signal)).trim())
   }
 
   private inside(record: WorkspaceRecord, args: readonly string[], timeoutMs: number, signal: AbortSignal | undefined, env: Readonly<Record<string, string>> = {}, maxOutputBytes?: number): Promise<string> {

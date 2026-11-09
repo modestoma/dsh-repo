@@ -51,6 +51,17 @@ describe('GitHub provider', () => {
     expect(requests[0]?.url.searchParams.get('labels')).toBe('bug')
   })
 
+  it('searches issues as text inside the repository only', async () => {
+    const found = (number: number, repository: string) => ({
+      number, title: `t${number}`, body: null, state: 'open', user: author, labels: [], assignees: [], created_at: 'c', updated_at: 'u',
+      html_url: `https://github.com/${repository}/issues/${number}`, repository_url: `https://api.github.com/repos/${repository}`,
+    })
+    const { requests } = fakeHttp([{ method: 'GET', path: '/search/issues', reply: { body: { total_count: 2, items: [found(1, 'modestoma/dsh-repo'), found(2, 'other/private')] } } }])
+    const page = await createService(testConfig(), TOKENS).listIssues(REPO, { search: 'crash repo:other/private', assignee: 'a b' })
+    expect(page.items.map(item => item.number)).toEqual([1])
+    expect(requests[0]?.url.searchParams.get('q')).toBe('"crash" "repo:other/private" repo:modestoma/dsh-repo is:issue state:open assignee:"a b"')
+  })
+
   it('reads one branch, and reports a missing or renamed branch as absent', async () => {
     fakeHttp([
       { method: 'GET', path: API, reply: { body: repoBody } },
