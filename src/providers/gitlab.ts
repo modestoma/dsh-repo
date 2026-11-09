@@ -1,8 +1,9 @@
 /**
  * GitLab provider on `@gitbeaker/rest`, the TypeScript SDK GitLab's
  * documentation lists: gitlab.com and self-managed instances, including ones
- * served under a path prefix. Merge requests are this module's change
- * requests; issue and merge request numbers are project-scoped IIDs.
+ * served under a path prefix. Merge requests are this module's PRs/MRs;
+ * issue and merge request numbers are project-scoped IIDs. {@link gitlabForge}
+ * is the family's adapter.
  *
  * @module dsh-repo/providers/gitlab
  */
@@ -13,8 +14,9 @@ import type {
   IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
-import { capFailures, errorText, nextPage, okBody, titleOf, truncateBytes } from './types.ts'
-import type { ActivityItem, ActivityRequest, Call, MrActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
+import { forgeKindInfo } from '../settings/contract.ts'
+import { capFailures, errorText, joinRepoPath, nextPage, okBody, pathSegments, titleOf, truncateBytes } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ForgeAdapter, MrActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitLab's maximum page size. */
 const MAX_PAGE = 100
@@ -723,4 +725,22 @@ export class GitlabProvider implements Provider {
     }
     return ids
   }
+}
+
+/** The GitLab family: repositories are `group/project` with any number of groups, git authenticates as `oauth2`. */
+export const gitlabForge: ForgeAdapter = {
+  kind: 'gitlab',
+  title: forgeKindInfo('gitlab').label,
+  gitUsername: 'oauth2',
+  pathHint: 'group/project（可有多级 group）',
+  // GitBeaker appends `/api/v4` itself.
+  apiBaseUrl: host => host.url,
+  repoPath: (rest) => {
+    let segments = pathSegments(rest)
+    const marker = segments.indexOf('-')
+    if (marker >= 0) segments = segments.slice(0, marker)
+    return segments.length >= 2 ? joinRepoPath(segments) : undefined
+  },
+  mrLabel: number => `MR !${number}`,
+  createProvider: (spec, token, timeoutMs) => new GitlabProvider(gitlabForge.apiBaseUrl(spec), token, timeoutMs),
 }

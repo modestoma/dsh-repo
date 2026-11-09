@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { ForgeKind, HostInfo, RepoAccess, RepoFeature, TokenStatus } from '../contract.ts'
-import { ACCESS_LEVELS, DEFAULT_SYNC_INTERVAL_MINUTES } from '../settings/contract.ts'
+import { ACCESS_LEVELS, DEFAULT_SYNC_INTERVAL_MINUTES, FORGE_KINDS, forgeKindInfo } from '../settings/contract.ts'
 import type { HostAddRequest, LocalSyncStatus, MirrorUsage, RepoInput, RepoRow, SettingsState, WatchInfo, WorkspaceRow } from '../settings/contract.ts'
 import { addHost, addRepo, clearHostToken, clearWorkspaceDir, createWorkspace, fetchMirrorUsage, fetchState, fetchWorkspaces, messageOf, pickDirectory, removeHost, removeRepo, removeWorkspace, clearMirrorDir, RequestError, resetSettings, saveHostToken, saveMirrorDir, saveSettings, saveWorkspaceDir, stopWatch, syncRepo, updateRepo } from './api.ts'
 import { formatBytes, formatInterval, fromDraft, intervalHoursText, NUMBER_FIELDS, parseIntervalHours, sameDraft, toDraft, WATCH_ACTIONS, WATCH_EVENTS, WRITE_MODES } from './form.ts'
@@ -61,10 +61,7 @@ const SYNC_POLL_MS = 2000
 /** Credential store layers of `@deepseek-ai/dsh-credentials-local` other than its own file. */
 const TOKEN_SOURCES: Readonly<Record<string, string>> = { 'env': '启动环境变量', 'project-env': '项目 .env', 'user-env': '$DSH_HOME/.env' }
 
-const HOST_KINDS: readonly { id: ForgeKind; label: string }[] = [
-  { id: 'gitlab', label: 'GitLab' },
-  { id: 'github', label: 'GitHub' },
-]
+const HOST_KINDS = FORGE_KINDS.map(entry => ({ id: entry.id, label: entry.label }))
 
 function tokenPill(token: TokenStatus): JSX.Element {
   if (token.error !== undefined) return <span className="dr__pill dr__pill--bad"><span className="dr__dot" />令牌无法读取</span>
@@ -462,7 +459,7 @@ function HostRow({ host, busy, run }: { host: HostInfo; busy: boolean; run: Run 
       <div className="dr__rowText">
         <div className="dr__rowLabel">
           <span className="dr__strong">{name}</span>
-          <span className="dr__tag">{host.kind === 'github' ? 'GitHub' : 'GitLab'}</span>
+          <span className="dr__tag">{forgeKindInfo(host.kind).label}</span>
           {host.origin === 'config' ? <span className="dr__tag">cordis.yml</span> : null}
           {tokenPill(host.token)}
         </div>
@@ -489,6 +486,7 @@ function HostRow({ host, busy, run }: { host: HostInfo; busy: boolean; run: Run 
 
 function AddHostForm({ busy, run, onDone }: { busy: boolean; run: Run; onDone: () => void }): JSX.Element {
   const [kind, setKind] = useState<ForgeKind>('gitlab')
+  const info = forgeKindInfo(kind)
   const [url, setUrl] = useState('')
   const [apiUrl, setApiUrl] = useState('')
   const [alias, setAlias] = useState('')
@@ -496,7 +494,7 @@ function AddHostForm({ busy, run, onDone }: { busy: boolean; run: Run; onDone: (
   const complete = url.trim() !== '' && alias.trim() !== '' && token.trim() !== ''
   const add = (): void => {
     if (!complete || busy) return
-    const host: HostAddRequest = { kind, url: url.trim(), alias: alias.trim(), token: token.trim(), ...kind === 'github' && apiUrl.trim() !== '' ? { apiUrl: apiUrl.trim() } : {} }
+    const host: HostAddRequest = { kind, url: url.trim(), alias: alias.trim(), token: token.trim(), ...info.apiUrl !== undefined && apiUrl.trim() !== '' ? { apiUrl: apiUrl.trim() } : {} }
     void run(() => addHost(host), `已添加 ${host.alias ?? host.url}`).then((ok) => { if (ok) onDone() })
   }
   const submitOnEnter = (event: { key: string }): void => { if (event.key === 'Enter') add() }
@@ -507,9 +505,9 @@ function AddHostForm({ busy, run, onDone }: { busy: boolean; run: Run; onDone: (
           <Segmented label="类型" value={kind} options={HOST_KINDS} disabled={busy} onChange={setKind} />
         </label>
         <label className="dr__field">别名<input className="dr__input" placeholder="例如 公司 GitLab" value={alias} onChange={(event) => { setAlias(event.target.value) }} onKeyDown={submitOnEnter} /></label>
-        <label className="dr__field">地址<input className="dr__input" placeholder={kind === 'github' ? 'https://github.com' : 'https://gitlab.example.com'} value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+        <label className="dr__field">地址<input className="dr__input" placeholder={info.urlPlaceholder} value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={submitOnEnter} /></label>
         <label className="dr__field">令牌<input className="dr__input dr__mono" type="password" autoComplete="new-password" spellCheck={false} placeholder="个人访问令牌" value={token} onChange={(event) => { setToken(event.target.value) }} onKeyDown={submitOnEnter} /></label>
-        {kind === 'github' ? <label className="dr__field dr__field--full">接口地址（可选，GitHub Enterprise 非默认时填写）<input className="dr__input" placeholder="默认 api.github.com 或 地址/api/v3" value={apiUrl} onChange={(event) => { setApiUrl(event.target.value) }} onKeyDown={submitOnEnter} /></label> : null}
+        {info.apiUrl !== undefined ? <label className="dr__field dr__field--full">{info.apiUrl.label}<input className="dr__input" placeholder={info.apiUrl.placeholder} value={apiUrl} onChange={(event) => { setApiUrl(event.target.value) }} onKeyDown={submitOnEnter} /></label> : null}
       </div>
       <div className="dr__formActions">
         <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onDone}>取消</button>

@@ -9,8 +9,8 @@
 import type { RepoRef } from './contract.ts'
 import type { HostSpec } from './config.ts'
 import { RepoError } from './errors.ts'
+import { forgeOf } from './providers/forges.ts'
 
-const SEGMENT = /^[A-Za-z0-9._-]+$/
 const SCP_LIKE = /^[A-Za-z0-9._-]+@([A-Za-z0-9.-]+):(.+)$/
 
 /** A target resolved to its host. */
@@ -41,20 +41,6 @@ function parse(input: string): ParsedTarget | undefined {
   if (url.protocol === 'https:' || url.protocol === 'http:') return { host: url.host.toLowerCase(), web: true, pathname: decodeURIComponent(url.pathname) }
   if (url.protocol === 'ssh:' || url.protocol === 'git:') return { host: url.hostname.toLowerCase(), web: false, pathname: decodeURIComponent(url.pathname) }
   return undefined
-}
-
-function repoPath(kind: HostSpec['kind'], rest: string): string | undefined {
-  let segments = rest.replace(/\.git$/, '').split('/').filter(segment => segment !== '')
-  if (kind === 'github') {
-    segments = segments.slice(0, 2)
-    if (segments.length !== 2) return undefined
-  } else {
-    const marker = segments.indexOf('-')
-    if (marker >= 0) segments = segments.slice(0, marker)
-    if (segments.length < 2) return undefined
-  }
-  if (segments.at(-1)?.endsWith('.git') === true) segments[segments.length - 1] = segments.at(-1)!.slice(0, -4)
-  return segments.every(segment => SEGMENT.test(segment) && segment !== '.' && segment !== '..') ? segments.join('/') : undefined
 }
 
 /** The host serving a parsed target and the path below the host's prefix. */
@@ -97,10 +83,9 @@ export function resolveTarget(input: string, hosts: readonly HostSpec[]): Resolv
   if (parsed === undefined) throw new RepoError('invalid', `无法识别的仓库：${input}（填仓库网址、git 地址或 主机/路径）`)
   const best = matchHost(parsed, hosts)
   if (best === undefined) throw new RepoError('not-allowed', `没有为 ${parsed.host} 配置主机，dsh-repo 不能访问 ${input}`)
-  const path = repoPath(best.spec.kind, best.rest)
-  if (path === undefined) {
-    throw new RepoError('invalid', best.spec.kind === 'github' ? `GitHub 仓库路径应为 owner/name：${input}` : `GitLab 仓库路径应为 group/project（可有多级 group）：${input}`)
-  }
+  const forge = forgeOf(best.spec.kind)
+  const path = forge.repoPath(best.rest)
+  if (path === undefined) throw new RepoError('invalid', `${forge.title} 仓库路径应为 ${forge.pathHint}：${input}`)
   const host = new URL(best.spec.url).host
   return { spec: best.spec, kind: best.spec.kind, host, path, webUrl: `${best.spec.url}/${path}` }
 }

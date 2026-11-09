@@ -79,6 +79,34 @@ export const MAX_SIGNATURE_LENGTH = 500
 
 /** Longest workspace commit name or email. */
 export const MAX_IDENTITY_LENGTH = 200
+/** A code host family as the settings page and host validation describe it. */
+export interface ForgeKindInfo {
+  readonly id: ForgeKind
+  /** Product name, e.g. `GitHub`. */
+  readonly label: string
+  /** Example host address for the add-host form. */
+  readonly urlPlaceholder: string
+  /** The separate API address a host of this family may configure; absent when the API address follows from the host address. */
+  readonly apiUrl?: { readonly label: string; readonly placeholder: string }
+}
+
+const FORGE_KIND_INFO: Readonly<Record<ForgeKind, ForgeKindInfo>> = {
+  gitlab: { id: 'gitlab', label: 'GitLab', urlPlaceholder: 'https://gitlab.example.com' },
+  github: { id: 'github', label: 'GitHub', urlPlaceholder: 'https://github.com', apiUrl: { label: '接口地址（可选，GitHub Enterprise 非默认时填写）', placeholder: '默认 api.github.com 或 地址/api/v3' } },
+}
+
+/** The code host families, in the order the settings page offers them. */
+export const FORGE_KINDS: readonly ForgeKindInfo[] = [FORGE_KIND_INFO.gitlab, FORGE_KIND_INFO.github]
+
+/**
+ * The description of a code host family.
+ * @param kind - host kind.
+ * @returns its entry of {@link FORGE_KINDS}.
+ */
+export function forgeKindInfo(kind: ForgeKind): ForgeKindInfo {
+  return FORGE_KIND_INFO[kind]
+}
+
 /** Labels of the catalog access levels, from the least. */
 export const ACCESS_LEVELS: readonly { readonly id: RepoAccess; readonly label: string }[] = [
   { id: 'read', label: '只读' },

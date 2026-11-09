@@ -7,6 +7,7 @@
  */
 
 import type { MrInfo, MrState, MrStatus, CheckState, ForgeKind } from '../contract.ts'
+import { forgeOf } from '../providers/forges.ts'
 import type { MrActivity } from '../providers/types.ts'
 import type { WatchEventKind } from '../settings/contract.ts'
 
@@ -251,11 +252,6 @@ function settledChecks(status: MrStatus): CheckState {
   return status.checks.some(check => check.state === 'pending') ? 'pending' : status.overall
 }
 
-/** The label of a PR/MR: `PR #12` on GitHub, `MR !12` on GitLab. */
-export function changeLabel(kind: ForgeKind, number: number): string {
-  return kind === 'github' ? `PR #${number}` : `MR !${number}`
-}
-
 function quote(body: string): string {
   const text = body.length > QUOTE_CHARS ? `${body.slice(0, QUOTE_CHARS)}…（已截断）` : body
   return text.split('\n').map(line => `  > ${line}`).join('\n')
@@ -335,7 +331,7 @@ export interface WatchMessage {
  * @returns the message.
  */
 export function renderMessage(record: WatchRecord, events: readonly WatchEvent[], options: { readonly wake: boolean; readonly idleDays: number; readonly limited: boolean }): WatchMessage {
-  const label = changeLabel(record.kind, record.number)
+  const label = forgeOf(record.kind).mrLabel(record.number)
   const kinds = [...new Set(events.map(event => event.kind))]
   const counts = kinds.map((kind) => {
     const count = events.filter(event => event.kind === kind).length

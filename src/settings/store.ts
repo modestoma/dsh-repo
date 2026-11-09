@@ -15,6 +15,7 @@ import type { HostCreate } from '../contract.ts'
 import { DEFAULT_SETTINGS, hostSpecSchema, normalizeHostUrl, repoSettingsSchema, settingsOverrides } from '../config.ts'
 import type { HostSpec, RepoSettings } from '../config.ts'
 import { RepoError } from '../errors.ts'
+import { forgeKindInfo } from './contract.ts'
 import { JsonFile } from '../files.ts'
 import { catalogEntrySchema } from '../catalog/entry.ts'
 import type { CatalogEntry } from '../catalog/entry.ts'
@@ -268,7 +269,8 @@ export class SettingsStore {
     const apiInput = create.apiUrl?.trim()
     let apiUrl: string | undefined
     if (apiInput !== undefined && apiInput !== '') {
-      if (kind !== 'github') throw new RepoError('invalid', '接口地址只用于 GitHub；GitLab 的接口地址由主机地址推出')
+      const info = forgeKindInfo(kind)
+      if (info.apiUrl === undefined) throw new RepoError('invalid', `${info.label} 的接口地址由主机地址推出，不能单独填写`)
       apiUrl = normalizeHostUrl(apiInput)
       if (apiUrl === undefined) throw new RepoError('invalid', `接口地址不合法：${apiInput}（填 https://主机[:端口][/路径]，不含用户名、查询参数或片段）`)
     }
