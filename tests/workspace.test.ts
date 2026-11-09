@@ -226,7 +226,7 @@ describe('plain git through the proxy', () => {
     expect(refused.output).toContain('已关闭写操作')
     writeFileSync(join(path, 'b.txt'), 'b\n')
     const record = await manager.locate(path)
-    await expect(manager.push(record, { message: 'b' }, TIMEOUT)).rejects.toMatchObject({ message: expect.stringContaining('已关闭写操作') })
+    await expect(manager.push(record, { message: 'b', committer: { name: 'bot', email: 'bot@example.com' } }, TIMEOUT)).rejects.toMatchObject({ message: expect.stringContaining('已关闭写操作') })
     expect(await git(path, 'status', '--porcelain')).toContain('b.txt')
     await expect(service.forge.createIssue(url, { title: 'x' })).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('已关闭写操作') })
     expect((await tryGit(bare, 'rev-parse', '--verify', '--quiet', 'refs/heads/fix/a')).status).not.toBe(0)
