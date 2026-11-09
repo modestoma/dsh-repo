@@ -346,8 +346,9 @@ export class WorkspaceManager {
   async push(record: WorkspaceRecord, request: PushRequest, timeoutMs: number): Promise<PushOutcome> {
     return await serialize(this.locks, record.id, async () => {
       const run = (args: readonly string[], env: Readonly<Record<string, string>> = {}) => this.inside(record, args, timeoutMs, request.signal, env)
-      const mirrorDir = this.deps.service.mirrors.dirOf(record.repo)
-      const remoteBefore = await this.mirrorBranch(mirrorDir, record.branch, request.signal)
+      // A fresh fetch: a stale mirror could claim the remote branch already holds HEAD after someone deleted or rewound it.
+      const mirror = await this.deps.service.syncMirror(record.repo, request.signal === undefined ? {} : { signal: request.signal })
+      const remoteBefore = await this.mirrorBranch(mirror.dir, record.branch, request.signal)
       let committed = false
       const author = request.author ?? request.committer
       try {

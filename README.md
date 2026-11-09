@@ -167,7 +167,7 @@ CI 工具读取 GitLab 流水线和 GitHub Actions。只通过提交状态上报
 
 - 每个工作区有自己的随机密钥，写在工作区 `.git/config` 的凭据助手里，只对这个代理地址生效；代理按密钥认出工作区，只放行这个工作区的仓库。工作区记录（含密钥）保存在设置文件旁边的 `workspaces.json`，权限 0600。密钥只能读写这一个仓库，而且要经过下面的推送规则；Agent 读得到它，和读得到工作区文件一样。
 - 拉取（`git fetch` / `pull`）先同步镜像，再由 `git http-backend` 从镜像提供，所以拉到的总是远端的最新内容。
-- 推送（`git push`）先检查每条引用更新：只能推分支（不能推 tag），不能删除分支，不能推到默认分支和受保护分支；然后以创建工作区的会话发 `access/authorize` 事件（`action` 是 `git-push`）。通过后代理用主机令牌转发给远端，远端的拒绝原样返回；不通过时 git 看到 `dsh-repo: <原因>` 的拒绝。推送成功后同步镜像，并跟踪这个分支上打开中的 PR/MR。
+- 推送（`git push`）先检查每条引用更新：只能推分支（不能推 tag），不能删除分支，不能推到默认分支（每次向远端确认当前的默认分支）和受保护分支；然后以创建工作区的会话发 `access/authorize` 事件（`action` 是 `git-push`）。通过后代理用主机令牌转发给远端，远端的拒绝原样返回；不通过时 git 看到 `dsh-repo: <原因>` 的拒绝。推送成功后同步镜像，并跟踪这个分支上打开中的 PR/MR。
 - 端口默认自动选择并记在 `workspaces.json` 里，重启后沿用；在设置页改端口后代理换到新端口，并改写所有工作区的配置。新端口监听失败时代理留在原端口，保存设置时报错。
 - 代理只监听 127.0.0.1；工作区的 git 配置为代理地址关闭 `http_proxy`。
 
@@ -352,6 +352,7 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 
 - GitBeaker 不接受逐次调用的取消信号，GitLab 请求只受 `timeoutMs` 约束；调用被取消后，已发出的请求可能仍会完成。
 - 修改 PR/MR 时不能切换草稿状态；GitHub 的行内评审评论、评审（approve / request changes）不在第一版范围内。
+- 工作区不支持 Git LFS：代理不转发 LFS 接口，插件推送时也不上传 LFS 对象，改动 LFS 文件的推送只会带上指针文件。使用 LFS 的仓库请在工作区之外推送 LFS 文件。
 - 代理分辨不出 `git push --force` 和 `--force-with-lease`，两者都按普通推送规则放行（仍不能推默认分支和受保护分支）；要保护的分支请在主机上设为受保护分支。
 - 代理用 Node 内置的 `fetch` 转发推送，和两个 SDK 一样需要 `NODE_USE_ENV_PROXY=1` 才走 `HTTPS_PROXY`。
 - 推送规则只在 dsh-repo 一侧检查：工作区之外的 git 客户端用自己的凭据推送不受影响。

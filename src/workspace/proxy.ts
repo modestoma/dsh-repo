@@ -324,7 +324,8 @@ export class GitProxy {
     const { service } = this.deps
     let defaultBranch: string
     try {
-      defaultBranch = await service.mirrors.defaultBranch(record.repo)
+      // Asked of the remote: the mirror's HEAD may predate a change of the default branch.
+      defaultBranch = await service.mirrors.remoteDefaultBranch(record.repo, await service.mirrorAuth(record.repo, true)) ?? await service.mirrors.defaultBranch(record.repo)
     } catch (error) {
       return `无法确认默认分支：${error instanceof Error ? error.message : String(error)}`
     }
@@ -336,6 +337,7 @@ export class GitProxy {
       if (service.gitHost(record.repo)) {
         try {
           const remote = await service.getBranch(record.repo, branch)
+          if (remote?.default === true) return `不能直接推送到默认分支 ${branch}；推送到别的分支后创建 PR/MR`
           if (remote?.protected === true) return `${branch} 是受保护分支，不能经工作区推送`
         } catch (error) {
           return `无法确认分支 ${branch} 是否受保护：${error instanceof Error ? error.message : String(error)}`

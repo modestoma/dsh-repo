@@ -184,6 +184,20 @@ describe('plain git through the proxy', () => {
     expect(gitAs(bare, 'rev-parse', 'main')).not.toBe(await git(path, 'rev-parse', 'HEAD'))
   })
 
+  it('asks the remote for its default branch instead of trusting the mirror', async () => {
+    const { bare, manager, sessions } = await setup()
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, branch: 'fix/a' })
+    gitAs(bare, 'symbolic-ref', 'HEAD', 'refs/heads/dev')
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    await git(path, 'add', '.')
+    await git(path, '-c', 'user.name=x', '-c', 'user.email=x@example.com', 'commit', '--quiet', '-m', 'a')
+    const refused = await tryGit(path, 'push', 'origin', 'HEAD:dev')
+    expect(refused.status).not.toBe(0)
+    expect(refused.output).toContain('默认分支 dev')
+    expect(gitAs(bare, 'rev-parse', 'dev')).not.toBe(await git(path, 'rev-parse', 'HEAD'))
+  })
+
   it('refuses a push the access/authorize listeners reject, and requests without the workspace secret', async () => {
     const { bare, manager, sessions, proxy, registry } = await setup({ parallel: async () => { throw new AggregateError([new Error('没有改代码权限')]) } })
     const path = join(sessions, 'app')
@@ -261,6 +275,18 @@ describe('workspace status, push, and removal', () => {
     const status = await manager.status(record, undefined, 4096, TIMEOUT)
     expect(status.commits.map(entry => entry.subject)).toEqual(['fix: a', 'feat: b'])
     expect(status.unpushed).toBe(0)
+  })
+
+  it('pushes again when the remote branch was deleted after the last push', async () => {
+    const { bare, manager, sessions } = await setup()
+    const path = join(sessions, 'app')
+    await manager.create({ repo: bare, path, branch: 'fix/a' })
+    const record = await manager.locate(path)
+    writeFileSync(join(path, 'a.txt'), 'a\n')
+    const first = await manager.push(record, { message: 'a', committer: { name: 'bot', email: 'bot@example.com' } }, TIMEOUT)
+    gitAs(bare, 'branch', '-D', 'fix/a')
+    expect(await manager.push(record, {}, TIMEOUT)).toEqual({ commit: first.commit, committed: false, created: true })
+    expect(gitAs(bare, 'rev-parse', 'fix/a')).toBe(first.commit)
   })
 
   it('refuses to overwrite a branch someone else moved unless forced with lease, and undoes its own commit on failure', async () => {
