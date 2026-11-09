@@ -6,7 +6,7 @@
  * @module dsh-repo/client/form
  */
 
-import { MAX_SIGNATURE_LENGTH, SETTING_BOUNDS, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
+import { MAX_IDENTITY_LENGTH, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
 import type { RepoSettingsWire, WatchAction, WatchEventKind } from '../settings/contract.ts'
 
 /** Integer settings, named as in {@link SETTING_BOUNDS}. */
@@ -86,8 +86,8 @@ export interface SettingsDraft {
   readonly commitEmail: string
 }
 
-/** Field of a rejected draft: an integer setting or the signature. */
-export type DraftField = NumberKey | 'signature'
+/** Field of a rejected draft: an integer setting, the signature, or the commit identity. */
+export type DraftField = NumberKey | 'signature' | 'commitName' | 'commitEmail'
 
 /** Drop float noise from `stored / scale` (e.g. 0.30000000000000004). */
 function tidy(value: number): number {
@@ -195,6 +195,13 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
   }
   if (errors.perPage === undefined && errors.maxPerPage === undefined && numbers.perPage > numbers.maxPerPage) errors.perPage = '默认每页条数不能大于每页上限'
   if (draft.signature.length > MAX_SIGNATURE_LENGTH) errors.signature = `签名最多 ${MAX_SIGNATURE_LENGTH} 个字符`
+  const commitName = draft.commitName.trim()
+  const commitEmail = draft.commitEmail.trim()
+  if (commitName.length > MAX_IDENTITY_LENGTH) errors.commitName = `提交姓名最多 ${MAX_IDENTITY_LENGTH} 个字符`
+  else if (/[<>\n]/.test(commitName)) errors.commitName = '提交姓名不能包含 < > 或换行'
+  if (commitEmail.length > MAX_IDENTITY_LENGTH) errors.commitEmail = `提交邮箱最多 ${MAX_IDENTITY_LENGTH} 个字符`
+  else if (/[<>\s]/.test(commitEmail)) errors.commitEmail = '提交邮箱不能包含 < > 或空白'
+  if ((commitName === '') !== (commitEmail === '')) errors[commitName === '' ? 'commitName' : 'commitEmail'] = '提交姓名和邮箱要一起填，或者都留空'
   if (Object.keys(errors).length > 0) return { ok: false, errors }
   return {
     ok: true,

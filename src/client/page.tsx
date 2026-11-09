@@ -1,8 +1,9 @@
 /**
- * 左侧栏「代码仓库」整页设置，分五个标签页：主机（主机与令牌）、仓库（仓库
- * 清单：每个仓库的分支、权限、其他插件登记的功能开关和本地同步）、模型工具、
- * MR 跟踪（各类动态的处理方式、检查频率、正在跟踪的 PR/MR）、高级（超时、
- * 上限、镜像目录、镜像占用）。主机、令牌、仓库清单、镜像目录和停止跟踪的改动立即保存；其余运行时设置有改动时出现底部保存条，保存后对之后的调用立即生效。
+ * 左侧栏「代码仓库」整页设置，分六个标签页：主机（主机与令牌）、仓库（仓库
+ * 清单：每个仓库的分支、权限、其他插件登记的功能开关和本地同步）、工作区（dsh-repo
+ * 建的所有工作区：分支、未提交和未推送的改动、PR/MR，新建、在此新建会话、删除）、
+ * 模型工具、MR 跟踪（各类动态的处理方式、检查频率、正在跟踪的 PR/MR）、高级（超时、
+ * 上限、工作区目录、代理端口、提交身份、镜像目录、镜像占用）。主机、令牌、仓库清单、工作区、工作区目录、镜像目录和停止跟踪的改动立即保存；其余运行时设置有改动时出现底部保存条，保存后对之后的调用立即生效。
  * 令牌值存入 DSH 凭据库，页面只显示是否已设置。
  *
  * @module dsh-repo/client/page
@@ -12,21 +13,23 @@ import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { ForgeKind, HostInfo, RepoAccess, RepoFeature, TokenStatus } from '../contract.ts'
 import { ACCESS_LEVELS, DEFAULT_SYNC_INTERVAL_MINUTES } from '../settings/contract.ts'
-import type { HostAddRequest, LocalSyncStatus, MirrorUsage, RepoInput, RepoRow, SettingsState, WatchInfo } from '../settings/contract.ts'
-import { addHost, addRepo, clearHostToken, fetchMirrorUsage, fetchState, messageOf, pickDirectory, removeHost, removeRepo, clearMirrorDir, resetSettings, saveHostToken, saveMirrorDir, saveSettings, stopWatch, syncRepo, updateRepo } from './api.ts'
+import type { HostAddRequest, LocalSyncStatus, MirrorUsage, RepoInput, RepoRow, SettingsState, WatchInfo, WorkspaceRow } from '../settings/contract.ts'
+import { addHost, addRepo, clearHostToken, clearWorkspaceDir, createWorkspace, fetchMirrorUsage, fetchState, fetchWorkspaces, messageOf, pickDirectory, removeHost, removeRepo, removeWorkspace, clearMirrorDir, RequestError, resetSettings, saveHostToken, saveMirrorDir, saveSettings, saveWorkspaceDir, stopWatch, syncRepo, updateRepo } from './api.ts'
 import { formatBytes, formatInterval, fromDraft, intervalHoursText, NUMBER_FIELDS, parseIntervalHours, sameDraft, toDraft, WATCH_ACTIONS, WATCH_EVENTS, WRITE_MODES } from './form.ts'
 import type { DraftField, NumberKey, SettingsDraft } from './form.ts'
+import { useWorkspaceOpener } from './navigation.ts'
 
 /** Page title, shared with the sidebar row. */
 export const PAGE_TITLE = '代码仓库'
 
 type Notice = { kind: 'ok' | 'error'; text: string } | undefined
 
-type TabId = 'hosts' | 'repos' | 'tools' | 'watch' | 'advanced'
+type TabId = 'hosts' | 'repos' | 'workspaces' | 'tools' | 'watch' | 'advanced'
 
 const TABS: readonly { id: TabId; label: string }[] = [
   { id: 'hosts', label: '主机' },
   { id: 'repos', label: '仓库' },
+  { id: 'workspaces', label: '工作区' },
   { id: 'tools', label: '模型工具' },
   { id: 'watch', label: 'MR 跟踪' },
   { id: 'advanced', label: '高级' },
@@ -106,7 +109,7 @@ export function bundlePointer(openPage: () => (() => void) | undefined): (props:
           <div className="dr__row">
             <div className="dr__rowText">
               <div className="dr__rowLabel">设置在左侧栏「{PAGE_TITLE}」</div>
-              <div className="dr__rowSummary">主机与令牌、仓库清单（权限、功能、本地同步）、模型工具、MR 跟踪、超时与上限、本地镜像都在那里配置。</div>
+              <div className="dr__rowSummary">主机与令牌、仓库清单（权限、功能、本地同步）、工作区、模型工具、MR 跟踪、超时与上限、本地镜像都在那里配置。</div>
             </div>
             {open === undefined ? null : <div className="dr__rowCtl"><button type="button" className="dr__btn" onClick={open}>打开设置</button></div>}
           </div>
@@ -127,6 +130,8 @@ function SettingsPanel(): JSX.Element {
   const [tab, setTab] = useState<TabId>('hosts')
   const [draft, setDraft] = useState<SettingsDraft | undefined>()
   const [errors, setErrors] = useState<Partial<Record<DraftField, string>>>({})
+  /** Catalog entry the 「工作区」 tab opens its creation form for. */
+  const [createFor, setCreateFor] = useState<string | undefined>()
 
   const reload = useCallback(async () => {
     try {
@@ -201,6 +206,7 @@ function SettingsPanel(): JSX.Element {
     void run(resetSettings, '已全部恢复默认').then((ok) => { if (ok) discard() })
   }
   const form = { current, defaults, errors, busy, edit }
+  const showError = (text: string): void => { setNotice({ kind: 'error', text }) }
 
   return (
     <div className="dr">
@@ -213,7 +219,8 @@ function SettingsPanel(): JSX.Element {
       {notice === undefined ? null : <div className={`dr__notice dr__notice--${notice.kind}`} role="status">{notice.text}</div>}
 
       {tab === 'hosts' ? <HostsTab hosts={state.hosts} busy={busy} run={run} /> : null}
-      {tab === 'repos' ? <ReposTab state={state} busy={busy} run={run} onError={(text) => { setNotice({ kind: 'error', text }) }} /> : null}
+      {tab === 'repos' ? <ReposTab state={state} busy={busy} run={run} onError={showError} onCreateWorkspace={(id) => { setCreateFor(id); setTab('workspaces') }} /> : null}
+      {tab === 'workspaces' ? <WorkspacesTab state={state} createFor={createFor} onCreateForm={setCreateFor} onNotice={setNotice} onOpenAdvanced={() => { setTab('advanced') }} /> : null}
       {tab === 'tools' ? <ToolsTab {...form} /> : null}
       {tab === 'watch'
         ? (
@@ -228,7 +235,8 @@ function SettingsPanel(): JSX.Element {
         ? (
             <>
               <AdvancedTab {...form} />
-              <MirrorSection state={state} busy={busy} run={run} onError={(text) => { setNotice({ kind: 'error', text }) }} />
+              <WorkspaceSettings form={form} state={state} run={run} onError={showError} />
+              <MirrorSection state={state} busy={busy} run={run} onError={showError} />
               <MirrorUsageSection mirrorDir={state.mirror.dir} />
               <div className="dr__footer">
                 <span>设置文件 <span className="dr__mono">{state.file}</span>，重装插件不会清空。</span>
@@ -551,7 +559,7 @@ function accessText(access: RepoAccess): string {
   return ACCESS_LEVELS.find(level => level.id === access)?.label ?? access
 }
 
-function ReposTab({ state, busy, run, onError }: { state: SettingsState; busy: boolean; run: Run; onError: (text: string) => void }): JSX.Element {
+function ReposTab({ state, busy, run, onError, onCreateWorkspace }: { state: SettingsState; busy: boolean; run: Run; onError: (text: string) => void; onCreateWorkspace: (id: string) => void }): JSX.Element {
   const [adding, setAdding] = useState(false)
   const [editing, setEditing] = useState<string | undefined>()
   const now = Date.now()
@@ -564,7 +572,7 @@ function ReposTab({ state, busy, run, onError }: { state: SettingsState; busy: b
           : null}
         {state.repos.map(repo => repo.id === editing
           ? <RepoForm key={repo.id} repo={repo} {...form} onCancel={() => { setEditing(undefined) }} onSubmit={(input) => { void run(() => updateRepo(repo.id, input), repoNotice(item => item.id === repo.id, '已保存')).then((ok) => { if (ok) setEditing(undefined) }) }} />
-          : <RepoListRow key={repo.id} repo={repo} features={state.features} now={now} busy={busy} run={run} onEdit={() => { setEditing(repo.id) }} />)}
+          : <RepoListRow key={repo.id} repo={repo} features={state.features} now={now} busy={busy} run={run} onEdit={() => { setEditing(repo.id) }} {...state.workspace.available && canWorkIn(repo) ? { onCreateWorkspace: () => { onCreateWorkspace(repo.id) } } : {}} />)}
         {adding
           ? <RepoForm {...form} onCancel={() => { setAdding(false) }} onSubmit={(input) => { void run(() => addRepo(input), repoNotice(item => item.url === input.url.trim(), '已加入仓库清单')).then((ok) => { if (ok) setAdding(false) }) }} />
           : <div className="dr__addRow"><button type="button" className="dr__link" disabled={busy} onClick={() => { setAdding(true) }}>＋ 添加仓库</button></div>}
@@ -582,7 +590,12 @@ function syncPill(sync: LocalSyncStatus): JSX.Element {
   return <span className="dr__pill dr__pill--ok"><span className="dr__dot" />已同步</span>
 }
 
-function RepoListRow({ repo, features, now, busy, run, onEdit }: { repo: RepoRow; features: readonly RepoFeature[]; now: number; busy: boolean; run: Run; onEdit: () => void }): JSX.Element {
+/** Whether the page offers 「新建工作区」 for a catalog repository: it can be reached and its access allows pushing. */
+function canWorkIn(repo: RepoRow): boolean {
+  return repo.problem === undefined && repo.access !== 'read'
+}
+
+function RepoListRow({ repo, features, now, busy, run, onEdit, onCreateWorkspace }: { repo: RepoRow; features: readonly RepoFeature[]; now: number; busy: boolean; run: Run; onEdit: () => void; onCreateWorkspace?: () => void }): JSX.Element {
   const titles = repo.features.map(id => features.find(feature => feature.id === id)?.title ?? id)
   const sync = repo.sync
   const parts: string[] = []
@@ -607,6 +620,7 @@ function RepoListRow({ repo, features, now, busy, run, onEdit }: { repo: RepoRow
         {sync?.error === undefined ? null : <div className="dr__rowError">{sync.error}</div>}
       </div>
       <div className="dr__rowCtl">
+        {onCreateWorkspace === undefined ? null : <button type="button" className="dr__btn" disabled={busy} onClick={onCreateWorkspace}>新建工作区</button>}
         {sync === undefined ? null : <button type="button" className="dr__btn" disabled={busy || sync.state !== 'idle'} onClick={() => { void run(() => syncRepo(repo.id), repoNotice(item => item.id === repo.id, `已同步 ${name}`)) }}>立即同步</button>}
         <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onEdit}>编辑</button>
         <button type="button" className="dr__btn dr__btn--ghost dr__btn--danger" disabled={busy} onClick={() => { if (window.confirm(`把 ${name} 移出仓库清单？之后模型工具和其他插件都不能再访问它${repo.localSync?.enabled === true ? `；本地同步目录 ${repo.localSync.dir} 里的文件会保留` : ''}。`)) void run(() => removeRepo(repo.id), `已把 ${name} 移出仓库清单`) }}>删除</button>
@@ -732,5 +746,204 @@ function MirrorUsageSection({ mirrorDir }: { mirrorDir: string | undefined }): J
       </div>
       {usage === undefined ? null : <p className="dr__secFoot">快照 {formatBytes(usage.snapshotBytes)} · 其他 {formatBytes(usage.otherBytes)}。时间是最近一次拉取。</p>}
     </section>
+  )
+}
+
+/** The directory name a new workspace of a repository gets by default. */
+function defaultName(url: string): string {
+  return url.replace(/\/+$/, '').replace(/\.git$/, '').split(/[/\\]/).pop() ?? 'repo'
+}
+
+function WorkspacesTab({ state, createFor, onCreateForm, onNotice, onOpenAdvanced }: { state: SettingsState; createFor: string | undefined; onCreateForm: (repo: string | undefined) => void; onNotice: (notice: Notice) => void; onOpenAdvanced: () => void }): JSX.Element {
+  const [rows, setRows] = useState<WorkspaceRow[] | undefined>()
+  const [loadError, setLoadError] = useState<string | undefined>()
+  const [busy, setBusy] = useState(false)
+  const opener = useWorkspaceOpener()
+  const load = useCallback(async () => {
+    try {
+      setRows(await fetchWorkspaces())
+      setLoadError(undefined)
+    } catch (error) {
+      setLoadError(messageOf(error))
+    }
+  }, [])
+  useEffect(() => { void load() }, [load])
+  const act = async (action: () => Promise<void>): Promise<void> => {
+    setBusy(true)
+    onNotice(undefined)
+    try {
+      await action()
+    } catch (error) {
+      onNotice({ kind: 'error', text: messageOf(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+  const open = async (path: string): Promise<void> => {
+    if (opener === undefined) return
+    await opener.open(path)
+  }
+  const remove = (row: WorkspaceRow): void => {
+    if (!window.confirm(`删除工作区 ${row.path}？目录会整个删掉。`)) return
+    void act(async () => {
+      try {
+        setRows(await removeWorkspace(row.id, false))
+      } catch (error) {
+        if (!(error instanceof RequestError) || error.status !== 409) throw error
+        if (!window.confirm(`${error.message.replace(/；确认不要了再用 force 删除$/, '')}。仍然删除？这些改动会丢失。`)) return
+        setRows(await removeWorkspace(row.id, true))
+      }
+      onNotice({ kind: 'ok', text: `已删除工作区 ${row.path}` })
+    })
+  }
+  const create = (input: { repo: string; base: string; branch: string; name: string }): void => {
+    void act(async () => {
+      const row = await createWorkspace(input)
+      onCreateForm(undefined)
+      await load()
+      if (opener === undefined) {
+        onNotice({ kind: 'ok', text: `已在 ${row.path} 新建工作区，推送分支 ${row.branch}` })
+        return
+      }
+      try {
+        await open(row.path)
+      } catch (error) {
+        onNotice({ kind: 'error', text: `已在 ${row.path} 新建工作区，但没能在 DSH 里打开：${messageOf(error)}` })
+      }
+    })
+  }
+  const repos = state.repos.filter(canWorkIn)
+  const now = Date.now()
+  return (
+    <>
+      <section className="dr__sec">
+        <div className="dr__secHead">
+          <h2 className="dr__secTitle">{rows === undefined ? '工作区' : `工作区（${rows.length}）`}</h2>
+          <button type="button" className="dr__link dr__link--small" disabled={busy} onClick={() => { void load() }}>刷新</button>
+        </div>
+        <div className="dr__list">
+          {loadError === undefined ? null : <div className="dr__emptyRow dr__rowError">{loadError}</div>}
+          {rows === undefined && loadError === undefined ? <div className="dr__emptyRow">加载中…</div> : null}
+          {rows !== undefined && rows.length === 0 && createFor === undefined ? <div className="dr__emptyRow">还没有工作区。工作区是一个完整的 git 仓库，可以在里面开会话改代码，用普通的 git 命令提交和推送。</div> : null}
+          {rows?.map(row => <WorkspaceListRow key={row.id} row={row} now={now} busy={busy} {...opener === undefined ? {} : { onOpen: () => { void act(() => open(row.path)) } }} onRemove={() => { remove(row) }} />)}
+          {createFor === undefined
+            ? <div className="dr__addRow"><button type="button" className="dr__link" disabled={busy || !state.workspace.available} onClick={() => { onCreateForm(repos[0]?.id ?? '') }}>＋ 新建工作区</button></div>
+            : <WorkspaceForm state={state} repos={repos} initial={createFor} busy={busy} onCancel={() => { onCreateForm(undefined) }} onSubmit={create} onOpenAdvanced={onOpenAdvanced} />}
+        </div>
+      </section>
+      <p className="dr__secFoot">工作区的 origin 经本机 git 代理访问远端，令牌不进工作区；fetch、pull、push 都可以直接用，推送到默认分支、受保护分支、标签和删除分支会被拒绝。设置页新建的工作区不属于任何会话，推送不经会话授权；在里面开的会话照常使用模型工具的审批设置。{opener === undefined ? '当前界面不能打开 DSH 工作区，新建后请在左侧栏用这个目录新建会话。' : ''}</p>
+    </>
+  )
+}
+
+function WorkspaceListRow({ row, now, busy, onOpen, onRemove }: { row: WorkspaceRow; now: number; busy: boolean; onOpen?: () => void; onRemove: () => void }): JSX.Element {
+  const branch = row.currentBranch ?? row.branch
+  const meta: string[] = []
+  if (row.activityAt !== undefined) meta.push(`最近 git 活动 ${ago(row.activityAt, now)}`)
+  meta.push(row.session === undefined ? '设置页新建' : `会话 ${row.session.slice(0, 8)}`)
+  return (
+    <div className="dr__row dr__row--top">
+      <div className="dr__rowText">
+        <div className="dr__rowLabel">
+          <span className="dr__strong dr__mono" title={row.url}>{row.repo}</span>
+          <span className="dr__tag dr__mono" title={row.currentBranch === undefined || row.currentBranch === row.branch ? `推送到 ${row.branch}` : `当前在 ${row.currentBranch}，推送到 ${row.branch}`}>{branch} → {row.base}</span>
+          {row.uncommittedFiles === undefined || row.uncommittedFiles === 0 ? null : <span className="dr__pill dr__pill--warn"><span className="dr__dot" />{row.uncommittedFiles} 个文件未提交</span>}
+          {row.unpushed === undefined || row.unpushed === 0 ? null : <span className="dr__pill dr__pill--warn"><span className="dr__dot" />{row.unpushed} 个提交未推送</span>}
+          {row.uncommittedFiles === 0 && row.unpushed === 0 ? <span className="dr__pill dr__pill--ok"><span className="dr__dot" />已推送</span> : null}
+          {row.mrs?.map(mr => <a key={mr.number} className="dr__tag" href={mr.webUrl} target="_blank" rel="noreferrer" title={mr.title}>#{mr.number}</a>)}
+        </div>
+        <div className="dr__rowSummary"><span className="dr__mono">{row.path}</span> · {meta.join(' · ')}</div>
+        {row.error === undefined ? null : <div className="dr__rowError">{row.error}</div>}
+      </div>
+      <div className="dr__rowCtl">
+        {onOpen === undefined ? null : <button type="button" className="dr__btn" disabled={busy} onClick={onOpen}>在此新建会话</button>}
+        <button type="button" className="dr__btn dr__btn--ghost dr__btn--danger" disabled={busy} onClick={onRemove}>删除</button>
+      </div>
+    </div>
+  )
+}
+
+function WorkspaceForm({ state, repos, initial, busy, onCancel, onSubmit, onOpenAdvanced }: { state: SettingsState; repos: readonly RepoRow[]; initial: string; busy: boolean; onCancel: () => void; onSubmit: (input: { repo: string; base: string; branch: string; name: string }) => void; onOpenAdvanced: () => void }): JSX.Element {
+  const [repoId, setRepoId] = useState(repos.some(repo => repo.id === initial) ? initial : repos[0]?.id ?? '')
+  const [base, setBase] = useState('')
+  const [branch, setBranch] = useState('')
+  const [name, setName] = useState('')
+  const repo = repos.find(item => item.id === repoId)
+  const dir = state.workspace.dir
+  const submit = (): void => {
+    if (repo === undefined || dir === undefined || busy) return
+    onSubmit({ repo: repo.id, base: base.trim(), branch: branch.trim(), name: name.trim() })
+  }
+  const submitOnEnter = (event: { key: string }): void => { if (event.key === 'Enter') submit() }
+  if (dir === undefined || repos.length === 0) {
+    return (
+      <div className="dr__addForm">
+        <div className="dr__rowError">{dir === undefined ? '还没有设置工作区目录，设置后才能在这里新建工作区。' : '仓库清单里没有权限为「可改代码」或「可合并」的仓库。'}</div>
+        <div className="dr__formActions">
+          <button type="button" className="dr__btn dr__btn--ghost" onClick={onCancel}>取消</button>
+          {dir === undefined ? <button type="button" className="dr__btn dr__btn--primary" onClick={onOpenAdvanced}>去设置</button> : null}
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="dr__addForm">
+      <div className="dr__formGrid">
+        <label className="dr__field dr__field--full">仓库
+          <select className="dr__input dr__mono" value={repoId} disabled={busy} onChange={(event) => { setRepoId(event.target.value) }}>
+            {repos.map(item => <option key={item.id} value={item.id}>{item.key ?? item.url}</option>)}
+          </select>
+        </label>
+        <label className="dr__field">合入分支（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder={repo?.branch ?? '默认分支'} value={base} onChange={(event) => { setBase(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+        <label className="dr__field">推送分支（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder="dsh/随机名；已有分支会接着改" value={branch} onChange={(event) => { setBranch(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+        <label className="dr__field dr__field--full">目录名（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder={repo === undefined ? '' : `${defaultName(repo.url)}，重名时加编号`} value={name} onChange={(event) => { setName(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+      </div>
+      <div className="dr__rowSummary">建在 <span className="dr__mono">{dir}</span> 下，从合入分支的最新提交开始。</div>
+      <div className="dr__formActions">
+        <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onCancel}>取消</button>
+        <button type="button" className="dr__btn dr__btn--primary" disabled={busy || repo === undefined} onClick={submit}>{busy ? '新建中…' : '新建'}</button>
+      </div>
+    </div>
+  )
+}
+
+function WorkspaceSettings({ form, state, run, onError }: { form: FormProps; state: SettingsState; run: Run; onError: (text: string) => void }): JSX.Element {
+  const { current, defaults, errors, busy, edit } = form
+  const [dirDraft, setDirDraft] = useState<string | undefined>()
+  const saved = state.workspace.dir ?? ''
+  const dirValue = dirDraft ?? saved
+  const changed = dirValue.trim() !== '' && dirValue.trim() !== saved
+  const saveDir = (): void => {
+    const dir = dirValue.trim()
+    if (!changed || busy) return
+    void run(() => saveWorkspaceDir(dir), (next) => ({ kind: 'ok', text: `工作区目录已改为 ${next.workspace.dir ?? dir}` })).then((ok) => { if (ok) setDirDraft(undefined) })
+  }
+  const choose = (): void => {
+    void pickDirectory().then((path) => { if (path !== null) setDirDraft(path) }, (error: unknown) => { onError(messageOf(error)) })
+  }
+  const listening = state.workspace.proxyListening
+  return (
+    <Section title="工作区">
+      <Row label="工作区目录" summary="「工作区」里新建的工作区放在这个目录下，不存在会自动创建。会话里用工具新建的工作区放在会话自己的目录里，不受影响。" block>
+        <div className="dr__inline">
+          <input className="dr__input dr__mono" spellCheck={false} aria-label="工作区目录" placeholder="例如 /srv/dsh/workspaces" value={dirValue} disabled={!state.workspace.available} onChange={(event) => { setDirDraft(event.target.value) }} onKeyDown={(event) => { if (event.key === 'Enter') saveDir() }} />
+          {state.pickerAvailable ? <button type="button" className="dr__btn" disabled={busy || !state.workspace.available} onClick={choose}>选择…</button> : null}
+          {changed ? <button type="button" className="dr__btn dr__btn--primary" disabled={busy} onClick={saveDir}>保存</button> : null}
+          {state.workspace.dir === undefined || changed ? null : <button type="button" className="dr__link dr__link--small" disabled={busy} onClick={() => { void run(clearWorkspaceDir, '已清除工作区目录').then((ok) => { if (ok) setDirDraft(undefined) }) }}>清除</button>}
+        </div>
+      </Row>
+      <NumberRow field="proxyPort" {...form} />
+      <Row label="代理状态" summary="端口改动保存后代理立即换到新端口，已有工作区一起改过去。">
+        {listening === undefined ? <span className="dr__pill dr__pill--bad"><span className="dr__dot" />没有运行</span> : <span className="dr__pill dr__pill--ok"><span className="dr__dot" />监听 127.0.0.1:{listening}</span>}
+      </Row>
+      <Row label="提交姓名" summary="写进新工作区的 git 配置，和邮箱一起填；都留空时用主机令牌账号的名字和邮箱。" error={errors.commitName}>
+        <ResetLink shown={current.commitName !== defaults.commitName} busy={busy} onReset={() => { edit({ commitName: defaults.commitName }) }} />
+        <input className="dr__input" aria-label="提交姓名" placeholder="令牌账号的名字" value={current.commitName} disabled={busy} onChange={(event) => { edit({ commitName: event.target.value }) }} />
+      </Row>
+      <Row label="提交邮箱" error={errors.commitEmail}>
+        <ResetLink shown={current.commitEmail !== defaults.commitEmail} busy={busy} onReset={() => { edit({ commitEmail: defaults.commitEmail }) }} />
+        <input className="dr__input dr__mono" aria-label="提交邮箱" placeholder="令牌账号的邮箱" value={current.commitEmail} disabled={busy} onChange={(event) => { edit({ commitEmail: event.target.value }) }} />
+      </Row>
+    </Section>
   )
 }

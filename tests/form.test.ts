@@ -25,6 +25,14 @@ describe('settings form', () => {
     })
   })
 
+  it('saves the commit identity trimmed and rejects a half-filled or malformed one', () => {
+    const draft = toDraft(DEFAULT_SETTINGS)
+    const saved = fromDraft({ ...draft, commitName: ' Bot ', commitEmail: 'bot@example.com ' })
+    expect(saved).toMatchObject({ ok: true, settings: { workspace: { commitName: 'Bot', commitEmail: 'bot@example.com' } } })
+    expect(fromDraft({ ...draft, commitName: 'Bot' })).toEqual({ ok: false, errors: { commitEmail: expect.stringContaining('一起填') } })
+    expect(fromDraft({ ...draft, commitName: 'A <b>', commitEmail: 'a b@example.com' })).toEqual({ ok: false, errors: { commitName: expect.stringContaining('<'), commitEmail: expect.stringContaining('空白') } })
+  })
+
   it('compares drafts by the settings they save', () => {
     const draft = toDraft(DEFAULT_SETTINGS)
     expect(sameDraft(draft, toDraft(DEFAULT_SETTINGS))).toBe(true)

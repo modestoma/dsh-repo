@@ -21,7 +21,7 @@
  */
 
 import { randomBytes } from 'node:crypto'
-import { chmod, copyFile, lstat, mkdir, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, lstat, mkdir, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import type { CommitAuthor, CommitTrailer, WorkspaceFileChange, WorkspaceInfo, WorkspaceStatus } from '../contract.ts'
 import { RepoError } from '../errors.ts'
@@ -43,6 +43,18 @@ export interface WorkspaceGitOptions {
   readonly env?: Readonly<Record<string, string>>
   readonly signal?: AbortSignal
   readonly maxOutputBytes?: number
+}
+
+/** What the settings page shows about one workspace. */
+export interface WorkspaceSummary {
+  /** Local branch checked out now; absent on a detached head. */
+  readonly currentBranch?: string
+  /** Files with changes that are not committed, untracked files included. */
+  readonly uncommittedFiles: number
+  /** Commits on `HEAD` or a local branch that no remote-tracking branch and no base history holds. */
+  readonly unpushed: number
+  /** Latest git activity (add, commit, checkout, pull), or the creation time. */
+  readonly activityAt: string
 }
 
 /** Runs one git command inside a workspace directory, confined to it when a sandbox is available. */
@@ -339,6 +351,39 @@ export class WorkspaceManager {
         return await this.describe(record, signal, maxDiffBytes, timeoutMs)
       } catch (error) {
         throw gitFailure(error, `读取工作区 ${record.path} 的改动`)
+      }
+    })
+  }
+
+  /**
+   * A short account of a workspace for the settings page, without a diff.
+   * @param record - located workspace.
+   * @param timeoutMs - timeout of one git command.
+   * @returns the checked-out branch, the number of changed files not committed, the commits only this clone holds, and the time of its latest git activity.
+   */
+  async summary(record: WorkspaceRecord, timeoutMs: number): Promise<WorkspaceSummary> {
+    return await serialize(this.locks, record.id, async () => {
+      try {
+        let currentBranch: string | undefined
+        try {
+          currentBranch = (await this.inside(record, ['symbolic-ref', '--quiet', '--short', 'HEAD'], timeoutMs, undefined)).trim()
+        } catch (error) {
+          // `symbolic-ref --quiet` exits 1 on a detached head.
+          if (!(error instanceof GitError)) throw error
+        }
+        const changed = await this.inside(record, ['status', '--porcelain', '-z', '--no-renames', '--untracked-files=all'], timeoutMs, undefined)
+        const unpushed = await this.localOnly(record, undefined, timeoutMs)
+        // The index and the HEAD log change with every add, commit, checkout, and pull.
+        const times = await Promise.all(['index', join('logs', 'HEAD')].map(async name => await stat(join(record.path, '.git', name)).then(info => info.mtimeMs, () => 0)))
+        const latest = Math.max(...times, Date.parse(record.createdAt))
+        return {
+          ...currentBranch === undefined ? {} : { currentBranch },
+          uncommittedFiles: changed.split('\0').filter(entry => entry !== '').length,
+          unpushed,
+          activityAt: new Date(latest).toISOString(),
+        }
+      } catch (error) {
+        throw gitFailure(error, `读取工作区 ${record.path} 的状态`)
       }
     })
   }

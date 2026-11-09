@@ -14,8 +14,9 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { RepoService } from '../service.ts'
 import type { DirectoryPicker } from './directory-picker.ts'
 import { hostDirectoryPicker } from './directory-picker.ts'
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE } from './contract.ts'
-import type { LocalSyncStatus, RepoInput, RepoRow, SettingsState, WatchInfo } from './contract.ts'
+import type { WorkspacePanel } from '../workspace/panel.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE, WORKSPACE_DIR_ROUTE, WORKSPACES_ROUTE } from './contract.ts'
+import type { LocalSyncStatus, RepoInput, RepoRow, SettingsState, WatchInfo, WorkspaceCreateInput } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -33,6 +34,8 @@ const hostUrlSchema = z.object({ url: z.string() }).strict()
 const hostTokenSchema = z.object({ url: z.string(), value: z.string() }).strict()
 const mirrorSchema = z.object({ dir: z.string() }).strict()
 const watchIdSchema = z.object({ id: z.string() }).strict()
+const workspaceCreateSchema = z.object({ repo: z.string(), base: z.string().optional(), branch: z.string().optional(), name: z.string().optional() }).strict()
+const workspaceRemoveSchema = z.object({ id: z.string(), force: z.boolean().optional() }).strict()
 
 /** The PR/MR watcher as the settings page uses it. */
 export interface WatchList {
@@ -55,6 +58,25 @@ const repoFields = {
 const repoAddSchema = z.object(repoFields).strict()
 const repoUpdateSchema = z.object({ id: z.string(), ...repoFields }).strict()
 const repoIdSchema = z.object({ id: z.string() }).strict()
+
+/** No workspaces: none are listed, and creating one is refused. */
+const NO_WORKSPACES: WorkspacePanel = {
+  dir: () => undefined,
+  setDir: async () => { throw new HttpError(404, '当前组合没有工作区') },
+  proxyPort: () => undefined,
+  rows: async () => [],
+  create: async () => { throw new HttpError(404, '当前组合没有工作区') },
+  remove: async () => { throw new HttpError(404, '当前组合没有工作区') },
+}
+
+function workspaceInput(body: z.output<typeof workspaceCreateSchema>): WorkspaceCreateInput {
+  return {
+    repo: body.repo,
+    ...body.base === undefined ? {} : { base: body.base },
+    ...body.branch === undefined ? {} : { branch: body.branch },
+    ...body.name === undefined ? {} : { name: body.name },
+  }
+}
 
 /** The local syncs as the settings page uses them. */
 export interface SyncList {
@@ -221,9 +243,12 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
  * @param picker - the Host's directory dialog.
  * @param watches - the PR/MR watcher.
  * @param syncs - the local syncs.
- * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, whether a directory dialog is available, the watched PRs/MRs, the catalog with local sync status, and the registered features.
+ * @param workspaces - the workspaces.
+ * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, whether a directory dialog is available, the watched PRs/MRs, the catalog with local sync status, the registered features, and the workspace directory and proxy port.
  */
-export async function settingsState(service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): Promise<SettingsState> {
+export async function settingsState(service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS, workspaces: WorkspacePanel = NO_WORKSPACES): Promise<SettingsState> {
+  const dir = workspaces.dir()
+  const listening = workspaces.proxyPort()
   return {
     hosts: await service.listHosts(),
     mirror: service.mirrorSettings(),
@@ -235,6 +260,11 @@ export async function settingsState(service: RepoService, picker: DirectoryPicke
     watchAvailable: watches.active,
     repos: repoRows(service, syncs),
     features: service.catalog.registeredFeatures(),
+    workspace: {
+      available: workspaces !== NO_WORKSPACES,
+      ...dir === undefined ? {} : { dir },
+      ...listening === undefined ? {} : { proxyListening: listening },
+    },
   }
 }
 
@@ -246,10 +276,11 @@ export async function settingsState(service: RepoService, picker: DirectoryPicke
  * @param picker - the Host's directory dialog.
  * @param watches - the PR/MR watcher.
  * @param syncs - the local syncs.
+ * @param workspaces - the workspaces.
  * @returns disposer removing every route.
  */
-export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): () => void {
-  const state = (): Promise<SettingsState> => settingsState(service, picker, watches, syncs)
+export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS, workspaces: WorkspacePanel = NO_WORKSPACES): () => void {
+  const state = (): Promise<SettingsState> => settingsState(service, picker, watches, syncs, workspaces)
   const reply = async (res: ServerResponse): Promise<void> => { sendJson(res, 200, { ok: true, state: await state() }) }
   const disposers = [
     server.register({
@@ -338,6 +369,30 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
     }),
     server.register({
       kind: 'exact',
+      path: WORKSPACES_ROUTE,
+      handler: guarded(gate, ['GET', 'POST', 'DELETE'], async (req, res) => {
+        const method = req.method?.toUpperCase()
+        if (method === 'GET') {
+          sendJson(res, 200, { ok: true, workspaces: await workspaces.rows() })
+        } else if (method === 'POST') {
+          sendJson(res, 200, { ok: true, workspace: await workspaces.create(workspaceInput(await readJsonBody(req, workspaceCreateSchema))) })
+        } else {
+          const { id, force } = await readJsonBody(req, workspaceRemoveSchema)
+          await workspaces.remove(id, force === true)
+          sendJson(res, 200, { ok: true, workspaces: await workspaces.rows() })
+        }
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: WORKSPACE_DIR_ROUTE,
+      handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
+        await workspaces.setDir(req.method?.toUpperCase() === 'DELETE' ? undefined : (await readJsonBody(req, mirrorSchema)).dir)
+        await reply(res)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
       path: MIRROR_USAGE_ROUTE,
       handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await service.mirrorUsage()) }),
     }),
@@ -367,13 +422,14 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
  * @param service - the `dshRepos` implementation.
  * @param watches - the PR/MR watcher.
  * @param syncs - the local syncs.
+ * @param workspaces - the workspaces.
  */
-export function mountSettingsRoutes(ctx: HostContext, service: RepoService, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): void {
+export function mountSettingsRoutes(ctx: HostContext, service: RepoService, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS, workspaces: WorkspacePanel = NO_WORKSPACES): void {
   const attach = (webCtx: HostContext): void => {
     const server = webCtx.get?.('webServer') as HostWebServer | undefined
     const gate = webCtx.get?.('connection') as HostRequestGate | undefined
     if (server === undefined || gate === undefined) return
-    webCtx.effect(() => registerSettingsRoutes(server, gate, service, hostDirectoryPicker(webCtx), watches, syncs), 'dsh-repo: settings routes')
+    webCtx.effect(() => registerSettingsRoutes(server, gate, service, hostDirectoryPicker(webCtx), watches, syncs, workspaces), 'dsh-repo: settings routes')
   }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer', 'connection'], attach)

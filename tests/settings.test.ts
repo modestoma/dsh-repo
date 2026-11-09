@@ -5,11 +5,11 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { HostContext, HostWebServer } from '../src/host.ts'
 import * as plugin from '../src/index.ts'
 import type { RepoService } from '../src/service.ts'
-import type { MirrorUsage, SettingsState } from '../src/settings/contract.ts'
+import type { MirrorUsage, SettingsState, WorkspaceRow } from '../src/settings/contract.ts'
 import { credentials } from './helpers.ts'
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
@@ -299,9 +299,61 @@ describe('settings routes', () => {
     expect(() => service.resolve('https://gone.example.com/a/b')).toThrow(expect.objectContaining({ code: 'not-allowed' }))
   })
 
+  it('creates workspaces in the chosen directory, lists them with their unsaved work, and removes them after confirmation', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'dsh-repo-settings-origin-'))
+    const author = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com' }
+    execFileSync('git', ['init', '--quiet', '--initial-branch=main'], { cwd: repo })
+    writeFileSync(join(repo, 'README.md'), 'hello\n')
+    execFileSync('git', ['add', '.'], { cwd: repo })
+    execFileSync('git', ['commit', '--quiet', '-m', 'init'], { cwd: repo, env: author })
+    const { call, json } = await serve()
+    const state = async () => (await call('/dsh-repo/state')).body as unknown as SettingsState
+    await vi.waitFor(async () => { expect((await state()).workspace.proxyListening).toBeGreaterThan(0) })
+    expect((await state()).workspace).toMatchObject({ available: true })
+    expect((await call('/dsh-repo/mirror', json('PUT', { dir: mkdtempSync(join(tmpdir(), 'dsh-repo-settings-mirrors-')) }))).status).toBe(200)
+    const added = await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', features: [] }))
+    const id = (added.body.state as SettingsState).repos[0]!.id
+
+    // No directory yet: creation is refused and says where to set one.
+    expect(await call('/dsh-repo/workspaces', json('POST', { repo: id }))).toMatchObject({ status: 400, body: { error: expect.stringContaining('工作区目录') } })
+    const parent = join(mkdtempSync(join(tmpdir(), 'dsh-repo-settings-ws-')), 'nested')
+    expect((await call('/dsh-repo/workspace-dir', json('PUT', { dir: 'relative' }))).status).toBe(400)
+    const saved = await call('/dsh-repo/workspace-dir', json('PUT', { dir: parent }))
+    expect((saved.body.state as SettingsState).workspace.dir).toBe(parent)
+    expect(existsSync(parent)).toBe(true)
+    expect((await call('/dsh-repo/workspaces')).body).toEqual({ ok: true, workspaces: [] })
+
+    expect((await call('/dsh-repo/workspaces', json('POST', { repo: id, name: '../x' }))).status).toBe(400)
+    expect((await call('/dsh-repo/workspaces', json('POST', { repo: '000000000000' }))).status).toBe(404)
+    const created = await call('/dsh-repo/workspaces', json('POST', { repo: id, branch: 'fix/a' }))
+    expect(created.status).toBe(200)
+    const row = created.body.workspace as WorkspaceRow
+    const name = repo.split('/').pop()!
+    expect(row).toMatchObject({ url: repo, repo, path: join(parent, name), base: 'main', branch: 'fix/a', currentBranch: 'fix/a', uncommittedFiles: 0, unpushed: 0 })
+    expect(row).not.toHaveProperty('session')
+    expect(row).not.toHaveProperty('mrs')
+    expect(readFileSync(join(row.path, 'README.md'), 'utf8')).toBe('hello\n')
+    // The default name is taken now, so the next one is numbered.
+    const second = (await call('/dsh-repo/workspaces', json('POST', { repo: id }))).body.workspace as WorkspaceRow
+    expect(second.path).toBe(join(parent, `${name}-2`))
+
+    writeFileSync(join(row.path, 'a.txt'), 'a\n')
+    const listed = (await call('/dsh-repo/workspaces')).body.workspaces as WorkspaceRow[]
+    expect(listed.map(item => item.path)).toEqual([row.path, second.path])
+    expect(listed[0]).toMatchObject({ uncommittedFiles: 1, unpushed: 0, activityAt: expect.any(String) })
+    expect(await call('/dsh-repo/workspaces', json('DELETE', { id: row.id }))).toMatchObject({ status: 409, body: { error: expect.stringContaining('未提交') } })
+    expect(existsSync(row.path)).toBe(true)
+    const removed = await call('/dsh-repo/workspaces', json('DELETE', { id: row.id, force: true }))
+    expect((removed.body.workspaces as WorkspaceRow[]).map(item => item.id)).toEqual([second.id])
+    expect(existsSync(row.path)).toBe(false)
+    expect((await call('/dsh-repo/workspaces', json('DELETE', { id: row.id }))).status).toBe(404)
+
+    expect(((await call('/dsh-repo/workspace-dir', { method: 'DELETE' })).body.state as SettingsState).workspace).not.toHaveProperty('dir')
+  })
+
   it('removes its routes when the Web server goes away', async () => {
     const { routes, disposers } = await serve()
-    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/mirror-usage', '/dsh-repo/pick-directory', '/dsh-repo/repos', '/dsh-repo/repos/sync', '/dsh-repo/settings', '/dsh-repo/state', '/dsh-repo/watches'])
+    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/mirror-usage', '/dsh-repo/pick-directory', '/dsh-repo/repos', '/dsh-repo/repos/sync', '/dsh-repo/settings', '/dsh-repo/state', '/dsh-repo/watches', '/dsh-repo/workspace-dir', '/dsh-repo/workspaces'])
     for (const dispose of disposers) dispose()
     expect(routes.size).toBe(0)
   })
