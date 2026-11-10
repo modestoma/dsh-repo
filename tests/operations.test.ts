@@ -157,6 +157,16 @@ describe('operation registry', () => {
     expect(all.get('repo_workspace_create')!.isConcurrencySafe?.({})).toBe(false)
   })
 
+  it('exposes parameters as plain JSON with no member a JSON round trip would drop', () => {
+    const hidden = (value: unknown, path: string): string[] => {
+      if (typeof value !== 'object' || value === null) return []
+      const own = Reflect.ownKeys(value).filter(key => !(Array.isArray(value) && key === 'length'))
+      const dropped = own.filter(key => typeof key !== 'string' || !Object.prototype.propertyIsEnumerable.call(value, key)).map(key => `${path}.${String(key)}`)
+      return [...dropped, ...Object.entries(value).flatMap(([key, child]) => hidden(child, `${path}.${key}`))]
+    }
+    for (const [name, tool] of tools(fakeService())) expect(hidden(tool.parameters, name)).toEqual([])
+  })
+
   it('rejects invalid arguments and surfaces RepoError codes', async () => {
     const getIssue = vi.fn(async () => { throw new RepoError('not-found', '读取 issue #9 失败') })
     const tool = tools(fakeService({ forge: { getIssue } })).get('repo_issue_get')!
