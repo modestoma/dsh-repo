@@ -28,7 +28,7 @@ import type { AuthorizeLevel, RepoAccess } from './contract.ts'
 import type { RepoSettings } from './config.ts'
 import { allows } from './catalog/entry.ts'
 import { RepoError } from './errors.ts'
-import { COMMIT_ID } from './refs.ts'
+import { COMMIT_ID, isCommitId } from './refs.ts'
 import { authorize } from './events.ts'
 import type { ParallelDispatch } from './events.ts'
 import type { Agent, HostApproval, WorkingDirectoryService } from './host.ts'
@@ -126,6 +126,31 @@ function stateSuffix(state: string | undefined): string {
 }
 
 /** Keep watches from reporting a comment dsh-repo posted; the comment exists, so a failure only loses that. */
+/**
+ * The commit a snapshot shows. A full commit id already in the mirror is used
+ * without fetching, so a commit synced earlier stays readable while the remote
+ * is unreachable; any other ref, or a commit the mirror lacks, syncs first.
+ * @param service - the engine.
+ * @param url - catalog address.
+ * @param ref - requested branch, tag, or full commit id; undefined means `branch`.
+ * @param branch - the branch the catalog entry follows; undefined means the remote's default branch.
+ * @param signal - cancellation.
+ * @returns the full commit id.
+ * @throws {RepoError} the mirror's sync and lookup failures.
+ */
+async function snapshotTarget(service: RepoService, url: string, ref: string | undefined, branch: string | undefined, signal: AbortSignal): Promise<string> {
+  if (ref !== undefined && isCommitId(ref)) {
+    try {
+      return (await service.mirrors.store.existing(url, ref, signal), ref)
+    } catch (error) {
+      // A commit the mirror does not hold yet is fetched by the sync below.
+      if (!(error instanceof RepoError && error.code === 'not-found')) throw error
+    }
+  }
+  const mirror = await service.mirrors.sync(url, { ...ref !== undefined || branch === undefined ? {} : { branch }, signal })
+  return ref === undefined ? mirror.commit : await service.mirrors.store.resolveRef(url, ref, signal)
+}
+
 async function rememberComment(deps: OperationDeps, repoTarget: string, mr: number, commentId: string): Promise<void> {
   try {
     await deps.watch?.ownComment(repoTarget, mr, commentId)
@@ -480,14 +505,12 @@ export const OPERATIONS: readonly Operation[] = [
     tool: 'repo_snapshot_acquire',
     method: 'snapshotAcquire',
     access: 'read',
-    description: 'Get a read-only local copy (plain files, no .git) of a repository at a branch, tag, or commit, fetched fresh from the remote, to search and read the whole code base with the ordinary file and shell tools. Snapshots of the same commit are shared; do not write into one. To change code, use repo_workspace_create instead.',
+    description: 'Get a read-only local copy (plain files, no .git) of a repository at a branch, tag, or commit, to search and read the whole code base with the ordinary file and shell tools. Branches and tags are fetched fresh from the remote; a full commit id already fetched earlier is used without contacting the remote. Snapshots of the same commit are shared; do not write into one. To change code, use repo_workspace_create instead.',
     schema: z.object({ repo, ref: z.string().min(1).optional().describe('Branch, tag, or full commit id; default: the branch the catalog follows, or the default branch') }).strict(),
     run: async (args, deps, caller) => {
       const { service } = deps
       const entry = service.catalog.require(args.repo, 'read')
-      const branch = args.ref === undefined ? entry.branch : undefined
-      const mirror = await service.mirrors.sync(entry.url, { ...branch === undefined ? {} : { branch }, signal: caller.signal })
-      const target = args.ref === undefined ? mirror.commit : await service.mirrors.store.resolveRef(entry.url, args.ref, caller.signal)
+      const target = await snapshotTarget(service, entry.url, args.ref, entry.branch, caller.signal)
       const lease = await service.mirrors.store.acquire(entry.url, target, caller.signal)
       if (caller.origin === 'service') return { repo: entry.url, commit: lease.commit, path: lease.dir, release: lease.release }
       deps.leases.hold(`${sessionOf(caller) ?? ''}\u0000${entry.url}`, lease.release)

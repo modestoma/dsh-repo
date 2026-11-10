@@ -311,6 +311,22 @@ describe('service calls', () => {
     leases.releaseAll()
     expect(release).toHaveBeenCalledTimes(2)
   })
+
+  it('use a full commit id already in the mirror without fetching, and fetch a commit the mirror lacks', async () => {
+    const held = 'e'.repeat(40)
+    const sync = vi.fn(async () => { throw new RepoError('unavailable', 'remote unreachable') })
+    const existing = vi.fn(async (_url: string, commit: string) => {
+      if (commit !== held) throw new RepoError('not-found', `no ${commit}`)
+      return '/mirror'
+    })
+    const acquire = vi.fn(async (_url: string, commit: string) => ({ commit, dir: '/snap', release: () => {} }))
+    const repos = api(fakeService({ mirrors: { sync }, mirrorStore: { existing, acquire } }))
+    await expect(repos.snapshotAcquire({ repo: 'github.com/a/b', ref: held })).resolves.toMatchObject({ commit: held, path: '/snap' })
+    expect(sync).not.toHaveBeenCalled()
+    await expect(repos.snapshotAcquire({ repo: 'github.com/a/b', ref: 'f'.repeat(40) })).rejects.toMatchObject({ code: 'unavailable' })
+    expect(sync).toHaveBeenCalledTimes(1)
+    expect(acquire).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('workspace operations', () => {

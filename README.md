@@ -132,7 +132,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | `repo_ci_get` | 一次运行的作业、阶段、失败原因、耗时、GitHub 步骤、GitLab 下游流水线；失败的运行附带失败用例或错误注解 | 否 |
 | `repo_ci_log` | 作业日志：默认返回末尾，`search` 返回命中行和上下文，可按 `section` 过滤、用 `beforeLine` 往前翻 | 否 |
 | `repo_ci_retry` / `repo_ci_cancel` | 重试一次运行的失败作业或单个作业；取消一次运行或单个作业（单个作业只限 GitLab） | 是 |
-| `repo_snapshot_acquire` | 某个分支、tag 或提交的只读检出目录（默认清单里的分支）；同一会话对同一仓库再取一次时释放上一份，12 小时后自动释放 | 否 |
+| `repo_snapshot_acquire` | 某个分支、tag 或提交的只读检出目录（默认清单里的分支）；分支和 tag 先从远端拉取，镜像里已有的完整提交 id 直接使用、不连远端；同一会话对同一仓库再取一次时释放上一份，12 小时后自动释放 | 否 |
 | `repo_workspace_create` | 新建工作区并把会话的工作目录切过去，见[改代码](#改代码) | 否 |
 | `repo_workspace_list` | 本会话创建的、或在本会话目录里的工作区 | 否 |
 | `repo_workspace_status` | 工作区相对起点提交的改动：文件与增删行数、提交、未推送的提交数、diff | 否 |
