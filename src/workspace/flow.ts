@@ -97,7 +97,7 @@ function configuredIdentity(settings: RepoSettings): CommitAuthor | undefined {
 async function openMrsFrom(service: RepoService, repo: string, branch: string, signal: AbortSignal): Promise<readonly MrInfo[]> {
   const found: MrInfo[] = []
   for (let next: number | undefined = 1; next !== undefined;) {
-    const result = await service.forge.listMrs(repo, { state: 'open', sourceBranch: branch, page: next, perPage: 100, signal })
+    const result = await service.forge.listMrs(repo, { state: 'open', sourceBranch: branch, page: next, perPage: service.settings.current.limits.maxPerPage, signal })
     found.push(...result.items)
     next = result.nextPage
   }

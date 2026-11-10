@@ -419,6 +419,13 @@ describe('workspace operations', () => {
     })
     expect(track).toHaveBeenCalledWith({ repo: 'https://github.com/a/b', mr, session: 'session-1', source: 'created', pushed: 'd'.repeat(40) })
 
+    expect(listMrs).toHaveBeenCalledWith('https://github.com/a/b', expect.objectContaining({ state: 'open', sourceBranch: 'fix/a', perPage: testSettings().limits.maxPerPage }))
+
+    // The lookup pages by the configured maximum page size.
+    const smallPages = fakeService({ forge: { listMrs, createMr }, hosts: { tokenIdentity: async () => ({ name: 'bot', email: 'bot@example.com' }) } }, () => testSettings({ limits: { perPage: 20, maxPerPage: 50 } }))
+    await tools(smallPages, { approval: { request }, workingDirectory, workspaces }).get('repo_workspace_push')!.execute({ message: 'fix: c' }, run)
+    expect(listMrs).toHaveBeenLastCalledWith('https://github.com/a/b', expect.objectContaining({ perPage: 50 }))
+
     // A failed PR/MR lookup is reported; the push already happened.
     listMrs.mockRejectedValueOnce(new RepoError('forbidden', 'no access'))
     expect(await tools(service, { approval: { request }, workingDirectory, workspaces }).get('repo_workspace_push')!.execute({ message: 'fix: b' }, run)).toMatchObject({ openMrs: [], watching: false, mrError: 'no access' })
