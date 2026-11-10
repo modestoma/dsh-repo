@@ -15,5 +15,5 @@
     "forceConsistentCasingInFileNames": true,
     "noUncheckedIndexedAccess": true
   },
-  "include": ["src/client", "src/settings/contract.ts", "src/contract.ts"]
+  "include": ["src/client", "src/settings/contract.ts", "src/settings/branch-names.ts", "src/contract.ts"]
 }

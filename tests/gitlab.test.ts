@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { DEFAULT_SETTINGS } from '../src/config.ts'
 import { GitlabProvider } from '../src/providers/gitlab.ts'
 import { createService, fakeHttp, testConfig, testSettings, TOKENS } from './helpers.ts'
 
@@ -73,6 +74,16 @@ describe('GitLab provider', () => {
     expect(requests.find(request => request.method === 'POST')?.body).toMatchObject({ source_branch: 'f', target_branch: 'main', title: 'Draft: T' })
     expect((await service.forge.listMrs(REPO, { state: 'merged' })).items[0]?.state).toBe('merged')
     expect(requests.at(-1)?.url.searchParams.get('state')).toBe('merged')
+  })
+
+  it('opens a merge request into the catalog baseline branch when no target is given', async () => {
+    const { requests } = fakeHttp([
+      { method: 'POST', path: `${API}/merge_requests`, reply: { status: 201, body: mr({ target_branch: 'dev' }) } },
+    ])
+    const service = createService(testConfig(), TOKENS, DEFAULT_SETTINGS, [{ id: '000000000000', url: REPO, base: 'dev', access: 'merge', features: [], addedAt: '2026-11-09T00:00:00.000Z' }])
+    await service.forge.createMr(REPO, { title: 'T', sourceBranch: 'f' })
+    expect(requests.find(request => request.method === 'POST')?.body).toMatchObject({ source_branch: 'f', target_branch: 'dev' })
+    expect(requests.some(request => request.url.pathname === API)).toBe(false)
   })
 
   it('lists merge requests from a source branch of this project only, leaving out forks with the same branch name', async () => {

@@ -58,7 +58,7 @@ async function createIssueWithListeners(listeners: Array<(event: AuthorizeEvent)
     },
   }
   plugin.apply(withEvents, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
-  await provided(map).api.repoAdd({ repo: 'https://github.com/a/b', access: 'write' })
+  await provided(map).engine.catalog.add({ url: 'https://github.com/a/b', access: 'write', features: [] })
   const tool = registered.find(entry => entry.definition.name === 'repo_issue_create')!.definition
   const agent = { id: 'a1', session: { header: { id: 's1' } } }
   const outcome = tool.execute({ repo: 'github.com/a/b', title: 'Bug' }, { signal: new AbortController().signal, agent })
@@ -93,18 +93,19 @@ describe('plugin', () => {
     expect([...plugin.inject]).toEqual(['tools', 'credentials'])
   })
 
-  it('provides dshRepos v6, starts the local git proxy, and offers tools once the catalog holds a repository', async () => {
+  it('provides dshRepos v7, starts the local git proxy, and offers tools once the catalog holds a repository', async () => {
     const { ctx, registered, provided: map, env } = context()
     plugin.apply(ctx, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
     const { api } = provided(map)
     expect(api).toBeInstanceOf(DshReposApi)
-    expect(api.version).toBe(6)
+    expect(api.version).toBe(7)
     await vi.waitFor(() => { expect(api.settingsGet().proxyListening).toBeGreaterThan(0) })
     expect(api.settingsGet()).toMatchObject({ mirrorDir: undefined, proxyPort: 0, commitName: '', commitEmail: '', workspaceDir: undefined })
-    expect(registered.map(entry => entry.definition.name)).toHaveLength(34)
+    expect(registered.map(entry => entry.definition.name)).toHaveLength(33)
+    expect(registered.map(entry => entry.definition.name)).not.toContain('repo_add')
     const offered = async (name: string) => await registered.find(entry => entry.definition.name === name)!.when!()
-    expect([await offered('repo_list'), await offered('repo_add')]).toEqual([false, true])
-    await api.repoAdd({ repo: 'https://github.com/a/b' })
+    expect(await offered('repo_list')).toBe(false)
+    await provided(map).engine.catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [] })
     expect(await offered('repo_list')).toBe(true)
   })
 
@@ -132,12 +133,13 @@ describe('plugin', () => {
     const { ctx, registered, provided: map, info, env } = context()
     plugin.apply(ctx, undefined, { env })
     const { api } = provided(map)
-    expect(registered.length).toBe(34)
+    expect(registered.length).toBe(33)
     expect(await registered[0]?.when?.()).toBe(false)
     expect(info).toHaveBeenCalled()
-    await expect(api.repoAdd({ repo: 'https://code.example.com/team/app' })).rejects.toMatchObject({ code: 'not-allowed' })
+    const { engine } = provided(map)
+    await expect(engine.catalog.add({ url: 'https://code.example.com/team/app', access: 'read', features: [] })).rejects.toMatchObject({ code: 'not-allowed' })
     await api.hostAdd({ url: 'https://code.example.com' })
-    await api.repoAdd({ repo: 'https://code.example.com/team/app' })
+    await engine.catalog.add({ url: 'https://code.example.com/team/app', access: 'read', features: [] })
     expect(await registered[0]?.when?.()).toBe(true)
     expect(() => plugin.apply(context().ctx, { hosts: 'github.com' })).toThrow(/配置不合法/)
   })
@@ -154,7 +156,7 @@ describe('plugin', () => {
     await service.catalog.update(entry.id, { url: entry.url, access: 'merge', features: [] })
     expect(await offered('repo_mr_merge')).toBe(true)
     await service.settings.update({ tools: { writes: 'off' } })
-    expect([await offered('repo_get'), await offered('repo_workspace_push'), await offered('repo_mr_merge'), await offered('repo_add')]).toEqual([true, false, false, false])
+    expect([await offered('repo_get'), await offered('repo_workspace_push'), await offered('repo_mr_merge')]).toEqual([true, false, false])
     await service.settings.update({ tools: { enabled: false } })
     expect(await offered('repo_get')).toBe(false)
   })
@@ -163,8 +165,8 @@ describe('plugin', () => {
     const services: Record<string, unknown> = {}
     const { ctx, registered, provided: map, env } = context()
     plugin.apply({ ...ctx, get: name => services[name] }, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
-    const { api, engine } = provided(map)
-    await api.repoAdd({ repo: 'https://github.com/a/b' })
+    const { engine } = provided(map)
+    await engine.catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [] })
     const offered = async () => await registered.find(entry => entry.definition.name === 'repo_mr_watch')!.when!()
     expect(await offered()).toBe(false)
     services.sessionController = { resolveAgent: async () => ({ error: new Error('unused') }) }

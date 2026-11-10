@@ -60,12 +60,14 @@ export interface SyncRecord {
 /**
  * The enabled local syncs of catalog entries.
  * @param entries - catalog entries.
- * @returns one record for each entry whose local sync is enabled, following the entry's branch.
+ * @returns one record for each entry whose local sync is enabled, following its own branch or else the entry's baseline branch.
  */
 export function syncRecords(entries: readonly CatalogEntry[]): SyncRecord[] {
-  return entries.flatMap(entry => entry.localSync?.enabled === true
-    ? [{ id: entry.id, url: entry.url, ...entry.branch === undefined ? {} : { branch: entry.branch }, dir: entry.localSync.dir, intervalMinutes: entry.localSync.intervalMinutes }]
-    : [])
+  return entries.flatMap((entry) => {
+    if (entry.localSync?.enabled !== true) return []
+    const branch = entry.localSync.branch ?? entry.base
+    return [{ id: entry.id, url: entry.url, ...branch === undefined ? {} : { branch }, dir: entry.localSync.dir, intervalMinutes: entry.localSync.intervalMinutes }]
+  })
 }
 
 /** The mirror calls a sync makes. */

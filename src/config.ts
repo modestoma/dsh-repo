@@ -12,6 +12,7 @@ import type { ForgeKind } from './contract.ts'
 import { RepoError } from './errors.ts'
 import { forgeKindInfo, MAX_IDENTITY_LENGTH, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS } from './settings/contract.ts'
 import type { RepoSettingsWire } from './settings/contract.ts'
+import { branchRulesProblem, DEFAULT_BRANCH_TEMPLATE, patternProblem, templateProblem } from './settings/branch-names.ts'
 
 
 /** An integer setting within its {@link SETTING_BOUNDS}. */
@@ -90,7 +91,18 @@ const workspaceSchema = z.object({
   commitName: z.string().trim().max(MAX_IDENTITY_LENGTH).refine(value => !/[<>\n]/.test(value), '提交姓名不能包含 < > 或换行').default(''),
   /** Commit email written into every new workspace's git configuration; empty uses the host token account's email. */
   commitEmail: z.string().trim().max(MAX_IDENTITY_LENGTH).refine(value => !/[<>\s]/.test(value), '提交邮箱不能包含 < > 或空白').default(''),
-}).strict()
+  /** Template of the branch a new workspace pushes to when none is given; see `dsh-repo/settings/branch-names`. A catalog entry may replace it. */
+  branchTemplate: z.string().trim().default(DEFAULT_BRANCH_TEMPLATE),
+  /** Regular expression every new branch of a workspace must match; empty = no rule. A catalog entry may replace it. */
+  branchPattern: z.string().trim().default(''),
+}).strict().superRefine((workspace, issues) => {
+  const template = templateProblem(workspace.branchTemplate)
+  if (template !== undefined) issues.addIssue({ code: 'custom', path: ['branchTemplate'], message: template })
+  const pattern = patternProblem(workspace.branchPattern)
+  if (pattern !== undefined) issues.addIssue({ code: 'custom', path: ['branchPattern'], message: pattern })
+  const both = template === undefined && pattern === undefined ? branchRulesProblem(workspace.branchTemplate, workspace.branchPattern) : undefined
+  if (both !== undefined) issues.addIssue({ code: 'custom', path: ['branchPattern'], message: both })
+})
 
 const toolsSchema = z.object({
   /** Whether model tools are offered at all; false leaves only the `dshRepos` service. */

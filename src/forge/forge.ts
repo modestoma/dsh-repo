@@ -11,6 +11,7 @@
 
 import type { CallOptions, CiActionResult, CiJob, CiJobLog, MergedBranchDeletion, MergeMethod, MrInfo, MrState, Page, RepoAccess, RepoRef, RepoTarget } from '../contract.ts'
 import type { RepoCatalog } from '../catalog/catalog.ts'
+import type { CatalogEntry } from '../catalog/entry.ts'
 import { readLog } from '../ci/log.ts'
 import type { RepoSettings } from '../config.ts'
 import { RepoError, toRepoError } from '../errors.ts'
@@ -49,6 +50,7 @@ export interface MrCreateFields extends CallOptions {
   readonly title: string
   readonly body?: string
   readonly sourceBranch: string
+  /** Default: the catalog entry's baseline branch, else the remote's default branch. */
   readonly targetBranch?: string
   readonly draft?: boolean
   readonly labels?: readonly string[]
@@ -346,8 +348,8 @@ export class Forge {
     requireText(change.title, '标题')
     requireBranch(change.sourceBranch, '源分支名')
     if (change.targetBranch !== undefined) requireBranch(change.targetBranch, '目标分支名')
-    return await this.run(repo, change, '创建 PR/MR', 'write', async (provider, ref, call) => {
-      const targetBranch = change.targetBranch ?? (await provider.repoInfo(ref, call)).defaultBranch
+    return await this.run(repo, change, '创建 PR/MR', 'write', async (provider, ref, call, entry) => {
+      const targetBranch = change.targetBranch ?? entry.base ?? (await provider.repoInfo(ref, call)).defaultBranch
       if (targetBranch === change.sourceBranch) throw new RepoError('invalid', '源分支和目标分支不能相同')
       const { signal: _signal, ...fields } = change
       return await provider.createMr(ref, { ...fields, targetBranch, draft: change.draft === true, deleteSourceBranch: change.deleteSourceBranch === true }, call)
@@ -403,14 +405,15 @@ export class Forge {
     return { page, perPage }
   }
 
-  private async run<T>(repo: RepoTarget, options: CallOptions, what: string, level: RepoAccess, body: (provider: Provider, ref: RepoRef, call: Call) => Promise<T>): Promise<T> {
+  private async run<T>(repo: RepoTarget, options: CallOptions, what: string, level: RepoAccess, body: (provider: Provider, ref: RepoRef, call: Call, entry: CatalogEntry) => Promise<T>): Promise<T> {
     const settings = this.deps.settings()
     if (level !== 'read') requireWritesOn(settings, what)
-    const { spec, ...ref } = this.deps.catalog.open(repo, level).target
+    const { entry, target } = this.deps.catalog.open(repo, level)
+    const { spec, ...ref } = target
     const deadline = AbortSignal.timeout(settings.timeoutMs)
     const signal = options.signal === undefined ? deadline : AbortSignal.any([options.signal, deadline])
     try {
-      return await body(this.deps.hosts.provider(spec), ref, { signal, limits: settings.limits })
+      return await body(this.deps.hosts.provider(spec), ref, { signal, limits: settings.limits }, entry)
     } catch (error) {
       throw toRepoError(error, `${what}（${ref.host}/${ref.path}）`)
     }

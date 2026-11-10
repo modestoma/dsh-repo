@@ -6,7 +6,7 @@
 
 ## 项目状态
 
-测试版：提供统一接口（服务版本 6）、模型工具、运行时主机管理、仓库清单、本地镜像、工作区与本机 git 代理、PR/MR 跟踪、本地同步和左侧栏「代码仓库」设置页。接口仍可能调整。
+测试版：提供统一接口（服务版本 7）、模型工具、运行时主机管理、仓库清单、本地镜像、工作区与本机 git 代理、PR/MR 跟踪、本地同步和左侧栏「代码仓库」设置页。接口仍可能调整。
 
 ## 安装
 
@@ -48,8 +48,8 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | 主机 | 添加（类型、地址、GitHub 接口地址、别名、令牌）、删除主机，保存或清除令牌 | 无 | 立即 |
 | 高级 | 镜像目录（必须设置；不能在 `$DSH_HOME` 或 `/tmp` 下） | 无 | 立即 |
 | 高级 | 镜像占用：镜像目录里每个仓库占用的空间和最近拉取时间，以及快照和其他文件的合计（只读） | — | — |
-| 仓库 | 添加、修改、删除清单中的仓库：地址、分支、权限、功能开关、本地同步开关与本地目录、同步间隔；立即同步。见[仓库清单](#仓库清单) | 空；间隔默认 12 小时 | 立即 |
-| 工作区 | dsh-repo 建的所有工作区：仓库、当前分支和合入分支、未提交的文件数、只在本机的提交数、这个分支上打开中的 PR/MR、最近 git 活动；新建、在此新建会话、删除。见[从设置页新建工作区](#从设置页新建工作区) | 无 | 立即 |
+| 仓库 | 添加、修改、删除清单中的仓库：地址、基线分支、权限、功能开关和各自的分支、本地同步（开关、本地目录、分支、间隔）、分支命名；镜像拉取状态和重新拉取；立即同步。见[仓库清单](#仓库清单) | 空；间隔默认 12 小时 | 立即 |
+| 工作区 | dsh-repo 建的所有工作区：仓库、当前分支和基线分支、未提交的文件数、只在本机的提交数、这个分支上打开中的 PR/MR、最近 git 活动；新建、在此新建会话、删除。见[从设置页新建工作区](#从设置页新建工作区) | 无 | 立即 |
 | 高级 | 工作区目录：「工作区」标签页新建的工作区放在这里，不存在会创建 | 无 | 立即 |
 | 模型工具 | `tools.enabled`：是否提供 `repo_*` 工具 | 提供 | 保存条 |
 | 模型工具 | `tools.writes`：`ask` 每次审批、`allow` 不审批、`off` 关闭所有写操作（不提供写工具，服务调用、设置页和工作区里的 `git push` 也一律拒绝） | `ask` | 保存条 |
@@ -65,6 +65,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | 高级 | `mirror.gitTimeoutMs`：一条 git 命令（clone、fetch、push） | 600 秒 | 保存条 |
 | 高级 | `workspace.proxyPort`：本机 git 代理的端口，见[改代码](#改代码)；0 表示自动选一个空闲端口并一直沿用 | 0 | 保存条 |
 | 高级 | `workspace.commitName` / `commitEmail`：工作区默认的提交身份；主机令牌账号读不到时作为提交者 | 空（用令牌账号） | 保存条 |
+| 高级 | `workspace.branchTemplate` / `branchPattern`：新工作区的分支命名模板和分支名规则，仓库可以单独设置，见[分支命名](#分支命名) | `dsh/{session}` / 空（不限） | 保存条 |
 | 高级 | `limits.perPage` / `maxPerPage` / `maxComments` / `maxTreeEntries` | 30 / 100 / 50 / 1000 | 保存条 |
 | 高级 | `limits.maxFileBytes` / `maxDiffBytes`：读文件上限、diff 截断 | 1 MiB / 512 KiB | 保存条 |
 | 高级 | `limits.maxLogBytes`：一次返回的 CI 作业日志片段上限，也是一条流水线所有失败信息合计的上限 | 32 KiB | 保存条 |
@@ -72,13 +73,13 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 
 「立即」的改动点击即保存；其余设置改动后页面底部出现保存条，每项改过时旁边有「恢复默认」。保存后的设置从下一次调用开始生效，不用重启：工具在模型的下一步按新设置提供或隐藏，已经提供的写工具在写操作被关闭后拒绝执行。设置文件的 `settings` 字段只记录与默认不同的项，「全部恢复默认」删除该字段；以后版本调整默认值时，没改过的项随之变化。「插件 → dsh-repo」页面只保留一个指向该入口的「打开设置」按钮。
 
-仓库清单为空（或清单里的仓库都不在已配置的主机上）时模型只看到 `repo_add`，添加仓库后立即提供其他工具。
+仓库清单为空（或清单里的仓库都不在已配置的主机上）时不提供任何工具，管理员在设置页添加仓库后立即提供。仓库只能在设置页添加，模型和其他插件都不能改清单。
 
 ### 运行时添加主机
 
 除了 cordis.yml 里的 `hosts`，还可以在设置页添加、删除主机和保存、清除令牌，改动立即生效；其他插件也可以调用 `hostAdd` 添加主机、`hostRemove` 删除、`hostSetToken` 保存或清除令牌。添加的主机保存在设置文件，令牌存入 DSH 凭据库，引用名由地址生成（`DSH_REPO_HOST_<哈希>`）。cordis.yml 中的主机只能改令牌，不能在运行时删除；`hostList` 列出所有主机及令牌是否已设置，不返回令牌值。`hostOnChange` 在每次主机、令牌或镜像目录变更成功后通知监听者，例如需要在令牌更新后重新拉取镜像的插件。
 
-设置页的数据来自宿主 `webServer` 上的 `/dsh-repo/state`、`/dsh-repo/hosts`、`/dsh-repo/host-token`、`/dsh-repo/mirror`、`/dsh-repo/settings`、`/dsh-repo/watches`、`/dsh-repo/repos`、`/dsh-repo/repos/sync`、`/dsh-repo/workspaces`、`/dsh-repo/workspace-dir` 路由，请求经宿主 `connection` 做与 DSH `/api` 相同的来源校验和登录鉴权，写操作另外要求同源。没有 Web 的组合不挂载这些路由。
+设置页的数据来自宿主 `webServer` 上的 `/dsh-repo/state`、`/dsh-repo/hosts`、`/dsh-repo/host-token`、`/dsh-repo/mirror`、`/dsh-repo/settings`、`/dsh-repo/watches`、`/dsh-repo/repos`、`/dsh-repo/repos/sync`、`/dsh-repo/repos/fetch`、`/dsh-repo/repos/branches`、`/dsh-repo/workspaces`、`/dsh-repo/workspace-dir` 路由，请求经宿主 `connection` 做与 DSH `/api` 相同的来源校验和登录鉴权，写操作另外要求同源。没有 Web 的组合不挂载这些路由。
 
 ### 令牌
 
@@ -99,13 +100,17 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | 设置 | 说明 |
 |---|---|
 | 地址 | HTTPS 地址，必须在已配置的主机上；本机路径和 `file:` URL 不支持，设置文件里旧版本留下的这类条目在加载时忽略并记日志，下次保存时删除。同一仓库只能出现一次：按小写的仓库网页地址（主机、主机的路径前缀、仓库路径）比较，所以网页地址、`.git` 地址、SSH 地址和大小写不同的写法算同一个仓库，同一域名下不同路径前缀的两个 GitLab 实例的仓库不会混淆 |
-| 分支 | 留空跟随远端默认分支；本地同步和其他插件按这个分支工作 |
+| 基线分支 | 改代码的起点和终点：新工作区从它的最新提交拉出新分支，PR/MR 默认合回它，不带 `ref` 的快照也取它。留空是远端默认分支。只在发版分支上开发的仓库留空即可；在 `dev` 上开发、`main` 发版的仓库填 `dev` |
 | 权限 | 「只读」只能读（包括快照，以及在本地工作区里修改但不能推送）；「可改代码」还能创建和评论 issue、PR/MR，推送工作区，重试和取消 CI，删除已合并分支；「可合并」还能合并 PR/MR |
-| 功能 | 其他插件运行时注册的功能（例如日志分析插件注册「日志分析」），每个仓库单独开关；dsh-repo 只保存开关，功能本身由注册它的插件实现。清单里有、但当前没有插件注册的功能照样保留，设置页以功能 id 显示并注明注册它的插件没有加载 |
-| 本地同步 | 开关、本地目录和同步间隔，见[本地同步](#本地同步) |
+| 功能 | 其他插件运行时注册的功能（例如日志分析插件注册「日志分析」），每个仓库单独开关，打开的功能可以选一个分支（例如日志分析读 `main`），留空跟基线分支一致；dsh-repo 只保存开关和分支，功能本身由注册它的插件实现。清单里有、但当前没有插件注册的功能照样保留，设置页以功能 id 显示并注明注册它的插件没有加载 |
+| 本地同步 | 开关、本地目录、分支（留空跟基线分支一致）和同步间隔，见[本地同步](#本地同步) |
+| 分支命名 | 这个仓库的分支命名模板和分支名规则，留空用全局设置，见[分支命名](#分支命名) |
 
 - 权限是这个仓库的上限，和其他限制同时生效：写操作仍然要经过 `tools.writes`、`access/authorize` 事件（例如渠道插件按用户或群开关的改代码权限）和用户审批。权限不够时调用以 `not-allowed` 失败，不问用户、不发请求。
-- 模型工具按清单里最高的权限提供：清单里有「可改代码」的仓库才提供写工具，有「可合并」的仓库才提供 `repo_mr_merge`。`repo_list` 列出清单里的仓库和各自的权限，模型据此选择仓库。清单为空时模型只看到 `repo_add`。
+- 添加仓库，或改了地址和任一分支时，保存前先用主机令牌执行一次 `git ls-remote`（超时取 `timeoutMs`）：访问不了或令牌被拒时报原因，填的基线分支、功能分支、本地同步分支在远端不存在时指出是哪一项，都不保存。
+- 保存后在后台拉取镜像，插件启动时也在后台拉取所有还没拉取过的仓库（镜像目录未设置时不拉取）；换镜像目录或主机、令牌变化后重新拉取。每个仓库显示拉取中、已拉取或拉取失败（带原因和「重新拉取」按钮）。工具、快照和工作区照常在使用前拉取最新内容，这个状态也随之更新；状态只在内存里，重启后重新拉取。
+- 模型工具按清单里最高的权限提供：清单里有「可改代码」的仓库才提供写工具，有「可合并」的仓库才提供 `repo_mr_merge`。`repo_list` 列出清单里的仓库、基线分支、权限和功能（带各自的分支），模型据此选择仓库。清单为空时不提供工具。
+- 旧版本的条目只有一个「分支」：加载时把它同时作为基线分支、每个功能的分支和本地同步分支，行为不变，记一条日志，下次保存时写成新格式。
 - 主机被删除后，清单里它上面的仓库保留，设置页标出原因，调用照样拒绝；重新添加主机后恢复。
 - 删除仓库只删除清单条目；本地同步目录里的文件保留，正在跟踪的 PR/MR 在下一次检查时停止跟踪。
 
@@ -115,9 +120,8 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 
 | 工具 | 作用 | 审批 |
 |---|---|---|
-| `repo_list` | 仓库清单里的仓库：地址、分支、权限、功能 | 否 |
+| `repo_list` | 仓库清单里的仓库：地址、基线分支、权限、功能和功能的分支 | 否 |
 | `repo_get` | 默认分支、可见性、描述、克隆地址 | 否 |
-| `repo_add` | 把仓库加入清单，或为已有条目打开功能；新条目默认只读。清单为空时也提供，写操作关闭时不提供 | 是（`admin`） |
 | `repo_branch_list` / `repo_branch_get` | 分支列表；单个分支（不存在时为 `null`） | 否 |
 | `repo_branch_delete` | 删除已经合并的遗留分支，见[合并后的分支](#合并后的分支) | 是 |
 | `repo_commit_list` | 提交历史 | 否 |
@@ -125,7 +129,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | `repo_issue_list` / `repo_issue_get` | issue 列表（可用 `search` 搜索标题和描述）、单个 issue 及评论 | 否 |
 | `repo_issue_create` / `repo_issue_update` / `repo_issue_comment` | 创建、修改、关闭或重开、评论 issue | 是 |
 | `repo_mr_list` / `repo_mr_get` / `repo_mr_diff` / `repo_mr_status` | PR/MR 列表、详情与评论、diff、CI 与可合并状态；CI 检查带 `runId` / `jobId` 时可以接着用 CI 工具查看 | 否 |
-| `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR；创建和重开的 PR/MR 自动跟踪 | 是 |
+| `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR；创建时不给目标分支就合回仓库清单里的基线分支，没设基线时合回默认分支；创建和重开的 PR/MR 自动跟踪 | 是 |
 | `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；按设置一并删除源分支；只合并权限为「可合并」的仓库 | 是 |
 | `repo_mr_watch` | 让本会话跟踪一个打开中的 PR/MR，或停止跟踪，见[跟踪 PR/MR](#跟踪-prmr)；跟踪可用时才提供 | 否 |
 | `repo_ci_list` | CI 运行列表（GitLab 流水线、GitHub Actions workflow run），可按分支或 tag、提交、PR/MR、状态过滤，见[查看 CI](#查看-ci) | 否 |
@@ -158,14 +162,22 @@ CI 工具读取 GitLab 流水线和 GitHub Actions。只通过提交状态上报
 
 改代码只有一条路：新建工作区 → 修改、提交 → 推送到工作区的分支 → 开 PR/MR。之后的修改（例如评审后的追加修复）推送到同一个分支，原 PR/MR 随之更新，不再开新分支和新 PR/MR。
 
-1. **新建。** `repo_workspace_create` 先拉取镜像，再从镜像 `git clone --shared` 出一份普通的 git 克隆（对象经 alternates 共用镜像，不另占空间），检出工作分支，并经 DSH 的 `workingDirectory` 服务把会话的工作目录切过去，仓库里的 AGENTS.md、项目 SKILL 随之生效。目录默认是当前工作目录下的 `<仓库名>/`（重名时加 `-2`、`-3`），当前工作目录不在会话目录（沙箱可写根）里时放在会话目录下，当前工作目录在某个工作区里时放在那个工作区旁边；给出的 `path` 必须在会话目录里，并且不存在或为空。`base` 是合入目标（默认是默认分支），起点是它的最新提交，或 `commit` 给出的、在 `base` 上的提交。`branch` 是推送的分支，默认 `dsh/<会话 id 前 8 位>`；远端已有这个分支时从它的最新提交开始，接着修改（这时不能再给 `commit`）。`branch` 不能是默认分支、`base` 或受保护分支。
+1. **新建。** `repo_workspace_create` 先拉取镜像，再从镜像 `git clone --shared` 出一份普通的 git 克隆（对象经 alternates 共用镜像，不另占空间），检出工作分支，并经 DSH 的 `workingDirectory` 服务把会话的工作目录切过去，仓库里的 AGENTS.md、项目 SKILL 随之生效。目录默认是当前工作目录下的 `<仓库名>/`（重名时加 `-2`、`-3`），当前工作目录不在会话目录（沙箱可写根）里时放在会话目录下，当前工作目录在某个工作区里时放在那个工作区旁边；给出的 `path` 必须在会话目录里，并且不存在或为空。`base` 默认是仓库清单里的基线分支，起点是它的最新提交，或 `commit` 给出的、在 `base` 上的提交，PR/MR 默认合回它。`branch` 是推送的分支，不给时按[分支命名](#分支命名)模板生成（默认 `dsh/<会话 id 前 8 位>`，同一会话的工作区接着用同一个分支）；远端已有这个分支时从它的最新提交开始，接着修改（这时不能再给 `commit`）；远端没有的新分支必须符合分支名规则。`branch` 不能是默认分支、`base` 或受保护分支。
 2. **修改。** Agent 用普通的文件和命令工具编辑、构建、测试，git 命令照常可用：`git status`、`git diff`、`git add`、`git commit`、`git rebase`、`git fetch`、`git pull`、`git push` 都在工作区里直接运行。工作区装了 `commit-msg` 钩子，提交说明末尾自动加一行 `DSH-Session: <会话 id>`，记录是哪个 DSH 会话做的改动。工作区的 `user.name` / `user.email` 是令牌账号（或设置页的提交身份）。
 3. **推送。** 两种方式效果相同：Agent 自己 `git push`，或调用 `repo_workspace_push`。后者先经 `access/authorize` 事件问过其他插件（见[授权事件](#授权事件)），再经用户审批，然后把未提交的改动（`git add --all`，`.gitignore` 生效）提交为一个提交，推送到工作区的分支；远端分支被他人更新时以 `conflict` 失败，`forceWithLease` 按工作区上次看到的远端位置覆盖。推送失败时撤销这次调用新建的提交。工具推送的提交者是令牌所属的账号（通常是公共账号），作者默认也是它，其他插件可以把作者换成提出改动的人（见[提交尾注事件](#提交尾注事件)），提交者不变，所以检查提交者的推送规则（如 GitLab 的提交者限制）照常通过。令牌账号的身份这样确定：推送前用令牌读一次主机的当前用户接口（GitHub `GET /user`，GitLab `GET /api/v4/user`），按令牌缓存；GitHub 账号没有公开邮箱时用 `<id>+<login>@users.noreply.<主机>`，GitLab 依次取提交邮箱、邮箱、公开邮箱，都没有时用 `<id>-<用户名>@users.noreply.<主机>`；读不到时用设置页的提交身份。推送结果的 `author` 给出新提交的作者。
 4. **开 PR/MR。** `repo_workspace_push` 推送成功后查一次这个分支上打开中的 PR/MR，在结果的 `openMrs` 里列出；给出 `mr` 且没有打开中的 PR/MR 时创建一个（目标默认是 `base`），结果的 `createdMr` 是新建的那个。打开中的 PR/MR 自动跟踪（见[跟踪 PR/MR](#跟踪-prmr)）。查询或创建失败不影响推送结果，`mrError` 写明原因。
 
 ### 从设置页新建工作区
 
-「仓库」标签页里权限为「可改代码」或「可合并」的仓库有「新建工作区」按钮，「工作区」标签页也可以新建：选仓库，可填合入分支、推送分支（默认 `dsh/<随机 8 位>`，已有的分支接着改）和目录名（默认仓库名，重名时加编号）。工作区建在「高级 → 工作区目录」下，和工具新建的一样是完整的 git 克隆，经本机 git 代理拉取和推送。建好后页面经 DSH 的 `workspaces` 服务把目录登记为 DSH 工作区，再经 `uiWorkspace` 在里面打开一个新会话；界面没有这两个服务时只提示目录位置。设置页新建的工作区不属于任何会话：代理推送时不发 `access/authorize` 事件，提交说明的 `DSH-Session` 取当时在里面运行的会话。「在此新建会话」对任何工作区都可用，包括会话里用工具建的。删除时有未提交的改动或只在本机的提交（任何本地分支上的）会再确认一次。
+「仓库」标签页里权限为「可改代码」或「可合并」的仓库有「新建工作区」按钮，「工作区」标签页也可以新建：选仓库，可选基线分支（默认是仓库的基线分支，下拉列出镜像里已有的分支）和目录名（默认仓库名，重名时加编号）。推送的新分支按[分支命名](#分支命名)模板生成，`{session}` 在这里换成随机串；表单底部写明会从哪个分支拉出什么名字的分支、PR/MR 合回哪里。要接着改已有分支，在会话里让模型给 `repo_workspace_create` 传 `branch`。工作区建在「高级 → 工作区目录」下，和工具新建的一样是完整的 git 克隆，经本机 git 代理拉取和推送。建好后页面经 DSH 的 `workspaces` 服务把目录登记为 DSH 工作区，再经 `uiWorkspace` 在里面打开一个新会话；界面没有这两个服务时只提示目录位置。设置页新建的工作区不属于任何会话：代理推送时不发 `access/authorize` 事件，提交说明的 `DSH-Session` 取当时在里面运行的会话。「在此新建会话」对任何工作区都可用，包括会话里用工具建的。删除时有未提交的改动或只在本机的提交（任何本地分支上的）会再确认一次。
+
+### 分支命名
+
+新分支的名字由模板生成，可选再用一条正则规则约束。两者在「高级」里全局设置，仓库可以在清单里单独设置，留空时用全局的。
+
+- **模板** 是带占位符的文本，默认 `dsh/{session}`。`{session}` 是会话 id 的前 8 个字母和数字（小写），同一会话的工作区接着用同一个分支，没有会话时（设置页新建）换成 8 位随机十六进制；`{random}` 是 8 位随机十六进制；`{date}` 是本地日期 `YYYYMMDD`。模板必须含 `{session}` 或 `{random}`，否则每个工作区都会用同一个分支；生成的名字必须是合法的分支名。
+- **规则** 是 JavaScript 正则表达式（`u` 标志），不加锚点，要匹配整个名字时自己写 `^` 和 `$`，例如 `^(feat|fix)/`。留空表示不限。规则只检查远端还没有的新分支，接着修改已有分支时不检查；模型给 `repo_workspace_create` 传的 `branch` 是新分支时同样要符合规则。
+- 保存时检查模板生成的名字符合规则，不符合时拒绝保存：每个占位符分别取全数字、全字母和数字字母交错的值（`{session}` 还取 `f` 以后的字母），各种组合生成的名字都要符合规则。仓库只覆盖了一项时，另一项沿用全局设置：保存仓库时按它最终生效的模板和规则检查，保存全局设置时也检查每个覆盖了规则的仓库。
 
 ### 本机 git 代理
 
@@ -231,12 +243,12 @@ GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支�
 import type { DshRepoService } from 'dsh-repo/contract'
 
 const repos = ctx.get('dshRepos') as DshRepoService | undefined
-if (repos?.version === 6) {
+if (repos?.version === 7) {
   const issue = await repos.issueGet({ repo: 'https://gitlab.example.com/team/orders', number: 12 })
 }
 ```
 
-服务版本是 6。每个模型工具都有一个同名的服务方法（见[模型工具](#模型工具)的命名规则），参数是同一个对象，用同一个参数校验；服务调用另外可以带调用方字段：
+服务版本是 7。每个模型工具都有一个同名的服务方法（见[模型工具](#模型工具)的命名规则），参数是同一个对象，用同一个参数校验；服务调用另外可以带调用方字段：
 
 | 字段 | 作用 |
 |---|---|
@@ -244,7 +256,7 @@ if (repos?.version === 6) {
 | `agent` | 替哪个 Agent 调用（`{ id, session: { header: { id } } }`，通常就是工具执行上下文里的 `agent`）。写操作带 `agent` 时和模型工具完全一样：写操作关闭时以 `forbidden` 失败，以 Agent 的会话发 `access/authorize`，`writes: ask` 时请用户审批，没批准时以 `declined` 失败；推送时发 `repo/commit-trailers`、PR/MR 自动跟踪这个会话 |
 | `callId` | 审批卡片上对应的工具调用 id |
 
-不带 `agent` 的写操作只检查写操作开关和仓库清单的权限（写操作关闭时同样以 `forbidden` 失败），不发授权事件也不审批，由调用方插件负责；`repoAdd` 不带 `agent` 时只检查参数（带 `agent` 时按 `admin` 级别授权，写操作关闭时拒绝）。`mrWatch` 必须带 `agent`。工作区方法的 `path` 必须是绝对路径，服务调用不切换会话的工作目录。
+不带 `agent` 的写操作只检查写操作开关和仓库清单的权限（写操作关闭时同样以 `forbidden` 失败），不发授权事件也不审批，由调用方插件负责。`mrWatch` 必须带 `agent`。工作区方法的 `path` 必须是绝对路径，服务调用不切换会话的工作目录。
 
 除这些方法外，服务还提供插件和设置页用的方法：`repoResolve`、`repoOnChange`、`featureRegister`、`hostList`、`hostAdd`、`hostRemove`、`hostSetToken`、`hostOnChange`、`settingsGet`、`settingsUpdate`（镜像目录、工作区默认目录、代理端口、提交身份）。完整定义见 [`src/contract.ts`](src/contract.ts)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`、`declined`。
 
@@ -252,10 +264,13 @@ if (repos?.version === 6) {
 
 ```ts
 const repos = ctx.get('dshRepos') as DshRepoService | undefined
-if (repos?.version === 6) {
+if (repos?.version === 7) {
   ctx.effect(() => repos.featureRegister({ id: 'log-analysis', title: '日志分析' }))
   ctx.effect(() => repos.repoOnChange(() => { void repos.repoList({ feature: 'log-analysis' }).then(reload) }))
-  const lease = await repos.snapshotAcquire({ repo: 'https://gitlab.example.com/team/orders' })
+  // 功能的分支：打开时选的分支，没选时是基线分支，再没有就是远端默认分支。
+  const [repo] = await repos.repoList({ feature: 'log-analysis' })
+  const branch = repo?.features.find(item => item.id === 'log-analysis')?.branch ?? repo?.base
+  const lease = await repos.snapshotAcquire({ repo: 'https://gitlab.example.com/team/orders', ...branch === undefined ? {} : { ref: branch } })
   try {
     analyze(lease.path)
   } finally {
@@ -263,6 +278,12 @@ if (repos?.version === 6) {
   }
 }
 ```
+
+从 6 升到 7：
+
+- `CatalogRepo.branch` 拆开：`base` 是基线分支（新工作区的起点和 PR/MR 的目标，`workspaceCreate` 不给 `base` 时取它，`snapshotAcquire` 不给 `ref` 时取它）；`features` 从功能 id 数组变成 `{ id, branch? }` 数组，`branch` 是这个功能用的分支，留空用 `base`；`localSync.branch` 是本地同步的分支，留空用 `base`；新增 `branchRules`（仓库自己的分支命名模板和规则）。
+- `repoAdd` 和 `repo_add` 移除：仓库只能在设置页添加。
+- `workspaceCreate` 不给 `branch` 时按分支命名模板生成；给出的新分支必须符合分支名规则，否则以 `invalid` 失败。插件需要可预期的分支名时，用返回值里的 `branch`。
 
 从 5 升到 6：
 
@@ -273,7 +294,7 @@ if (repos?.version === 6) {
 
 ### 授权事件
 
-每个写操作在参数校验通过之后、询问用户审批之前，用 `ctx.parallel('access/authorize', event)` 问其他插件这次调用的会话能不能写：模型工具总是发，服务调用带 `agent` 时发，经代理的 `git push` 以创建工作区的会话发。`event` 带 `session`（会话 id，可能是子 Agent 的会话，监听者自己顺着 `parentSession` 找到它认识的会话）、`level`（dsh-repo 的写操作发 `code-write`，`repoAdd` 发 `admin`；`wiki-read`、`wiki-write` 留给其他插件的写操作，监听者拒绝不认识的级别）、`action`（服务方法名，经代理的推送是 `git-push`）和 `summary`（审批卡片上的中文说明）。认识这个会话且不允许的监听者抛出带原因的 `Error`，调用以 `forbidden` 失败，不问用户、不改任何东西；不认识这个会话的监听者直接返回；没有监听者就是允许。`tools.writes` 关闭时不发事件，直接以 `forbidden` 失败；「不审批」模式仍然发。
+每个写操作在参数校验通过之后、询问用户审批之前，用 `ctx.parallel('access/authorize', event)` 问其他插件这次调用的会话能不能写：模型工具总是发，服务调用带 `agent` 时发，经代理的 `git push` 以创建工作区的会话发。`event` 带 `session`（会话 id，可能是子 Agent 的会话，监听者自己顺着 `parentSession` 找到它认识的会话）、`level`（dsh-repo 的写操作发 `code-write`；`wiki-read`、`wiki-write`、`admin` 留给其他插件的写操作，监听者拒绝不认识的级别）、`action`（服务方法名，经代理的推送是 `git-push`）和 `summary`（审批卡片上的中文说明）。认识这个会话且不允许的监听者抛出带原因的 `Error`，调用以 `forbidden` 失败，不问用户、不改任何东西；不认识这个会话的监听者直接返回；没有监听者就是允许。`tools.writes` 关闭时不发事件，直接以 `forbidden` 失败；「不审批」模式仍然发。
 
 监听者不需要依赖 dsh-repo 的包，在本地声明事件类型即可：
 
@@ -331,7 +352,7 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 
 本地同步把仓库分支的最新提交定时展开到本机任意目录，适合让 DSH 或其他工具直接读一份始终最新的文件，例如把公用 SKILL 仓库同步到一个目录，再把该目录加进 deepseek-harness `@deepseek-ai/dsh-skill-filesystem` 的 `customSkillDirs`。
 
-- 本地同步是仓库清单里每个仓库的一项设置：打开开关，填本地目录（绝对路径，`~` 展开为主目录，不能是根目录或主目录）和同步间隔（5 分钟到 30 天，默认 12 小时）。分支就是清单里这个仓库的分支，留空跟随远端默认分支。每个仓库最多一个本地目录；打开的本地目录不能互相包含，也不能与镜像目录重叠，比较时会解析路径中已存在部分的符号链接。关掉开关时目录和间隔保留。
+- 本地同步是仓库清单里每个仓库的一项设置：打开开关，填本地目录（绝对路径，`~` 展开为主目录，不能是根目录或主目录）和同步间隔（5 分钟到 30 天，默认 12 小时）。分支是本地同步自己的分支，留空用这个仓库的基线分支，都没填时跟随远端默认分支。每个仓库最多一个本地目录；打开的本地目录不能互相包含，也不能与镜像目录重叠，比较时会解析路径中已存在部分的符号链接。关掉开关时目录和间隔保留。
 - 同步先拉取镜像，再用 `git --git-dir=<镜像> --work-tree=<本地目录> read-tree --reset -u <提交>` 展开，使用每个本地目录自己的索引文件（在 `$DSH_HOME/dsh-repo/syncs/` 下），不改动镜像的 `HEAD` 和索引。本地目录里只有普通文件，没有 `.git`；git 对象只在镜像目录里存一份。
 - 每次同步只写入有变化的文件，删除分支上已删除的文件，本地改过或删掉的文件恢复成仓库里的版本；分支上从来没有的文件保留。改公用仓库请走[改代码](#改代码)的工作区流程，合入后等下一次同步或点「立即同步」。
 - 第一次同步要求本地目录不存在或为空，避免覆盖已有文件；目录不为空时这次同步失败并在列表里显示原因。检查通过后先在 `local-syncs.json` 记下这个目录再写文件，所以第一次同步写到一半被打断时，重试会接着写入该目录。每个本地目录有自己的索引文件（`syncs/<id>-<目录哈希>.index`）。把同步改到另一个目录时同样要求新目录为空，旧目录里的文件保留。

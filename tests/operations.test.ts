@@ -121,27 +121,26 @@ function record(path: string, fields: Partial<WorkspaceRecord> = {}): WorkspaceR
 
 describe('operation registry', () => {
   it('pairs every tool with a service method of the same name scheme', () => {
-    expect(OPERATIONS).toHaveLength(34)
+    expect(OPERATIONS).toHaveLength(33)
     for (const operation of OPERATIONS) {
       const words = operation.tool.replace(/^repo_/, '').split('_')
       const method = words.length === 1 ? `repo${words[0]![0]!.toUpperCase()}${words[0]!.slice(1)}` : words.map((word, index) => index === 0 ? word : `${word[0]!.toUpperCase()}${word.slice(1)}`).join('')
       expect(operation.method).toBe(method)
       expect(typeof Reflect.get(DshReposApi.prototype, operation.method)).toBe('function')
     }
-    expect(new Set(OPERATIONS.map(operation => operation.tool)).size).toBe(34)
+    expect(new Set(OPERATIONS.map(operation => operation.tool)).size).toBe(33)
   })
 
   it('offers tools by the settings and the highest catalog access', () => {
     const offered = (settings: RepoSettings, highest: RepoAccess | undefined) => OPERATIONS.filter(operation => toolOffered(operation.access, settings.tools, highest)).map(operation => operation.tool)
-    expect(offered(testSettings(), 'merge')).toHaveLength(34)
+    expect(offered(testSettings(), 'merge')).toHaveLength(33)
     const read = offered(testSettings(), 'read')
     expect(read).toContain('repo_workspace_create')
     expect(read).toContain('repo_snapshot_acquire')
-    expect(read).toContain('repo_add')
     expect(read).not.toContain('repo_workspace_push')
     expect(offered(testSettings(), 'write')).not.toContain('repo_mr_merge')
     expect(offered(testSettings({ tools: { writes: 'off' } }), 'merge').filter(tool => /push|create$|merge|delete|retry|cancel|update|comment|add$/.test(tool))).toEqual(['repo_workspace_create'])
-    expect(offered(testSettings(), undefined)).toEqual(['repo_add'])
+    expect(offered(testSettings(), undefined)).toEqual([])
     expect(offered(testSettings({ tools: { enabled: false } }), 'merge')).toEqual([])
   })
 
@@ -238,19 +237,6 @@ describe('write gate for tools', () => {
     expect(cancelCi).toHaveBeenCalledWith('gitlab.example.com/g/p', { jobId: 2 }, { signal: exec.signal })
     expect(request.mock.calls.at(-1)?.[0].reason).toBe('取消 CI 作业\n仓库：gitlab.example.com/g/p\n作业：2')
     await expect(all.get('repo_ci_retry')!.execute({ repo: 'gitlab.example.com/g/p', runId: 42, jobId: 2 }, exec)).rejects.toThrow(/\[invalid\].*runId and jobId/)
-  })
-
-  it('adds a repository to the catalog through the gate with the catalog summary', async () => {
-    const addRepo = vi.fn(async (_url: string, _options: unknown, confirm: (summary: string) => Promise<void>) => {
-      await confirm('把 github.com/a/b 加入 dsh-repo 仓库清单（权限：只读）')
-      return { status: 'added' }
-    })
-    const parallel = vi.fn(async () => {})
-    const request = vi.fn(async () => 'allowed-once' as const)
-    const { exec: run } = session()
-    expect(await tools(fakeService({ catalog: { ensure: addRepo } }), { approval: { request }, parallel }).get('repo_add')!.execute({ repo: 'https://github.com/a/b' }, run)).toEqual({ status: 'added' })
-    expect(parallel).toHaveBeenCalledWith('access/authorize', { session: 'session-1', level: 'admin', action: 'repoAdd', summary: '把 github.com/a/b 加入 dsh-repo 仓库清单（权限：只读）' })
-    expect(request).toHaveBeenCalledWith(expect.objectContaining({ toolName: 'repo_add', displayReason: { zh: '把 github.com/a/b 加入 dsh-repo 仓库清单（权限：只读）', en: 'Change the dsh-repo repository catalog: https://github.com/a/b' } }))
   })
 })
 

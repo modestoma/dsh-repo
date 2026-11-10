@@ -38,7 +38,7 @@ export interface WorkspacePanel {
   rows(): Promise<WorkspaceRow[]>
   /**
    * Create a workspace under the page's directory.
-   * @param input - catalog entry, base, branch, and directory name.
+   * @param input - catalog entry, base, and directory name.
    * @returns the new workspace.
    * @throws {RepoError} `invalid` while no directory is set or for a bad name, `not-found` for an unknown catalog entry, and the failures of `workspaceCreate`.
    */
@@ -131,8 +131,7 @@ export function workspacePanel(service: RepoService, manager: WorkspaceManager, 
       if (name !== '' && (name === '.' || name === '..' || /[/\\\0]/.test(name))) throw new RepoError('invalid', `目录名只能是一级名称：${name}`)
       const path = name === '' ? await freeDirectory(parent, basename(entry.url.replace(/\/+$/, '').replace(/\.git$/, '')) || 'repo') : join(parent, name)
       const base = input.base?.trim() ?? ''
-      const branch = input.branch?.trim() ?? ''
-      const info = await manager.create({ repo: entry.url, path, ...base === '' ? {} : { base }, ...branch === '' ? {} : { branch } })
+      const info = await manager.create({ repo: entry.url, path, ...base === '' ? {} : { base } })
       const record = (await manager.list()).find(item => item.id === info.id)
       if (record === undefined) throw new RepoError('unavailable', `工作区 ${info.path} 创建后没有找到记录`)
       return await row(record)

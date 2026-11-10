@@ -26,6 +26,7 @@ import { Mirrors } from './mirror/access.ts'
 import type { MirrorStore } from './mirror/store.ts'
 import { WritePolicy } from './policy.ts'
 import { RuntimeSettings } from './settings/runtime.ts'
+import { inheritedBranchRulesProblem } from './catalog/entry.ts'
 import type { SettingsStore } from './settings/store.ts'
 
 /** Name the service is provided under. */
@@ -58,7 +59,8 @@ export class RepoService {
   /** @param deps - credential store, settings file, mirror store, forbidden mirror roots, provider factory, and logger. */
   constructor(deps: RepoServiceDeps) {
     const logger = deps.logger === undefined ? {} : { logger: deps.logger }
-    this.settings = new RuntimeSettings(deps.store)
+    // A repository's own branch rules are paired with the global ones it inherits, so new global rules are checked against every repository.
+    this.settings = new RuntimeSettings(deps.store, next => inheritedBranchRulesProblem(this.catalog.entries(), next.workspace))
     this.hosts = new HostRegistry({ credentials: deps.credentials, store: deps.store, ...deps.factory === undefined ? {} : { factory: deps.factory }, ...logger })
     // Registered first, so providers carry the new API deadline before any other listener runs.
     this.settings.onChange(async () => { this.hosts.resetProviders() })

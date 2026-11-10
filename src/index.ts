@@ -69,7 +69,8 @@ export interface RepoPluginOptions {
 
 /**
  * Provide the `dshRepos` service, start the local git proxy, the PR/MR
- * watcher, and the catalog's local syncs, mount the settings routes while the
+ * watcher, and the catalog's local syncs, fetch each catalog repository's
+ * mirror in the background when it is added, mount the settings routes while the
  * Host serves the Web, and register the model tools, each offered only while
  * the catalog holds a repository whose access the tool needs and the current
  * tool settings allow it (`repo_mr_watch` also needs watching to be active).
@@ -185,6 +186,24 @@ export function apply(ctx: HostContext, config?: unknown, options: RepoPluginOpt
       void syncer.stop()
     }
   }, 'dsh-repo: local syncs')
+  ctx.effect(() => {
+    // Clone or fetch every reachable catalog repository that has no fetch state yet (and, after a host change, the failed ones), so its first use is fast and a bad address or token shows on the settings page.
+    const prefetch = (retryFailed: boolean): void => {
+      if (service.mirrors.settings().dir === undefined) return
+      for (const entry of service.catalog.entries()) {
+        if (!('key' in service.catalog.keyOf(entry))) continue
+        const status = service.mirrors.status(entry.url)
+        if (status === undefined || (retryFailed && status.state === 'failed')) void service.mirrors.prefetch(entry.url)
+      }
+    }
+    prefetch(false)
+    const unlistenCatalog = service.catalog.onChange(() => { prefetch(false) })
+    const unlistenHosts = service.hosts.onChange(() => { prefetch(true) })
+    return () => {
+      unlistenCatalog()
+      unlistenHosts()
+    }
+  }, 'dsh-repo: mirror prefetch')
   mountSettingsRoutes(ctx, service, watcher, syncer, workspacePanel(service, workspaces, () => proxy.port))
   if (service.catalog.entries().length === 0) ctx.logger?.info?.('dsh-repo: 仓库清单为空，代码仓库工具在「代码仓库 → 仓库」添加仓库后提供')
   for (const { definition, access } of createTools(operations)) {

@@ -47,8 +47,7 @@ function synced(url: string, dir: string, extra: { branch?: string; intervalMinu
     url,
     access: 'read',
     features: [],
-    ...extra.branch === undefined ? {} : { branch: extra.branch },
-    localSync: { enabled: extra.enabled ?? true, dir, ...extra.intervalMinutes === undefined ? {} : { intervalMinutes: extra.intervalMinutes } },
+    localSync: { enabled: extra.enabled ?? true, dir, ...extra.intervalMinutes === undefined ? {} : { intervalMinutes: extra.intervalMinutes }, ...extra.branch === undefined ? {} : { branch: extra.branch } },
   }
 }
 
@@ -166,6 +165,14 @@ describe('local syncs', () => {
     expect(existsSync(join(second, 'beta.md'))).toBe(false)
     expect(existsSync(join(first, 'beta.md'))).toBe(true)
     await syncer.stop()
+  })
+
+  it('syncs the local sync\'s own branch, else the entry\'s baseline branch', () => {
+    const entry = { id: '000000000001', url: 'https://git.test/a/b', access: 'read' as const, features: [], addedAt: 't', localSync: { enabled: true, dir: '/srv/b', intervalMinutes: 60 } }
+    expect(syncRecords([entry])[0]).not.toHaveProperty('branch')
+    expect(syncRecords([{ ...entry, base: 'dev' }])[0]).toMatchObject({ branch: 'dev' })
+    expect(syncRecords([{ ...entry, base: 'dev', localSync: { ...entry.localSync, branch: 'release' } }])[0]).toMatchObject({ branch: 'release' })
+    expect(syncRecords([{ ...entry, localSync: { ...entry.localSync, enabled: false } }])).toEqual([])
   })
 
   it('refuses a non-empty directory on the first sync and reports the failure on the sync', async () => {
