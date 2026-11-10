@@ -52,9 +52,11 @@ export class Mirrors {
   readonly store: MirrorStore
   /** Why the stored mirror directory is not in use, while it was rejected at construction. */
   private problem: string | undefined
-  /** Latest fetch of each catalog address, keyed by the address as the catalog stores it. */
-  private readonly statuses = new Map<string, MirrorStatus>()
-  /** Background fetches running, keyed like {@link statuses}, with the {@link generation} they started in. */
+  /** How the latest finished fetch of each catalog address ended (`ready` or `failed`), keyed by the address as the catalog stores it. */
+  private readonly settled = new Map<string, MirrorStatus>()
+  /** Fetches running for each catalog address, keyed like {@link settled}. */
+  private readonly running = new Map<string, number>()
+  /** Background fetches running, keyed like {@link settled}, with the {@link generation} they started in. */
   private readonly background = new Map<string, { readonly generation: number; readonly done: Promise<void> }>()
   /** Incremented when the mirror directory changes, so fetches begun for the previous directory neither report a state nor stand in for a fetch of the new one. */
   private generation = 0
@@ -106,7 +108,8 @@ export class Mirrors {
     this.problem = undefined
     // Mirrors in the new directory are cloned afresh, so earlier states say nothing about them.
     this.generation += 1
-    this.statuses.clear()
+    this.settled.clear()
+    this.running.clear()
     this.deps.hosts.notify({ kind: 'mirror', dir: target })
     return this.settings()
   }
@@ -129,41 +132,46 @@ export class Mirrors {
    */
   async sync(url: string, options: { readonly branch?: string; readonly signal?: AbortSignal } = {}): Promise<MirrorState> {
     const generation = this.generation
-    const previous = this.statuses.get(url)
-    this.statuses.set(url, { state: 'fetching', ...previous?.fetchedAt === undefined ? {} : { fetchedAt: previous.fetchedAt } })
+    this.running.set(url, (this.running.get(url) ?? 0) + 1)
     try {
       const env = await this.auth(url)
       const state = await this.store.sync(url, options.branch, env, options.signal)
-      if (generation === this.generation) this.statuses.set(url, { state: 'ready', fetchedAt: new Date(this.now()).toISOString() })
+      if (generation === this.generation) this.settled.set(url, { state: 'ready', fetchedAt: new Date(this.now()).toISOString() })
       return state
     } catch (error) {
-      if (generation === this.generation) this.record(url, previous, error, options.signal)
+      if (generation === this.generation) this.record(url, error, options.signal)
       throw error
+    } finally {
+      if (generation === this.generation) {
+        const left = (this.running.get(url) ?? 1) - 1
+        if (left > 0) this.running.set(url, left)
+        else this.running.delete(url)
+      }
     }
   }
 
-  /** Record how a fetch of `url` ended after it threw. */
-  private record(url: string, previous: MirrorStatus | undefined, error: unknown, signal: AbortSignal | undefined): void {
+  /** Record how a fetch of `url` ended after it threw; a fetch running beside it records its own outcome. */
+  private record(url: string, error: unknown, signal: AbortSignal | undefined): void {
     const code = error instanceof RepoError ? error.code : undefined
     if (code === 'not-found') {
       // The fetch succeeded; the requested branch or commit is what is missing.
-      this.statuses.set(url, { state: 'ready', fetchedAt: new Date(this.now()).toISOString() })
-    } else if (signal?.aborted === true || code === 'not-allowed') {
+      this.settled.set(url, { state: 'ready', fetchedAt: new Date(this.now()).toISOString() })
+    } else if (signal?.aborted !== true && code !== 'not-allowed') {
       // A cancelled call, or an address outside the catalog, says nothing about the mirror.
-      if (previous === undefined) this.statuses.delete(url)
-      else this.statuses.set(url, previous)
-    } else {
-      this.statuses.set(url, { state: 'failed', ...previous?.fetchedAt === undefined ? {} : { fetchedAt: previous.fetchedAt }, error: error instanceof Error ? error.message : String(error) })
+      const fetchedAt = this.settled.get(url)?.fetchedAt
+      this.settled.set(url, { state: 'failed', ...fetchedAt === undefined ? {} : { fetchedAt }, error: error instanceof Error ? error.message : String(error) })
     }
   }
 
   /**
-   * The latest fetch of a catalog address.
+   * The fetch state of a catalog address: `fetching` while any fetch of it runs, else how the latest finished fetch ended.
    * @param url - address as the catalog stores it.
-   * @returns the state, or undefined before the first fetch since the plugin started or the mirror directory changed.
+   * @returns the state with the time of the last successful fetch, or undefined before the first fetch since the plugin started or the mirror directory changed.
    */
   status(url: string): MirrorStatus | undefined {
-    return this.statuses.get(url)
+    const last = this.settled.get(url)
+    if (!this.running.has(url)) return last
+    return { state: 'fetching', ...last?.fetchedAt === undefined ? {} : { fetchedAt: last.fetchedAt } }
   }
 
   /**

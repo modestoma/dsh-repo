@@ -245,6 +245,32 @@ describe('mirror fetch state', () => {
     expect(service.mirrors.status(repo.url)).toBeUndefined()
   })
 
+  it('keeps the outcome of a background fetch when an overlapping call is cancelled', async () => {
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let held = true
+    const remote = fileRemote()
+    const { service } = setup({ git: async (args, options) => {
+      if (held && args.includes('clone')) {
+        held = false
+        await gate
+      }
+      return await remote.git(args, options)
+    } })
+    const repo = origin(remote)
+    await allow(service, [repo.url])
+    const background = service.mirrors.prefetch(repo.url)
+    await vi.waitFor(() => { expect(held).toBe(false) })
+    const controller = new AbortController()
+    const foreground = service.mirrors.sync(repo.url, { signal: controller.signal }).then(() => undefined, (error: unknown) => error)
+    expect(service.mirrors.status(repo.url)).toEqual({ state: 'fetching' })
+    controller.abort(new Error('cancelled'))
+    release?.()
+    await background
+    await foreground
+    expect(service.mirrors.status(repo.url)).toEqual({ state: 'ready', fetchedAt: expect.any(String) })
+  })
+
   it('checks that a repository can be reached and has the branches an entry names, before it is in the catalog', async () => {
     const { service, remote } = setup()
     const repo = origin(remote)
