@@ -334,13 +334,28 @@ describe('workspace operations', () => {
     const { root, set, workingDirectory, exec: run } = session('topics/t1')
     mkdirSync(join(root, 'topics/t1/b'))
     const create = vi.fn(async (request: { path: string; branch?: string }) => ({ id: '0123456789abcdef', repo: 'https://github.com/a/b', path: request.path, base: 'main', baseCommit: 'c'.repeat(40), branch: request.branch ?? 'dsh/session1', session: 'session-1', createdAt: 't' }))
-    const workspaces = fakeWorkspaces({ create })
+    const created: string[] = []
+    const locate = vi.fn(async (target: string) => {
+      const found = created.find(dir => target === dir || target.startsWith(`${dir}/`))
+      if (found === undefined) throw new RepoError('not-found', `${target} 不在工作区内`)
+      return record(found)
+    })
+    create.mockImplementation(async (request: { path: string; branch?: string }) => {
+      created.push(request.path)
+      return { id: '0123456789abcdef', repo: 'https://github.com/a/b', path: request.path, base: 'main', baseCommit: 'c'.repeat(40), branch: request.branch ?? 'dsh/session1', session: 'session-1', createdAt: 't' }
+    })
+    const workspaces = fakeWorkspaces({ create, locate })
     const tool = tools(fakeService(), { workingDirectory, workspaces }).get('repo_workspace_create')!
     const value = await tool.execute({ repo: 'github.com/a/b', commit: 'c'.repeat(40) }, run)
     const path = join(root, 'topics/t1/b-2')
     expect(create).toHaveBeenCalledWith({ repo: 'https://github.com/a/b', path, commit: 'c'.repeat(40), session: 'session-1' }, run.signal)
     expect(set).toHaveBeenCalledWith(run.agent, path, run.signal)
     expect(value).toMatchObject({ path, workingDirectory: path, next: expect.stringContaining('repo_workspace_push') })
+    // From inside a workspace, the default directory goes beside it.
+    mkdirSync(path)
+    await tool.execute({ repo: 'github.com/a/b' }, run)
+    expect(create).toHaveBeenLastCalledWith(expect.objectContaining({ path: join(root, 'topics/t1/b-3') }), run.signal)
+    await set(run.agent, path)
     await tool.execute({ repo: 'github.com/a/b', path: 'sub', branch: 'fix/x' }, run)
     expect(create).toHaveBeenLastCalledWith(expect.objectContaining({ path: join(path, 'sub'), branch: 'fix/x' }), run.signal)
     await expect(tool.execute({ repo: 'github.com/a/b', path: tmpdir() }, run)).rejects.toThrow(/^\[invalid\].*会话目录/)

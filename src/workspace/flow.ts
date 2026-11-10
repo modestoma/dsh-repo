@@ -14,7 +14,7 @@
  * @module dsh-repo/workspace/flow
  */
 
-import { basename, isAbsolute, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, resolve } from 'node:path'
 import type { Caller } from '../calls.ts'
 import { requireAgent, sessionOf, watchMr, withSignature } from '../calls.ts'
 import type { RepoSettings } from '../config.ts'
@@ -27,6 +27,7 @@ import { freeDirectory, realPathOf, within } from '../paths.ts'
 import { pushPrompt } from '../push-prompt.ts'
 import type { RepoService } from '../service.ts'
 import { workspaceInfo } from './manager.ts'
+import type { WorkspaceManager } from './manager.ts'
 
 /** Parameters of a workspace creation. */
 export interface CreateArgs {
@@ -129,6 +130,30 @@ async function workspaceTarget(deps: OperationDeps, path: string | undefined, ca
 }
 
 /**
+ * The nearest directory at or above `dir` that no workspace contains, so a
+ * workspace created from inside another one goes beside it instead of inside it.
+ * @param workspaces - the workspace manager.
+ * @param dir - absolute starting directory.
+ * @returns the directory.
+ */
+async function outsideWorkspaces(workspaces: WorkspaceManager, dir: string): Promise<string> {
+  let current = dir
+  while (current !== dirname(current) && await insideWorkspace(workspaces, current)) current = dirname(current)
+  return current
+}
+
+async function insideWorkspace(workspaces: WorkspaceManager, dir: string): Promise<boolean> {
+  try {
+    await workspaces.locate(dir)
+    return true
+  } catch (error) {
+    // `not-found`: no workspace contains the directory.
+    if (error instanceof RepoError && error.code === 'not-found') return false
+    throw error
+  }
+}
+
+/**
  * Create a workspace; a tool call also makes it the Agent's working directory.
  * @param deps - collaborators.
  * @param args - repository, directory, base, start commit, and branch.
@@ -144,7 +169,7 @@ export async function createWorkspace(deps: OperationDeps, args: CreateArgs, cal
     agent = requireAgent(caller, 'repo_workspace_create')
     const root = (agent as Agent).session?.header.cwd
     const current = await currentDirectory(deps, agent, caller.signal)
-    const parent = root === undefined || within(root, current) ? current : root
+    const parent = await outsideWorkspaces(deps.workspaces, root === undefined || within(root, current) ? current : root)
     path = path === undefined ? await freeDirectory(parent, basename(url.replace(/\/+$/, '').replace(/\.git$/, '')) || 'repo') : resolve(current, path)
     // Compared also through real paths: a symbolic link inside the Session directory may lead outside it.
     if (root !== undefined && (!within(root, path) || !within(await realPathOf(root), await realPathOf(path)))) throw new RepoError('invalid', `工作区目录必须在会话目录 ${root} 里面：${path}`)
