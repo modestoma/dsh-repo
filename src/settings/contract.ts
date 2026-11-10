@@ -236,6 +236,8 @@ export interface RepoBranches {
   branches: string[]
   /** The remote's default branch as the latest fetch recorded it. */
   defaultBranch?: string
+  /** Whether a fetch of the mirror is running; the list may grow once it ends. */
+  fetching: boolean
 }
 
 /** Where a repository's local sync stands. */

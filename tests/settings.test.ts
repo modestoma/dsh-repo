@@ -229,6 +229,30 @@ describe('settings routes', () => {
     expect(((await (await serve()).call('/dsh-repo/state')).body as unknown as SettingsState).watchAvailable).toBe(false)
   })
 
+  it('reports a branch list as fetching while the mirror of a repository just added is cloned', async () => {
+    const remote = fileRemote()
+    const { url: repo } = remote.repo('team/new', { 'a.txt': 'a\n' })
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let held = true
+    const holding: Remote = { ...remote, git: async (args, options) => {
+      if (held && args.includes('clone')) {
+        held = false
+        await gate
+      }
+      return await remote.git(args, options)
+    } }
+    const { call, json } = await serve(undefined, {}, undefined, holding)
+    const mirrors = join(mkdtempSync(join(tmpdir(), 'dsh-repo-settings-mirrors-')), 'mirrors')
+    expect((await call('/dsh-repo/mirror', json('PUT', { dir: mirrors }))).status).toBe(200)
+    const added = await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', features: [] }))
+    const id = (added.body.state as SettingsState).repos[0]?.id
+    await vi.waitFor(() => { expect(held).toBe(false) })
+    expect((await call('/dsh-repo/repos/branches', json('POST', { id }))).body).toEqual({ ok: true, branches: [], fetching: true })
+    release?.()
+    await vi.waitFor(async () => { expect((await call('/dsh-repo/repos/branches', json('POST', { id }))).body).toEqual({ ok: true, branches: ['main'], defaultBranch: 'main', fetching: false }) })
+  })
+
   it('adds, changes, syncs, and removes catalog repositories with their local syncs, and measures the mirror directory', async () => {
     const remote = fileRemote()
     const { url: repo, dir: origin } = remote.repo('team/skills', { 'skill-a/SKILL.md': 'a\n' })
@@ -270,7 +294,7 @@ describe('settings routes', () => {
     expect(row).toMatchObject({ url: repo, access: 'write', base: 'main', features: [{ id: 'log-analysis', branch: 'main' }], localSync: { enabled: true, dir, intervalMinutes: 720 }, sync: { syncedBranch: 'main', state: 'idle' } })
     // The mirror is fetched in the background after the entry is added; its branches are then listed without contacting the remote.
     await vi.waitFor(async () => { expect(((await call('/dsh-repo/state')).body as unknown as SettingsState).repos[0]?.mirror).toMatchObject({ state: 'ready', fetchedAt: expect.any(String) }) })
-    expect((await call('/dsh-repo/repos/branches', json('POST', { id: row?.id }))).body).toEqual({ ok: true, branches: ['main'], defaultBranch: 'main' })
+    expect((await call('/dsh-repo/repos/branches', json('POST', { id: row?.id }))).body).toEqual({ ok: true, branches: ['main'], defaultBranch: 'main', fetching: false })
     expect((await call('/dsh-repo/repos/fetch', json('POST', { id: row?.id }))).status).toBe(200)
     expect((await call('/dsh-repo/repos/fetch', json('POST', { id: 'missing' }))).status).toBe(404)
     expect((await call('/dsh-repo/repos/branches', json('POST', { id: 'missing' }))).status).toBe(404)

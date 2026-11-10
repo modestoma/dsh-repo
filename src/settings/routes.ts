@@ -425,7 +425,8 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
         const entry = service.catalog.entries().find(item => item.id === id)
         if (entry === undefined) throw new HttpError(404, '仓库清单中没有这个仓库，可能已经删除')
         const listed = await service.mirrors.branches(entry.url)
-        sendJson(res, 200, { ok: true, branches: [...listed.branches], ...listed.defaultBranch === undefined ? {} : { defaultBranch: listed.defaultBranch } })
+        const fetching = service.mirrors.status(entry.url)?.state === 'fetching'
+        sendJson(res, 200, { ok: true, branches: [...listed.branches], ...listed.defaultBranch === undefined ? {} : { defaultBranch: listed.defaultBranch }, fetching })
       }),
     }),
     server.register({

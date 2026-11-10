@@ -901,9 +901,21 @@ function WorkspaceForm({ state, repos, initial, busy, onCancel, onSubmit, onOpen
   useEffect(() => {
     if (repoId === '') return undefined
     let current = true
+    let timer: ReturnType<typeof setTimeout> | undefined
     // The list only offers names; without it the field still takes any branch.
-    fetchBranches(repoId).then((listed) => { if (current) setBranches({ id: repoId, names: listed.branches, ...listed.defaultBranch === undefined ? {} : { defaultBranch: listed.defaultBranch } }) }, (_unavailable: unknown) => undefined)
-    return () => { current = false }
+    const load = (): void => {
+      fetchBranches(repoId).then((listed) => {
+        if (!current) return
+        setBranches({ id: repoId, names: listed.branches, ...listed.defaultBranch === undefined ? {} : { defaultBranch: listed.defaultBranch } })
+        // A mirror still being fetched, such as a repository just added, lists its branches once the fetch ends.
+        if (listed.fetching) timer = setTimeout(load, SYNC_POLL_MS)
+      }, (_unavailable: unknown) => undefined)
+    }
+    load()
+    return () => {
+      current = false
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }, [repoId])
   const listed = branches?.id === repoId ? branches : undefined
   const baseline = repo?.base ?? listed?.defaultBranch
