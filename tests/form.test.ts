@@ -44,6 +44,14 @@ describe('settings form', () => {
     expect(fromDraft({ ...draft, branchPattern: '^fix/' })).toEqual({ ok: false, errors: { branchPattern: expect.stringContaining('不符合分支名规则 ^fix/') } })
   })
 
+  it('rejects branch rules that only some generated names match', () => {
+    const draft = toDraft(DEFAULT_SETTINGS)
+    expect(fromDraft({ ...draft, branchTemplate: 'feature/{random}', branchPattern: '^feature/[a-z][a-z0-9]*$' })).toEqual({ ok: false, errors: { branchPattern: expect.stringContaining('不符合分支名规则') } })
+    expect(fromDraft({ ...draft, branchTemplate: 'dsh/{session}', branchPattern: '^dsh/[0-9a-f]{8}$' })).toEqual({ ok: false, errors: { branchPattern: expect.stringContaining('不符合分支名规则') } })
+    expect(fromDraft({ ...draft, branchTemplate: 'feature/{date}-{random}', branchPattern: '^feature/20[0-9]{6}-[0-9a-f]{8}$' })).toMatchObject({ ok: true })
+    expect(fromDraft({ ...draft, branchTemplate: 'dsh/{session}', branchPattern: '^dsh/[a-z0-9]{8}$' })).toMatchObject({ ok: true })
+  })
+
   it('compares drafts by the settings they save', () => {
     const draft = toDraft(DEFAULT_SETTINGS)
     expect(sameDraft(draft, toDraft(DEFAULT_SETTINGS))).toBe(true)

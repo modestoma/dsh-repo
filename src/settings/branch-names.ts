@@ -43,8 +43,37 @@ export type BranchPlaceholder = typeof BRANCH_PLACEHOLDERS[number]
 /** Values the placeholders of a template take. */
 export type BranchNameValues = Readonly<Record<BranchPlaceholder, string>>
 
-/** Values used to check a template: the longest each placeholder produces. */
+/** Values used to check that a template generates legal branch names. */
 const SAMPLE_VALUES: BranchNameValues = { session: 'a1b2c3d4', random: 'e5f6a7b8', date: '20260101' }
+
+/** Eight hexadecimal digits: all digits, all letters, and mixed in both orders. */
+const HEX_SAMPLES = ['00000000', '99999999', 'aaaaaaaa', 'ffffffff', '0a1b2c3d', 'a0b1c2d3', '01234567', '89abcdef']
+
+/**
+ * Values each placeholder is checked with against a pattern: every character
+ * class of its values at every position. `{session}` also takes letters past
+ * `f`, and its hexadecimal values cover workspaces without a Session.
+ */
+const PATTERN_SAMPLES: Readonly<Record<BranchPlaceholder, readonly string[]>> = {
+  session: [...HEX_SAMPLES, 'zzzzzzzz', 'a1z2y3x4', '0z9y8x7w'],
+  random: HEX_SAMPLES,
+  date: ['20000101', '20991231', '20261009'],
+}
+
+/**
+ * The names a template is checked with against a pattern: every combination of
+ * the {@link PATTERN_SAMPLES} of the placeholders it uses.
+ * @param template - template checked by {@link templateProblem}.
+ * @returns the names.
+ */
+function patternSamples(template: string): string[] {
+  let combinations: Partial<Record<BranchPlaceholder, string>>[] = [{}]
+  for (const name of BRANCH_PLACEHOLDERS) {
+    if (!template.includes(`{${name}}`)) continue
+    combinations = combinations.flatMap(values => PATTERN_SAMPLES[name].map(value => ({ ...values, [name]: value })))
+  }
+  return combinations.map(values => renderBranchName(template, { ...SAMPLE_VALUES, ...values }))
+}
 
 const PLACEHOLDER = /\{([^{}]*)\}/g
 
@@ -104,13 +133,13 @@ export function matchesBranchPattern(name: string, pattern: string): boolean {
  * Why a template and a pattern cannot be used together.
  * @param template - candidate template.
  * @param pattern - candidate pattern; empty means no rule.
- * @returns the reason, or undefined when the template is valid, the pattern is valid, and the names the template generates match the pattern.
+ * @returns the reason, or undefined when the template is valid, the pattern is valid, and every name in the template's {@link PATTERN_SAMPLES} combinations matches the pattern.
  */
 export function branchRulesProblem(template: string, pattern: string): string | undefined {
   const problem = templateProblem(template) ?? patternProblem(pattern)
   if (problem !== undefined) return problem
-  const sample = renderBranchName(template, SAMPLE_VALUES)
-  if (!matchesBranchPattern(sample, pattern)) return `分支命名模板生成的名字（例如 ${sample}）不符合分支名规则 ${pattern}`
+  const mismatch = patternSamples(template).find(sample => !matchesBranchPattern(sample, pattern))
+  if (mismatch !== undefined) return `分支命名模板生成的名字（例如 ${mismatch}）不符合分支名规则 ${pattern}`
   return undefined
 }
 
