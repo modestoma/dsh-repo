@@ -1180,7 +1180,10 @@ export interface DshRepoService {
   ciCancel(params: CiActionParams & WriteOptions): Promise<CiActionResult>
 
   /**
-   * Fetch the mirror and hold read-only files of a commit, creating them on first use.
+   * Hold read-only files of a commit, creating them on first use. A branch or
+   * tag fetches the mirror first; a full commit id already in the mirror is
+   * used without contacting the remote, so it stays available while the remote
+   * is unreachable.
    * @returns the lease.
    * @throws `not-found` for a missing ref, `unavailable` while no mirror directory is set or git fails.
    */

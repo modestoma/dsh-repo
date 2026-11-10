@@ -311,6 +311,22 @@ describe('service calls', () => {
     leases.releaseAll()
     expect(release).toHaveBeenCalledTimes(2)
   })
+
+  it('use a full commit id already in the mirror without fetching, and fetch a commit the mirror lacks', async () => {
+    const held = 'e'.repeat(40)
+    const sync = vi.fn(async () => { throw new RepoError('unavailable', 'remote unreachable') })
+    const existing = vi.fn(async (_url: string, commit: string) => {
+      if (commit !== held) throw new RepoError('not-found', `no ${commit}`)
+      return '/mirror'
+    })
+    const acquire = vi.fn(async (_url: string, commit: string) => ({ commit, dir: '/snap', release: () => {} }))
+    const repos = api(fakeService({ mirrors: { sync }, mirrorStore: { existing, acquire } }))
+    await expect(repos.snapshotAcquire({ repo: 'github.com/a/b', ref: held })).resolves.toMatchObject({ commit: held, path: '/snap' })
+    expect(sync).not.toHaveBeenCalled()
+    await expect(repos.snapshotAcquire({ repo: 'github.com/a/b', ref: 'f'.repeat(40) })).rejects.toMatchObject({ code: 'unavailable' })
+    expect(sync).toHaveBeenCalledTimes(1)
+    expect(acquire).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('workspace operations', () => {
@@ -402,6 +418,13 @@ describe('workspace operations', () => {
       watching: true,
     })
     expect(track).toHaveBeenCalledWith({ repo: 'https://github.com/a/b', mr, session: 'session-1', source: 'created', pushed: 'd'.repeat(40) })
+
+    expect(listMrs).toHaveBeenCalledWith('https://github.com/a/b', expect.objectContaining({ state: 'open', sourceBranch: 'fix/a', perPage: testSettings().limits.maxPerPage }))
+
+    // The lookup pages by the configured maximum page size.
+    const smallPages = fakeService({ forge: { listMrs, createMr }, hosts: { tokenIdentity: async () => ({ name: 'bot', email: 'bot@example.com' }) } }, () => testSettings({ limits: { perPage: 20, maxPerPage: 50 } }))
+    await tools(smallPages, { approval: { request }, workingDirectory, workspaces }).get('repo_workspace_push')!.execute({ message: 'fix: c' }, run)
+    expect(listMrs).toHaveBeenLastCalledWith('https://github.com/a/b', expect.objectContaining({ perPage: 50 }))
 
     // A failed PR/MR lookup is reported; the push already happened.
     listMrs.mockRejectedValueOnce(new RepoError('forbidden', 'no access'))
