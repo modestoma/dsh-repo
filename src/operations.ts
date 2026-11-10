@@ -310,13 +310,13 @@ export const OPERATIONS: readonly Operation[] = [
     method: 'mrCreate',
     access: 'write',
     description: 'Open a pull request (GitHub) or merge request (GitLab) from a pushed branch. repo_workspace_push can open one in the same step. When the settings delete source branches, a GitLab MR is opened with "delete source branch" ticked, so GitLab removes the branch once it is merged. While PR/MR watching is on, its CI results, comments, reviews, and merge or close arrive in this session as messages (`watching` in the result), so do not poll it. Requires user approval.',
-    schema: z.object({ repo, title: z.string().min(1), body: mrBody, sourceBranch: z.string().min(1), targetBranch: z.string().optional(), draft: z.boolean().optional(), labels, assignees }).strict(),
+    schema: z.object({ repo, title: z.string().min(1), body: mrBody, sourceBranch: z.string().min(1), targetBranch: z.string().optional().describe('Branch to merge into; default the repository\'s baseline branch in the catalog, else its default branch'), draft: z.boolean().optional(), labels, assignees }).strict(),
     write: {
       level: 'write',
       authorize: 'code-write',
       prompt: args => ({
-        zh: `创建${args.draft === true ? '草稿 ' : ''}PR/MR\n仓库：${args.repo}\n分支：${args.sourceBranch} → ${args.targetBranch ?? '默认分支'}\n标题：${args.title}`,
-        en: `Open a ${args.draft === true ? 'draft ' : ''}PR/MR\nRepository: ${args.repo}\nBranches: ${args.sourceBranch} → ${args.targetBranch ?? 'default branch'}\nTitle: ${args.title}`,
+        zh: `创建${args.draft === true ? '草稿 ' : ''}PR/MR\n仓库：${args.repo}\n分支：${args.sourceBranch} → ${args.targetBranch ?? '基线分支'}\n标题：${args.title}`,
+        en: `Open a ${args.draft === true ? 'draft ' : ''}PR/MR\nRepository: ${args.repo}\nBranches: ${args.sourceBranch} → ${args.targetBranch ?? 'baseline branch'}\nTitle: ${args.title}`,
       }),
     },
     run: async (args, deps, caller) => {

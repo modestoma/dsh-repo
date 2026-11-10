@@ -812,7 +812,7 @@ export interface MrCreateParams extends RepoParams {
   /** The tools' signature setting is appended. */
   readonly body?: string
   readonly sourceBranch: string
-  /** Default: the repository's default branch. */
+  /** Default: the catalog entry's baseline branch, else the remote's default branch. */
   readonly targetBranch?: string
   readonly draft?: boolean
   readonly labels?: readonly string[]

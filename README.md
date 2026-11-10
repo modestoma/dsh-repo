@@ -129,7 +129,7 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | `repo_issue_list` / `repo_issue_get` | issue 列表（可用 `search` 搜索标题和描述）、单个 issue 及评论 | 否 |
 | `repo_issue_create` / `repo_issue_update` / `repo_issue_comment` | 创建、修改、关闭或重开、评论 issue | 是 |
 | `repo_mr_list` / `repo_mr_get` / `repo_mr_diff` / `repo_mr_status` | PR/MR 列表、详情与评论、diff、CI 与可合并状态；CI 检查带 `runId` / `jobId` 时可以接着用 CI 工具查看 | 否 |
-| `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR；创建和重开的 PR/MR 自动跟踪 | 是 |
+| `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR；创建时不给目标分支就合回仓库清单里的基线分支，没设基线时合回默认分支；创建和重开的 PR/MR 自动跟踪 | 是 |
 | `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；按设置一并删除源分支；只合并权限为「可合并」的仓库 | 是 |
 | `repo_mr_watch` | 让本会话跟踪一个打开中的 PR/MR，或停止跟踪，见[跟踪 PR/MR](#跟踪-prmr)；跟踪可用时才提供 | 否 |
 | `repo_ci_list` | CI 运行列表（GitLab 流水线、GitHub Actions workflow run），可按分支或 tag、提交、PR/MR、状态过滤，见[查看 CI](#查看-ci) | 否 |
