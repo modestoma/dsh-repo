@@ -1,8 +1,9 @@
 /**
  * The mirrors as the rest of the plugin reaches them: the chosen mirror
  * directory, which is checked against the forbidden roots and stored in the
- * settings file, and mirror fetches that require the address in the catalog
- * and hand git the host's token.
+ * settings file, mirror fetches that require the address in the catalog and
+ * hand git the host's token, and the state of each catalog address's latest
+ * fetch since the plugin started or the mirror directory changed.
  *
  * @module dsh-repo/mirror/access
  */
@@ -13,11 +14,18 @@ import type { RepoCatalog } from '../catalog/catalog.ts'
 import { RepoError } from '../errors.ts'
 import type { HostRegistry } from '../forge/hosts.ts'
 import type { HostLogger } from '../host.ts'
-import type { MirrorSettings, MirrorUsage } from '../settings/contract.ts'
+import type { MirrorSettings, MirrorStatus, MirrorUsage } from '../settings/contract.ts'
 import type { SettingsStore } from '../settings/store.ts'
 import { credentialEnvironment } from './git.ts'
 import { checkMirrorDir } from './root.ts'
 import type { MirrorState, MirrorStore } from './store.ts'
+
+/** A branch a repository is required to have, with what it is for. */
+export interface RequiredBranch {
+  readonly name: string
+  /** Field the branch was entered in, for the message, e.g. `基线分支`. */
+  readonly label: string
+}
 
 /** Collaborators of {@link Mirrors}. */
 export interface MirrorsDeps {
@@ -34,6 +42,8 @@ export interface MirrorsDeps {
    */
   readonly forbiddenRoots: readonly string[]
   readonly logger?: HostLogger
+  /** Current time; tests substitute it. */
+  readonly now?: () => number
 }
 
 /** The mirror directory and catalog-checked mirror fetches. */
@@ -42,6 +52,11 @@ export class Mirrors {
   readonly store: MirrorStore
   /** Why the stored mirror directory is not in use, while it was rejected at construction. */
   private problem: string | undefined
+  /** Latest fetch of each catalog address, keyed by the address as the catalog stores it. */
+  private readonly statuses = new Map<string, MirrorStatus>()
+  /** Background fetches running, keyed like {@link statuses}. */
+  private readonly background = new Map<string, Promise<void>>()
+  private readonly now: () => number
 
   /**
    * A mirror directory stored in the settings file replaces the store's
@@ -51,6 +66,7 @@ export class Mirrors {
    */
   constructor(private readonly deps: MirrorsDeps) {
     this.store = deps.store
+    this.now = deps.now ?? Date.now
     const stored = deps.settings.mirrorDir()
     if (stored === undefined) return
     try {
@@ -86,6 +102,8 @@ export class Mirrors {
     await this.deps.settings.setMirrorDir(target)
     this.store.setRoot(target)
     this.problem = undefined
+    // Mirrors in the new directory are cloned afresh, so earlier states say nothing about them.
+    this.statuses.clear()
     this.deps.hosts.notify({ kind: 'mirror', dir: target })
     return this.settings()
   }
@@ -107,8 +125,82 @@ export class Mirrors {
    * @throws {RepoError} `not-allowed` outside the catalog, `unavailable` while no mirror directory is set, and the mirror's failures.
    */
   async sync(url: string, options: { readonly branch?: string; readonly signal?: AbortSignal } = {}): Promise<MirrorState> {
-    const env = await this.auth(url)
-    return await this.store.sync(url, options.branch, env, options.signal)
+    const previous = this.statuses.get(url)
+    this.statuses.set(url, { state: 'fetching', ...previous?.fetchedAt === undefined ? {} : { fetchedAt: previous.fetchedAt } })
+    try {
+      const env = await this.auth(url)
+      const state = await this.store.sync(url, options.branch, env, options.signal)
+      this.statuses.set(url, { state: 'ready', fetchedAt: new Date(this.now()).toISOString() })
+      return state
+    } catch (error) {
+      this.record(url, previous, error, options.signal)
+      throw error
+    }
+  }
+
+  /** Record how a fetch of `url` ended after it threw. */
+  private record(url: string, previous: MirrorStatus | undefined, error: unknown, signal: AbortSignal | undefined): void {
+    const code = error instanceof RepoError ? error.code : undefined
+    if (code === 'not-found') {
+      // The fetch succeeded; the requested branch or commit is what is missing.
+      this.statuses.set(url, { state: 'ready', fetchedAt: new Date(this.now()).toISOString() })
+    } else if (signal?.aborted === true || code === 'not-allowed') {
+      // A cancelled call, or an address outside the catalog, says nothing about the mirror.
+      if (previous === undefined) this.statuses.delete(url)
+      else this.statuses.set(url, previous)
+    } else {
+      this.statuses.set(url, { state: 'failed', ...previous?.fetchedAt === undefined ? {} : { fetchedAt: previous.fetchedAt }, error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  /**
+   * The latest fetch of a catalog address.
+   * @param url - address as the catalog stores it.
+   * @returns the state, or undefined before the first fetch since the plugin started or the mirror directory changed.
+   */
+  status(url: string): MirrorStatus | undefined {
+    return this.statuses.get(url)
+  }
+
+  /**
+   * Fetch a catalog address in the background; a fetch already running in the background is not started again.
+   * @param url - address as the catalog stores it.
+   * @returns when the fetch ended; its failure is recorded in {@link status}, never thrown.
+   */
+  prefetch(url: string): Promise<void> {
+    const running = this.background.get(url)
+    if (running !== undefined) return running
+    const started = this.sync(url).then(() => undefined, (error: unknown) => {
+      this.deps.logger?.warn?.('dsh-repo: 后台拉取 %s 失败：%s', url, error instanceof Error ? error.message : String(error))
+    }).finally(() => { this.background.delete(url) })
+    this.background.set(url, started)
+    return started
+  }
+
+  /**
+   * Check that a repository on a configured host can be reached with its host's token and has the given branches.
+   * Contacts the remote with the API deadline; the catalog is not consulted, so a repository can be checked before it is added.
+   * @param url - accepted git address.
+   * @param branches - branches the repository must have.
+   * @param signal - cancellation.
+   * @throws {RepoError} `invalid` naming the first missing branch, `not-allowed` without a configured host, `unauthenticated` when the host's token is unset, `unavailable` when the remote cannot be reached or refuses the token.
+   */
+  async checkRemote(url: string, branches: readonly RequiredBranch[], signal?: AbortSignal): Promise<void> {
+    const credentials = await this.deps.hosts.gitCredentials(url)
+    const env = credentialEnvironment(credentials.hostUrl, credentials.username, credentials.token)
+    const remote = await this.store.remoteBranches(url, env, this.deps.settings.settings().timeoutMs, signal)
+    const missing = branches.find(branch => !remote.branches.includes(branch.name))
+    if (missing !== undefined) throw new RepoError('invalid', `${url} 没有分支 ${missing.name}（${missing.label}）`)
+  }
+
+  /**
+   * The branches a catalog address's mirror holds, without contacting the remote.
+   * @param url - address as the catalog stores it.
+   * @returns the sorted branches and the default branch; no branches before the first fetch.
+   * @throws {RepoError} `unavailable` while no mirror directory is set or git fails.
+   */
+  async branches(url: string): Promise<{ readonly branches: readonly string[]; readonly defaultBranch?: string }> {
+    return await this.store.localBranches(url)
   }
 
   /**

@@ -15,7 +15,11 @@ import type { RepoService } from '../service.ts'
 import type { DirectoryPicker } from './directory-picker.ts'
 import { hostDirectoryPicker } from './directory-picker.ts'
 import type { WorkspacePanel } from '../workspace/panel.ts'
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE, WORKSPACE_DIR_ROUTE, WORKSPACES_ROUTE } from './contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_BRANCHES_ROUTE, REPO_FETCH_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE, WORKSPACE_DIR_ROUTE, WORKSPACES_ROUTE } from './contract.ts'
+import { checkInput } from '../catalog/entry.ts'
+import { branchRulesProblem } from './branch-names.ts'
+import type { CatalogEntry, CheckedInput } from '../catalog/entry.ts'
+import type { RequiredBranch } from '../mirror/access.ts'
 import type { LocalSyncStatus, RepoInput, RepoRow, SettingsState, WatchInfo, WorkspaceCreateInput } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
@@ -34,7 +38,7 @@ const hostUrlSchema = z.object({ url: z.string() }).strict()
 const hostTokenSchema = z.object({ url: z.string(), value: z.string() }).strict()
 const mirrorSchema = z.object({ dir: z.string() }).strict()
 const watchIdSchema = z.object({ id: z.string() }).strict()
-const workspaceCreateSchema = z.object({ repo: z.string(), base: z.string().optional(), branch: z.string().optional(), name: z.string().optional() }).strict()
+const workspaceCreateSchema = z.object({ repo: z.string(), base: z.string().optional(), name: z.string().optional() }).strict()
 const workspaceRemoveSchema = z.object({ id: z.string(), force: z.boolean().optional() }).strict()
 
 /** The PR/MR watcher as the settings page uses it. */
@@ -50,10 +54,12 @@ const NO_WATCHES: WatchList = { active: false, list: () => [], remove: async () 
 
 const repoFields = {
   url: z.string(),
-  branch: z.string().optional(),
+  base: z.string().optional(),
   access: z.enum(['read', 'write', 'merge']),
-  features: z.array(z.string()),
-  localSync: z.object({ enabled: z.boolean(), dir: z.string(), intervalMinutes: z.number().optional() }).strict().optional(),
+  features: z.array(z.object({ id: z.string(), branch: z.string().optional() }).strict()),
+  localSync: z.object({ enabled: z.boolean(), dir: z.string(), intervalMinutes: z.number().optional(), branch: z.string().optional() }).strict().optional(),
+  branchTemplate: z.string().optional(),
+  branchPattern: z.string().optional(),
 }
 const repoAddSchema = z.object(repoFields).strict()
 const repoUpdateSchema = z.object({ id: z.string(), ...repoFields }).strict()
@@ -73,7 +79,6 @@ function workspaceInput(body: z.output<typeof workspaceCreateSchema>): Workspace
   return {
     repo: body.repo,
     ...body.base === undefined ? {} : { base: body.base },
-    ...body.branch === undefined ? {} : { branch: body.branch },
     ...body.name === undefined ? {} : { name: body.name },
   }
 }
@@ -99,11 +104,44 @@ function repoInput(body: z.output<typeof repoAddSchema>): RepoInput {
   const { localSync } = body
   return {
     url: body.url,
-    ...body.branch === undefined ? {} : { branch: body.branch },
+    ...body.base === undefined ? {} : { base: body.base },
     access: body.access,
-    features: body.features,
-    ...localSync === undefined ? {} : { localSync: { enabled: localSync.enabled, dir: localSync.dir, ...localSync.intervalMinutes === undefined ? {} : { intervalMinutes: localSync.intervalMinutes } } },
+    features: body.features.map(item => ({ id: item.id, ...item.branch === undefined ? {} : { branch: item.branch } })),
+    ...localSync === undefined
+      ? {}
+      : { localSync: { enabled: localSync.enabled, dir: localSync.dir, ...localSync.intervalMinutes === undefined ? {} : { intervalMinutes: localSync.intervalMinutes }, ...localSync.branch === undefined ? {} : { branch: localSync.branch } } },
+    ...body.branchTemplate === undefined ? {} : { branchTemplate: body.branchTemplate },
+    ...body.branchPattern === undefined ? {} : { branchPattern: body.branchPattern },
   }
+}
+
+/** The branches an entry names, with the field each was entered in. */
+function namedBranches(service: RepoService, entry: CheckedInput | CatalogEntry): RequiredBranch[] {
+  const titles = new Map(service.catalog.registeredFeatures().map(feature => [feature.id, feature.title]))
+  return [
+    ...entry.base === undefined ? [] : [{ name: entry.base, label: '基线分支' }],
+    ...entry.features.flatMap(item => item.branch === undefined ? [] : [{ name: item.branch, label: `「${titles.get(item.id) ?? item.id}」的分支` }]),
+    ...entry.localSync?.branch === undefined ? [] : [{ name: entry.localSync.branch, label: '本地同步分支' }],
+  ]
+}
+
+/**
+ * Before a catalog entry is saved, check that the names its branch name
+ * template generates match its branch name pattern, each taken from the entry
+ * or else from the run-time settings; and, when the entry is new or its address
+ * or branches change, that the repository can be reached with its host's token
+ * and has every branch the entry names, so a mistake shows in the form instead
+ * of at the first use.
+ * @throws {RepoError} `invalid` for mismatched branch rules or a missing branch, and the failures of `Mirrors.checkRemote`.
+ */
+async function checkReachable(service: RepoService, input: RepoInput, existing: CatalogEntry | undefined): Promise<void> {
+  const checked = checkInput(input)
+  const workspace = service.settings.current.workspace
+  const rulesIssue = branchRulesProblem(checked.branchRules?.template ?? workspace.branchTemplate, checked.branchRules?.pattern ?? workspace.branchPattern)
+  if (rulesIssue !== undefined) throw new RepoError('invalid', rulesIssue)
+  const wanted = namedBranches(service, checked)
+  if (existing !== undefined && existing.url === checked.url && JSON.stringify(namedBranches(service, existing).map(item => item.name)) === JSON.stringify(wanted.map(item => item.name))) return
+  await service.mirrors.checkRemote(checked.url, wanted)
 }
 
 /**
@@ -116,14 +154,17 @@ export function repoRows(service: RepoService, syncs: SyncList = NO_SYNCS): Repo
   return service.catalog.entries().map((entry) => {
     const own = service.catalog.keyOf(entry)
     const sync = syncs.status(entry.id)
+    const mirror = service.mirrors.status(entry.url)
     return {
       id: entry.id,
       url: entry.url,
-      ...entry.branch === undefined ? {} : { branch: entry.branch },
+      ...entry.base === undefined ? {} : { base: entry.base },
       access: entry.access,
-      features: [...entry.features],
+      features: entry.features.map(item => ({ ...item })),
       ...entry.localSync === undefined ? {} : { localSync: { ...entry.localSync } },
+      ...entry.branchRules === undefined ? {} : { branchRules: { ...entry.branchRules } },
       addedAt: entry.addedAt,
+      ...mirror === undefined ? {} : { mirror },
       ...'key' in own ? { key: own.key } : { problem: own.problem },
       ...sync === undefined ? {} : { sync },
     }
@@ -351,12 +392,40 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
           const entry = method === 'PUT'
             ? await (async () => {
               const { id, ...body } = await readJsonBody(req, repoUpdateSchema)
-              return await service.catalog.update(id, repoInput(body))
+              const input = repoInput(body)
+              await checkReachable(service, input, service.catalog.entries().find(item => item.id === id))
+              return await service.catalog.update(id, input)
             })()
-            : await service.catalog.add(repoInput(await readJsonBody(req, repoAddSchema)))
+            : await (async () => {
+              const input = repoInput(await readJsonBody(req, repoAddSchema))
+              await checkReachable(service, input, undefined)
+              return await service.catalog.add(input)
+            })()
           await syncs.settled(entry.id)
         }
         await reply(res)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: REPO_FETCH_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        const { id } = await readJsonBody(req, repoIdSchema)
+        const entry = service.catalog.entries().find(item => item.id === id)
+        if (entry === undefined) throw new HttpError(404, '仓库清单中没有这个仓库，可能已经删除')
+        void service.mirrors.prefetch(entry.url)
+        await reply(res)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: REPO_BRANCHES_ROUTE,
+      handler: guarded(gate, ['POST'], async (req, res) => {
+        const { id } = await readJsonBody(req, repoIdSchema)
+        const entry = service.catalog.entries().find(item => item.id === id)
+        if (entry === undefined) throw new HttpError(404, '仓库清单中没有这个仓库，可能已经删除')
+        const listed = await service.mirrors.branches(entry.url)
+        sendJson(res, 200, { ok: true, branches: [...listed.branches], ...listed.defaultBranch === undefined ? {} : { defaultBranch: listed.defaultBranch } })
       }),
     }),
     server.register({

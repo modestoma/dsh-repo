@@ -184,6 +184,49 @@ describe('mirror store', () => {
   })
 })
 
+describe('mirror fetch state', () => {
+  it('records each fetch, keeps a missing branch from counting as a failed fetch, and forgets everything when the directory changes', async () => {
+    const { root, service, remote } = setup()
+    const repo = origin(remote)
+    await allow(service, [repo.url])
+    expect(service.mirrors.status(repo.url)).toBeUndefined()
+    await service.mirrors.prefetch(repo.url)
+    const ready = service.mirrors.status(repo.url)
+    expect(ready).toEqual({ state: 'ready', fetchedAt: expect.any(String) })
+    await expect(service.mirrors.sync(repo.url, { branch: 'nope' })).rejects.toMatchObject({ code: 'not-found' })
+    expect(service.mirrors.status(repo.url)).toMatchObject({ state: 'ready' })
+    expect(await service.mirrors.branches(repo.url)).toEqual({ branches: ['main'], defaultBranch: 'main' })
+    // A repository outside the catalog says nothing about the mirror.
+    await expect(service.mirrors.sync('https://git.test/team/other')).rejects.toMatchObject({ code: 'not-allowed' })
+    expect(service.mirrors.status('https://git.test/team/other')).toBeUndefined()
+    await service.mirrors.setDir(join(root, 'moved'))
+    expect(service.mirrors.status(repo.url)).toBeUndefined()
+    expect(await service.mirrors.branches(repo.url)).toEqual({ branches: [] })
+  })
+
+  it('records a failed fetch with its reason, keeping the time of the last success', async () => {
+    let fail = false
+    const remote = fileRemote()
+    const { service } = setup({ git: async (args, options) => { if (fail && args.includes('fetch')) throw new Error('remote hung up'); return await remote.git(args, options) } })
+    const repo = origin(remote)
+    await allow(service, [repo.url])
+    await service.mirrors.prefetch(repo.url)
+    const fetchedAt = service.mirrors.status(repo.url)?.fetchedAt
+    fail = true
+    await service.mirrors.prefetch(repo.url)
+    expect(service.mirrors.status(repo.url)).toEqual({ state: 'failed', fetchedAt, error: expect.stringContaining('remote hung up') })
+  })
+
+  it('checks that a repository can be reached and has the branches an entry names, before it is in the catalog', async () => {
+    const { service, remote } = setup()
+    const repo = origin(remote)
+    git(repo.dir, 'branch', 'dev')
+    await service.mirrors.checkRemote(repo.url, [{ name: 'dev', label: '基线分支' }, { name: 'main', label: '本地同步分支' }])
+    await expect(service.mirrors.checkRemote(repo.url, [{ name: 'release', label: '基线分支' }])).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('没有分支 release（基线分支）') })
+    await expect(service.mirrors.checkRemote('https://git.test/team/missing', [])).rejects.toMatchObject({ code: 'unavailable' })
+  })
+})
+
 describe('mirror directory changes', () => {
   it('clones into the new directory and keeps held snapshots beside the old mirror', async () => {
     const { root, service, remote } = setup()

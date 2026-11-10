@@ -35,7 +35,7 @@ export type DshReposServiceName = 'dshRepos'
  * consumer misbehave; a consumer refuses a provider whose version it does not
  * know.
  */
-export type DshReposVersion = 6
+export type DshReposVersion = 7
 
 /** Code host family. */
 export type ForgeKind = 'github' | 'gitlab'
@@ -193,8 +193,7 @@ export interface FileContent {
 
 /**
  * What an `access/authorize` listener is asked to allow. dsh-repo asks for
- * `code-write` before its writes and git pushes and `admin` before
- * {@link DshRepoService.repoAdd} changes the catalog; other plugins use the
+ * `code-write` before its writes and git pushes; other plugins use the
  * levels for their own writes. Listeners refuse a level they do not know.
  */
 export type AuthorizeLevel = 'code-write' | 'wiki-read' | 'wiki-write' | 'admin'
@@ -603,14 +602,36 @@ export interface RepoFeature {
   readonly description?: string
 }
 
-/** Keeping a local directory equal to the head of the repository's branch. */
+/** Keeping a local directory equal to the head of one of the repository's branches. */
 export interface LocalSyncSpec {
   /** Whether the directory is kept up to date; a disabled sync keeps its directory and interval. */
   readonly enabled: boolean
+  /** Branch whose head the directory holds; absent: the entry's {@link CatalogRepo.base}. */
+  readonly branch?: string
   /** Absolute directory on the Host the files are expanded into. */
   readonly dir: string
   /** Minutes between two syncs. */
   readonly intervalMinutes: number
+}
+
+/** A {@link RepoFeature} turned on for one catalog repository. */
+export interface RepoFeatureSwitch {
+  /** The feature's id. */
+  readonly id: string
+  /** Branch the feature works on (for example the branch log analysis reads); absent: the entry's {@link CatalogRepo.base}. */
+  readonly branch?: string
+}
+
+/**
+ * How a repository names the branches new workspaces push to; each field
+ * absent uses the run-time setting of the same name. See
+ * `dsh-repo/settings/branch-names` for the template placeholders.
+ */
+export interface BranchRules {
+  /** Template of a generated branch name. */
+  readonly template?: string
+  /** Regular expression every new branch must match. */
+  readonly pattern?: string
 }
 
 /** One repository of the catalog. */
@@ -619,20 +640,19 @@ export interface CatalogRepo {
   readonly id: string
   /** HTTPS address on a configured host. */
   readonly url: string
-  /** Branch consumers and the local sync follow; absent follows the remote's default branch. */
-  readonly branch?: string
+  /**
+   * Baseline branch: changes to the code start from it and merge back into
+   * it. New workspaces start from its head, their PRs/MRs target it, and
+   * snapshots without a ref show it. Absent: the remote's default branch.
+   */
+  readonly base?: string
   readonly access: RepoAccess
-  /** Ids of the {@link RepoFeature}s turned on, including features whose plugin is not loaded now. */
-  readonly features: readonly string[]
+  /** The {@link RepoFeature}s turned on, including features whose plugin is not loaded now. */
+  readonly features: readonly RepoFeatureSwitch[]
   /** Absent until a local directory was configured. */
   readonly localSync?: LocalSyncSpec
-}
-
-/** Outcome of {@link DshRepoService.repoAdd}. */
-export interface RepoAddResult {
-  /** `added`: a new entry; `updated`: features were turned on; `unchanged`: nothing to do. */
-  readonly status: 'added' | 'updated' | 'unchanged'
-  readonly repo: CatalogRepo
+  /** Absent: the run-time settings name new branches. */
+  readonly branchRules?: BranchRules
 }
 
 
@@ -692,24 +712,6 @@ export interface RepoListParams {
   readonly feature?: string
 }
 
-/** Parameters of {@link DshRepoService.repoAdd}. */
-export interface RepoAddParams {
-  /** HTTPS address on a configured host. */
-  readonly repo: string
-  /** Branch of a new entry; for an existing entry it must equal the entry's branch. */
-  readonly branch?: string
-  /** Access of a new entry, default `read`; an existing entry keeps its access. */
-  readonly access?: RepoAccess
-  /** Features turned on in addition to the ones already on. */
-  readonly features?: readonly string[]
-}
-
-/** Outcome of {@link DshRepoService.repoAdd}. */
-export interface RepoAddResult {
-  /** `added`: a new entry; `updated`: features were turned on; `unchanged`: nothing to do. */
-  readonly status: 'added' | 'updated' | 'unchanged'
-  readonly repo: CatalogRepo
-}
 
 /** Parameters of {@link DshRepoService.branchList}. */
 export interface BranchListParams extends RepoParams, PageParams {
@@ -889,7 +891,7 @@ export type CiActionParams = RepoParams & ({ readonly runId: number; readonly jo
 
 /** Parameters of {@link DshRepoService.snapshotAcquire}. */
 export interface SnapshotAcquireParams extends RepoParams {
-  /** Branch, tag, or full commit id; default: the catalog entry's branch, or the default branch. */
+  /** Branch, tag, or full commit id; default: the catalog entry's baseline branch. */
   readonly ref?: string
 }
 
@@ -916,16 +918,16 @@ export interface WorkspaceCreateParams extends RepoParams {
    * the Session's directory; the service requires it.
    */
   readonly path?: string
-  /** Branch the work merges into, and starts from unless {@link branch} exists; default: the default branch. */
+  /** Branch the work starts from unless {@link branch} exists, and the default target of its PR/MR; default: the catalog entry's baseline branch. */
   readonly base?: string
   /** Full commit id on {@link base} to start from; not when {@link branch} already exists. */
   readonly commit?: string
   /**
    * Remote branch the workspace pushes to. An existing branch is continued
    * from its head; a missing one is created from the start point on the first
-   * push. Default `dsh/<first 8 characters of the Session id>` (a random
-   * suffix without a Session). Never the default branch, {@link base}, or a
-   * protected branch.
+   * push and must match the repository's branch name pattern ({@link BranchRules}).
+   * Default: a name generated from the repository's branch name template.
+   * Never the default branch, {@link base}, or a protected branch.
    */
   readonly branch?: string
 }
@@ -1104,12 +1106,6 @@ export interface DshRepoService {
   repoList(params?: RepoListParams & CallOptions): Promise<readonly CatalogRepo[]>
   /** @returns repository metadata. */
   repoGet(params: RepoParams & CallOptions): Promise<RepoInfo>
-  /**
-   * Add a repository to the catalog, or turn features on for the entry that holds it; asks `access/authorize` at level `admin`.
-   * @returns the outcome and the entry.
-   * @throws `invalid` for a bad address, branch, or feature id; `not-allowed` for an unconfigured host; `conflict` when the entry follows another branch; `too-large` when the catalog is full.
-   */
-  repoAdd(params: RepoAddParams & WriteOptions): Promise<RepoAddResult>
 
   /** @returns one page of branches. */
   branchList(params: BranchListParams & CallOptions): Promise<Page<BranchInfo>>
@@ -1191,7 +1187,7 @@ export interface DshRepoService {
   /**
    * Clone the repository into a new workspace (objects borrowed from the mirror) and check out its branch.
    * @returns the workspace.
-   * @throws `invalid` for a bad path, branch, or commit; `not-found` for a missing base or commit; `unavailable` while no mirror directory is set or git fails.
+   * @throws `invalid` for a bad path, branch, or commit, or a new branch that breaks the repository's branch name pattern; `not-found` for a missing base or commit; `unavailable` while no mirror directory is set or git fails.
    */
   workspaceCreate(params: WorkspaceCreateParams & WriteOptions & { readonly path: string }): Promise<WorkspaceInfo>
   /** @returns the workspaces whose directories still exist, oldest first. */

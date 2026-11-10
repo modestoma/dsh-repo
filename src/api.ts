@@ -11,7 +11,7 @@ import type {
   BranchDeleteParams, BranchGetParams, BranchInfo, BranchListParams, CallerAgent, CallOptions, CatalogRepo, CiActionParams, CiActionResult, CiGetParams, CiJobLog, CiListParams, CiLogParams,
   CiRun, CiRunDetail, CommentInfo, CommentParams, CommitInfo, CommitListParams, DshRepoService, FileContent, FileReadParams, HostCreate, HostInfo, HostsChange, IssueCreateParams, IssueDetail,
   IssueInfo, IssueListParams, IssueUpdateParams, MergedBranchDeletion, MergeResult, MrCreateParams, MrDetail, MrDiff, MrInfo, MrListParams, MrMergeParams, MrStatus, MrUpdateParams, MrWatchParams,
-  MrWatchResult, NumberParams, Page, RepoAddParams, RepoAddResult, RepoFeature, RepoInfo, RepoListParams, RepoParams, RepoPublicSettings, RepoRef, RepoSettingsUpdate, RepoTarget, SnapshotAcquireParams,
+  MrWatchResult, NumberParams, Page, RepoFeature, RepoInfo, RepoListParams, RepoParams, RepoPublicSettings, RepoRef, RepoSettingsUpdate, RepoTarget, SnapshotAcquireParams,
   SnapshotLease, TreeListing, TreeListParams, WatchState, WorkspaceCreateParams, WorkspaceInfo, WorkspaceListParams, WorkspacePathParams, WorkspacePushParams, WorkspacePushResult,
   WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceStatus, WriteOptions,
 } from './contract.ts'
@@ -32,7 +32,7 @@ const NEVER = new AbortController().signal
 
 /** The `dshRepos` service. */
 export class DshReposApi implements DshRepoService {
-  readonly version = 6 as const
+  readonly version = 7 as const
   private readonly service: RepoService
 
   /** @param deps - operation collaborators and proxy control. */
@@ -42,7 +42,6 @@ export class DshReposApi implements DshRepoService {
 
   repoList(params: RepoListParams & CallOptions = {}): Promise<readonly CatalogRepo[]> { return this.call('repoList', params) }
   repoGet(params: RepoParams & CallOptions): Promise<RepoInfo> { return this.call('repoGet', params) }
-  repoAdd(params: RepoAddParams & WriteOptions): Promise<RepoAddResult> { return this.call('repoAdd', params) }
   branchList(params: BranchListParams & CallOptions): Promise<Page<BranchInfo>> { return this.call('branchList', params) }
   branchGet(params: BranchGetParams & CallOptions): Promise<BranchInfo | null> { return this.call('branchGet', params) }
   branchDelete(params: BranchDeleteParams & WriteOptions): Promise<MergedBranchDeletion> { return this.call('branchDelete', params) }

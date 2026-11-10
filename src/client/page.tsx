@@ -11,10 +11,11 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { ForgeKind, HostInfo, RepoAccess, RepoFeature, TokenStatus } from '../contract.ts'
+import type { ForgeKind, HostInfo, RepoAccess, RepoFeature, RepoFeatureSwitch, TokenStatus } from '../contract.ts'
 import { ACCESS_LEVELS, DEFAULT_SYNC_INTERVAL_MINUTES, FORGE_KINDS, forgeKindInfo } from '../settings/contract.ts'
-import type { HostAddRequest, LocalSyncStatus, MirrorUsage, RepoInput, RepoRow, SettingsState, WatchInfo, WorkspaceRow } from '../settings/contract.ts'
-import { addHost, addRepo, clearHostToken, clearWorkspaceDir, createWorkspace, fetchMirrorUsage, fetchState, fetchWorkspaces, messageOf, pickDirectory, removeHost, removeRepo, removeWorkspace, clearMirrorDir, RequestError, resetSettings, saveHostToken, saveMirrorDir, saveSettings, saveWorkspaceDir, stopWatch, syncRepo, updateRepo } from './api.ts'
+import type { HostAddRequest, LocalSyncStatus, MirrorStatus, MirrorUsage, RepoInput, RepoRow, SettingsState, WatchInfo, WorkspaceRow } from '../settings/contract.ts'
+import { describeBranchTemplate } from '../settings/branch-names.ts'
+import { addHost, addRepo, clearHostToken, clearWorkspaceDir, createWorkspace, fetchBranches, fetchMirrorUsage, fetchRepo, fetchState, fetchWorkspaces, messageOf, pickDirectory, removeHost, removeRepo, removeWorkspace, clearMirrorDir, RequestError, resetSettings, saveHostToken, saveMirrorDir, saveSettings, saveWorkspaceDir, stopWatch, syncRepo, updateRepo } from './api.ts'
 import { formatBytes, formatInterval, fromDraft, intervalHoursText, NUMBER_FIELDS, parseIntervalHours, sameDraft, toDraft, WATCH_ACTIONS, WATCH_EVENTS, WRITE_MODES } from './form.ts'
 import type { DraftField, NumberKey, SettingsDraft } from './form.ts'
 import { useWorkspaceOpener } from './navigation.ts'
@@ -55,7 +56,7 @@ function until(iso: string, now: number): string {
   return `${Math.floor(seconds / 86_400)} 天后`
 }
 
-/** How often the page refreshes while a local sync is queued or running. */
+/** How often the page refreshes while a local sync is queued or running or a mirror is being fetched. */
 const SYNC_POLL_MS = 2000
 
 /** Credential store layers of `@deepseek-ai/dsh-credentials-local` other than its own file. */
@@ -141,7 +142,7 @@ function SettingsPanel(): JSX.Element {
 
   useEffect(() => { void reload() }, [reload])
 
-  const syncing = tab === 'repos' && !busy && state?.repos.some(repo => repo.sync !== undefined && repo.sync.state !== 'idle') === true
+  const syncing = tab === 'repos' && !busy && state?.repos.some(repo => (repo.sync !== undefined && repo.sync.state !== 'idle') || repo.mirror?.state === 'fetching') === true
   useEffect(() => {
     if (!syncing) return undefined
     const timer = setTimeout(() => { void reload() }, SYNC_POLL_MS)
@@ -561,7 +562,7 @@ function ReposTab({ state, busy, run, onError, onCreateWorkspace }: { state: Set
   const [adding, setAdding] = useState(false)
   const [editing, setEditing] = useState<string | undefined>()
   const now = Date.now()
-  const form = { features: state.features, picker: state.pickerAvailable, busy, onError }
+  const form = { features: state.features, picker: state.pickerAvailable, rules: state.settings.workspace, busy, onError }
   return (
     <>
       <Section>
@@ -575,7 +576,7 @@ function ReposTab({ state, busy, run, onError, onCreateWorkspace }: { state: Set
           ? <RepoForm {...form} onCancel={() => { setAdding(false) }} onSubmit={(input) => { void run(() => addRepo(input), repoNotice(item => item.url === input.url.trim(), '已加入仓库清单')).then((ok) => { if (ok) setAdding(false) }) }} />
           : <div className="dr__addRow"><button type="button" className="dr__link" disabled={busy} onClick={() => { setAdding(true) }}>＋ 添加仓库</button></div>}
       </Section>
-      <p className="dr__secFoot">清单外的仓库一律不能访问。权限：只读可以读代码、issue、PR/MR 和 CI，也可以在本机检出工作区；可改代码另外可以推送工作区、创建和评论 issue 与 PR/MR、重试或取消 CI、删除已合并的分支；可合并另外可以合并 PR/MR。功能开关由其他插件登记，例如日志分析插件用它决定分析哪些仓库。本地同步把分支最新提交定时展开到本机目录（只有普通文件，没有 .git）：只写入有变化的文件，删除分支上已删除的文件，本地改过的文件恢复成仓库里的版本；第一次同步要求目录不存在或为空；关闭或删除不会删除目录里的文件。</p>
+      <p className="dr__secFoot">清单外的仓库一律不能访问。添加或改了地址、分支时先检查能否用主机令牌访问、填的分支是否存在，保存后在后台拉取镜像。基线分支是改代码的起点：新工作区从它拉出，PR/MR 默认合回它，留空是远端默认分支；功能和本地同步各自可以选分支，留空跟基线分支一致。权限：只读可以读代码、issue、PR/MR 和 CI，也可以在本机检出工作区；可改代码另外可以推送工作区、创建和评论 issue 与 PR/MR、重试或取消 CI、删除已合并的分支；可合并另外可以合并 PR/MR。功能开关由其他插件登记，例如日志分析插件用它决定分析哪些仓库。本地同步把分支最新提交定时展开到本机目录（只有普通文件，没有 .git）：只写入有变化的文件，删除分支上已删除的文件，本地改过的文件恢复成仓库里的版本；第一次同步要求目录不存在或为空；关闭或删除不会删除目录里的文件。</p>
     </>
   )
 }
@@ -588,17 +589,25 @@ function syncPill(sync: LocalSyncStatus): JSX.Element {
   return <span className="dr__pill dr__pill--ok"><span className="dr__dot" />已同步</span>
 }
 
+function mirrorPill(mirror: MirrorStatus): JSX.Element {
+  if (mirror.state === 'fetching') return <span className="dr__pill dr__pill--warn"><span className="dr__dot" />{mirror.fetchedAt === undefined ? '拉取中' : '更新中'}</span>
+  if (mirror.state === 'failed') return <span className="dr__pill dr__pill--bad"><span className="dr__dot" />拉取失败</span>
+  return <span className="dr__pill dr__pill--ok"><span className="dr__dot" />已拉取</span>
+}
+
 /** Whether the page offers 「新建工作区」 for a catalog repository: it can be reached and its access allows pushing. */
 function canWorkIn(repo: RepoRow): boolean {
   return repo.problem === undefined && repo.access !== 'read'
 }
 
 function RepoListRow({ repo, features, now, busy, run, onEdit, onCreateWorkspace }: { repo: RepoRow; features: readonly RepoFeature[]; now: number; busy: boolean; run: Run; onEdit: () => void; onCreateWorkspace?: () => void }): JSX.Element {
-  const titles = repo.features.map(id => features.find(feature => feature.id === id)?.title ?? id)
+  const titles = repo.features.map(item => `${features.find(feature => feature.id === item.id)?.title ?? item.id}${item.branch === undefined ? '' : ` · ${item.branch}`}`)
   const sync = repo.sync
+  const mirror = repo.mirror
   const parts: string[] = []
   if (repo.localSync?.enabled === true) {
     parts.push(`每 ${formatInterval(repo.localSync.intervalMinutes)}`)
+    if (repo.localSync.branch !== undefined) parts.push(`分支 ${repo.localSync.branch}`)
     if (sync?.syncedAt !== undefined) parts.push(`上次 ${ago(sync.syncedAt, now)}${sync.commit === undefined ? '' : `（${sync.syncedBranch ?? ''} ${sync.commit.slice(0, 8)}）`}`)
     if (sync?.nextAt !== undefined) parts.push(`下次 ${until(sync.nextAt, now)}`)
   }
@@ -608,16 +617,20 @@ function RepoListRow({ repo, features, now, busy, run, onEdit, onCreateWorkspace
       <div className="dr__rowText">
         <div className="dr__rowLabel">
           <span className="dr__strong dr__mono" title={repo.url}>{name}</span>
-          <span className="dr__tag">{repo.branch ?? '默认分支'}</span>
+          <span className="dr__tag dr__mono" title="基线分支：新工作区从它拉出，PR/MR 默认合回它">基线 {repo.base ?? '默认分支'}</span>
           <span className="dr__tag">{accessText(repo.access)}</span>
           {titles.map(title => <span key={title} className="dr__tag">{title}</span>)}
+          {mirror === undefined ? null : mirrorPill(mirror)}
           {sync === undefined ? null : syncPill(sync)}
         </div>
+        {repo.branchRules === undefined ? null : <div className="dr__rowSummary">分支命名 <span className="dr__mono">{[repo.branchRules.template, repo.branchRules.pattern === undefined ? undefined : `规则 ${repo.branchRules.pattern}`].filter(part => part !== undefined).join(' · ')}</span></div>}
         {repo.localSync?.enabled === true ? <div className="dr__rowSummary"><span className="dr__mono">本地同步 → {repo.localSync.dir}</span>{parts.length === 0 ? null : ` · ${parts.join(' · ')}`}</div> : null}
         {repo.problem === undefined ? null : <div className="dr__rowError">{repo.problem}</div>}
+        {mirror?.state !== 'failed' || mirror.error === undefined ? null : <div className="dr__rowError">拉取失败：{mirror.error}</div>}
         {sync?.error === undefined ? null : <div className="dr__rowError">{sync.error}</div>}
       </div>
       <div className="dr__rowCtl">
+        {mirror?.state === 'failed' ? <button type="button" className="dr__btn" disabled={busy} onClick={() => { void run(() => fetchRepo(repo.id), `已开始重新拉取 ${name}`) }}>重新拉取</button> : null}
         {onCreateWorkspace === undefined ? null : <button type="button" className="dr__btn" disabled={busy} onClick={onCreateWorkspace}>新建工作区</button>}
         {sync === undefined ? null : <button type="button" className="dr__btn" disabled={busy || sync.state !== 'idle'} onClick={() => { void run(() => syncRepo(repo.id), repoNotice(item => item.id === repo.id, `已同步 ${name}`)) }}>立即同步</button>}
         <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onEdit}>编辑</button>
@@ -627,19 +640,24 @@ function RepoListRow({ repo, features, now, busy, run, onEdit, onCreateWorkspace
   )
 }
 
-function RepoForm({ repo, features, picker, busy, onError, onCancel, onSubmit }: { repo?: RepoRow; features: readonly RepoFeature[]; picker: boolean; busy: boolean; onError: (text: string) => void; onCancel: () => void; onSubmit: (input: RepoInput) => void }): JSX.Element {
+function RepoForm({ repo, features, picker, rules, busy, onError, onCancel, onSubmit }: { repo?: RepoRow; features: readonly RepoFeature[]; picker: boolean; rules: SettingsState['settings']['workspace']; busy: boolean; onError: (text: string) => void; onCancel: () => void; onSubmit: (input: RepoInput) => void }): JSX.Element {
   const [url, setUrl] = useState(repo?.url ?? '')
-  const [branch, setBranch] = useState(repo?.branch ?? '')
+  const [base, setBase] = useState(repo?.base ?? '')
   const [access, setAccess] = useState<RepoAccess>(repo?.access ?? 'read')
-  const [enabled, setEnabled] = useState<readonly string[]>(repo?.features ?? [])
+  const [enabled, setEnabled] = useState<readonly RepoFeatureSwitch[]>(repo?.features ?? [])
   const [syncOn, setSyncOn] = useState(repo?.localSync?.enabled ?? false)
   const [dir, setDir] = useState(repo?.localSync?.dir ?? '')
+  const [syncBranch, setSyncBranch] = useState(repo?.localSync?.branch ?? '')
   const [hours, setHours] = useState(intervalHoursText(repo?.localSync?.intervalMinutes ?? DEFAULT_SYNC_INTERVAL_MINUTES))
+  const [template, setTemplate] = useState(repo?.branchRules?.template ?? '')
+  const [pattern, setPattern] = useState(repo?.branchRules?.pattern ?? '')
   const [error, setError] = useState<string | undefined>()
   // Features turned on by a plugin that is not loaded now stay listed so saving keeps them.
-  const shown = [...features, ...enabled.filter(id => !features.some(feature => feature.id === id)).map(id => ({ id, title: id, description: '登记这个功能的插件当前没有加载' }))]
+  const shown = [...features, ...enabled.filter(item => !features.some(feature => feature.id === item.id)).map(item => ({ id: item.id, title: item.id, description: '登记这个功能的插件当前没有加载' }))]
   const complete = url.trim() !== '' && (!syncOn || dir.trim() !== '')
-  const toggle = (id: string, on: boolean): void => { setEnabled(on ? [...enabled, id] : enabled.filter(item => item !== id)) }
+  const toggle = (id: string, on: boolean): void => { setEnabled(on ? [...enabled, { id }] : enabled.filter(item => item.id !== id)) }
+  const setFeatureBranch = (id: string, branch: string): void => { setEnabled(enabled.map(item => item.id === id ? { id, branch } : item)) }
+  const baseText = base.trim() === '' ? '默认分支' : base.trim()
   const submit = (): void => {
     if (!complete || busy) return
     const interval = parseIntervalHours(hours)
@@ -651,10 +669,12 @@ function RepoForm({ repo, features, picker, busy, onError, onCancel, onSubmit }:
     const keepSync = syncOn || dir.trim() !== ''
     onSubmit({
       url: url.trim(),
-      branch: branch.trim(),
+      base: base.trim(),
       access,
-      features: [...enabled],
-      ...keepSync ? { localSync: { enabled: syncOn, dir: dir.trim(), ...interval.ok ? { intervalMinutes: interval.minutes } : {} } } : {},
+      features: enabled.map(item => ({ id: item.id, ...item.branch === undefined || item.branch.trim() === '' ? {} : { branch: item.branch.trim() } })),
+      ...keepSync ? { localSync: { enabled: syncOn, dir: dir.trim(), ...interval.ok ? { intervalMinutes: interval.minutes } : {}, ...syncBranch.trim() === '' ? {} : { branch: syncBranch.trim() } } } : {},
+      branchTemplate: template.trim(),
+      branchPattern: pattern.trim(),
     })
   }
   const choose = (): void => {
@@ -665,17 +685,22 @@ function RepoForm({ repo, features, picker, busy, onError, onCancel, onSubmit }:
     <div className="dr__addForm">
       <div className="dr__formGrid">
         <label className="dr__field dr__field--full">仓库地址<input className="dr__input dr__mono" spellCheck={false} placeholder="https://gitlab.example.com/team/order-service.git" value={url} onChange={(event) => { setUrl(event.target.value) }} onKeyDown={submitOnEnter} /></label>
-        <label className="dr__field">分支（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder="默认分支" value={branch} onChange={(event) => { setBranch(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+        <label className="dr__field">基线分支（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder="默认分支" value={base} onChange={(event) => { setBase(event.target.value) }} onKeyDown={submitOnEnter} /></label>
         <label className="dr__field">权限
           <Segmented label="权限" value={access} options={ACCESS_LEVELS} disabled={busy} onChange={setAccess} />
         </label>
       </div>
+      <div className="dr__rowSummary">改代码都从基线分支拉出新分支，PR/MR 默认合回基线分支。</div>
       <div className="dr__list">
-        {shown.map(feature => (
-          <Row key={feature.id} label={feature.title} {...feature.description === undefined ? {} : { summary: feature.description }}>
-            <Switch label={feature.title} checked={enabled.includes(feature.id)} disabled={busy} onChange={(on) => { toggle(feature.id, on) }} />
-          </Row>
-        ))}
+        {shown.map((feature) => {
+          const on = enabled.find(item => item.id === feature.id)
+          return (
+            <Row key={feature.id} label={feature.title} {...feature.description === undefined ? {} : { summary: feature.description }}>
+              {on === undefined ? null : <input className="dr__input dr__mono" spellCheck={false} aria-label={`${feature.title}的分支`} placeholder={`同基线（${baseText}）`} value={on.branch ?? ''} disabled={busy} onChange={(event) => { setFeatureBranch(feature.id, event.target.value) }} onKeyDown={submitOnEnter} />}
+              <Switch label={feature.title} checked={on !== undefined} disabled={busy} onChange={(value) => { toggle(feature.id, value) }} />
+            </Row>
+          )
+        })}
         <Row label="本地同步" summary="把分支最新提交定时展开到本机目录。">
           <Switch label="本地同步" checked={syncOn} disabled={busy} onChange={setSyncOn} />
         </Row>
@@ -683,20 +708,25 @@ function RepoForm({ repo, features, picker, busy, onError, onCancel, onSubmit }:
       {syncOn
         ? (
             <div className="dr__formGrid">
-              <div className="dr__field">本地目录
+              <div className="dr__field dr__field--full">本地目录
                 <div className="dr__inline dr__inline--flush">
                   <input className="dr__input dr__mono" spellCheck={false} aria-label="本地目录" placeholder="/绝对路径/目录，不存在会自动创建" value={dir} onChange={(event) => { setDir(event.target.value) }} onKeyDown={submitOnEnter} />
                   {picker ? <button type="button" className="dr__btn" disabled={busy} onClick={choose}>选择…</button> : null}
                 </div>
               </div>
+              <label className="dr__field">同步分支（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder={`同基线（${baseText}）`} value={syncBranch} onChange={(event) => { setSyncBranch(event.target.value) }} onKeyDown={submitOnEnter} /></label>
               <label className="dr__field">同步间隔（小时）<input className="dr__input dr__mono" inputMode="decimal" aria-invalid={error === undefined ? undefined : true} value={hours} onChange={(event) => { setHours(event.target.value); setError(undefined) }} onKeyDown={submitOnEnter} /></label>
             </div>
           )
         : null}
+      <div className="dr__formGrid">
+        <label className="dr__field">分支命名模板（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder={`同全局（${rules.branchTemplate}）`} value={template} onChange={(event) => { setTemplate(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+        <label className="dr__field">分支名规则（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder={rules.branchPattern === '' ? '同全局（不限）' : `同全局（${rules.branchPattern}）`} value={pattern} onChange={(event) => { setPattern(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+      </div>
       {error === undefined ? null : <div className="dr__rowError">{error}</div>}
       <div className="dr__formActions">
         <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onCancel}>取消</button>
-        <button type="button" className="dr__btn dr__btn--primary" disabled={busy || !complete} onClick={submit}>{busy ? '保存中…' : repo === undefined ? '添加' : '保存'}</button>
+        <button type="button" className="dr__btn dr__btn--primary" disabled={busy || !complete} onClick={submit}>{busy ? (repo === undefined ? '检查中…' : '保存中…') : repo === undefined ? '添加' : '保存'}</button>
       </div>
     </div>
   )
@@ -794,7 +824,7 @@ function WorkspacesTab({ state, createFor, onCreateForm, onNotice, onOpenAdvance
       onNotice({ kind: 'ok', text: `已删除工作区 ${row.path}` })
     })
   }
-  const create = (input: { repo: string; base: string; branch: string; name: string }): void => {
+  const create = (input: { repo: string; base: string; name: string }): void => {
     void act(async () => {
       const row = await createWorkspace(input)
       onCreateForm(undefined)
@@ -861,16 +891,27 @@ function WorkspaceListRow({ row, now, busy, onOpen, onRemove }: { row: Workspace
   )
 }
 
-function WorkspaceForm({ state, repos, initial, busy, onCancel, onSubmit, onOpenAdvanced }: { state: SettingsState; repos: readonly RepoRow[]; initial: string; busy: boolean; onCancel: () => void; onSubmit: (input: { repo: string; base: string; branch: string; name: string }) => void; onOpenAdvanced: () => void }): JSX.Element {
+function WorkspaceForm({ state, repos, initial, busy, onCancel, onSubmit, onOpenAdvanced }: { state: SettingsState; repos: readonly RepoRow[]; initial: string; busy: boolean; onCancel: () => void; onSubmit: (input: { repo: string; base: string; name: string }) => void; onOpenAdvanced: () => void }): JSX.Element {
   const [repoId, setRepoId] = useState(repos.some(repo => repo.id === initial) ? initial : repos[0]?.id ?? '')
   const [base, setBase] = useState('')
-  const [branch, setBranch] = useState('')
   const [name, setName] = useState('')
+  const [branches, setBranches] = useState<{ readonly id: string; readonly names: readonly string[]; readonly defaultBranch?: string } | undefined>()
   const repo = repos.find(item => item.id === repoId)
   const dir = state.workspace.dir
+  useEffect(() => {
+    if (repoId === '') return undefined
+    let current = true
+    // The list only offers names; without it the field still takes any branch.
+    fetchBranches(repoId).then((listed) => { if (current) setBranches({ id: repoId, names: listed.branches, ...listed.defaultBranch === undefined ? {} : { defaultBranch: listed.defaultBranch } }) }, (_unavailable: unknown) => undefined)
+    return () => { current = false }
+  }, [repoId])
+  const listed = branches?.id === repoId ? branches : undefined
+  const baseline = repo?.base ?? listed?.defaultBranch
+  const shownBase = base.trim() === '' ? baseline ?? '默认分支' : base.trim()
+  const template = repo?.branchRules?.template ?? state.settings.workspace.branchTemplate
   const submit = (): void => {
     if (repo === undefined || dir === undefined || busy) return
-    onSubmit({ repo: repo.id, base: base.trim(), branch: branch.trim(), name: name.trim() })
+    onSubmit({ repo: repo.id, base: base.trim(), name: name.trim() })
   }
   const submitOnEnter = (event: { key: string }): void => { if (event.key === 'Enter') submit() }
   if (dir === undefined || repos.length === 0) {
@@ -888,15 +929,19 @@ function WorkspaceForm({ state, repos, initial, busy, onCancel, onSubmit, onOpen
     <div className="dr__addForm">
       <div className="dr__formGrid">
         <label className="dr__field dr__field--full">仓库
-          <select className="dr__input dr__mono" value={repoId} disabled={busy} onChange={(event) => { setRepoId(event.target.value) }}>
+          <select className="dr__input dr__mono" value={repoId} disabled={busy} onChange={(event) => { setRepoId(event.target.value); setBase('') }}>
             {repos.map(item => <option key={item.id} value={item.id}>{item.key ?? item.url}</option>)}
           </select>
         </label>
-        <label className="dr__field">合入分支（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder={repo?.branch ?? '默认分支'} value={base} onChange={(event) => { setBase(event.target.value) }} onKeyDown={submitOnEnter} /></label>
-        <label className="dr__field">推送分支（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder="dsh/随机名；已有分支会接着改" value={branch} onChange={(event) => { setBranch(event.target.value) }} onKeyDown={submitOnEnter} /></label>
-        <label className="dr__field dr__field--full">目录名（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder={repo === undefined ? '' : `${defaultName(repo.url)}，重名时加编号`} value={name} onChange={(event) => { setName(event.target.value) }} onKeyDown={submitOnEnter} /></label>
+        <label className="dr__field">基线分支
+          <input className="dr__input dr__mono" spellCheck={false} list="dr-workspace-branches" placeholder={baseline === undefined ? '仓库的基线分支' : `${baseline}（仓库的基线分支）`} value={base} onChange={(event) => { setBase(event.target.value) }} onKeyDown={submitOnEnter} />
+          <datalist id="dr-workspace-branches">
+            {listed?.names.map(branch => <option key={branch} value={branch} />)}
+          </datalist>
+        </label>
+        <label className="dr__field">目录名（可选）<input className="dr__input dr__mono" spellCheck={false} placeholder={repo === undefined ? '' : `${defaultName(repo.url)}，重名时加编号`} value={name} onChange={(event) => { setName(event.target.value) }} onKeyDown={submitOnEnter} /></label>
       </div>
-      <div className="dr__rowSummary">建在 <span className="dr__mono">{dir}</span> 下，从合入分支的最新提交开始。</div>
+      <div className="dr__rowSummary">从 <span className="dr__mono">{shownBase}</span> 拉出新分支 <span className="dr__mono">{describeBranchTemplate(template, false)}</span>，改完开 PR/MR 合回 <span className="dr__mono">{shownBase}</span>；建在 <span className="dr__mono">{dir}</span> 下。要接着改已有分支，在会话里让模型指定分支即可。</div>
       <div className="dr__formActions">
         <button type="button" className="dr__btn dr__btn--ghost" disabled={busy} onClick={onCancel}>取消</button>
         <button type="button" className="dr__btn dr__btn--primary" disabled={busy || repo === undefined} onClick={submit}>{busy ? '新建中…' : '新建'}</button>
@@ -950,6 +995,14 @@ function WorkspaceSettings({ form, state, run, onError }: { form: FormProps; sta
       <Row label="提交邮箱" error={errors.commitEmail}>
         <ResetLink shown={current.commitEmail !== defaults.commitEmail} busy={busy} onReset={() => { edit({ commitEmail: defaults.commitEmail }) }} />
         <input className="dr__input dr__mono" aria-label="提交邮箱" placeholder="令牌账号的邮箱" value={current.commitEmail} disabled={busy} onChange={(event) => { edit({ commitEmail: event.target.value }) }} />
+      </Row>
+      <Row label="分支命名模板" summary="没指定分支时，新工作区按它生成要推送的新分支名。{session} 是会话号前 8 位（同一会话的工作区接着用同一个分支，设置页新建时换成随机串），{random} 是随机串，{date} 是日期。仓库可以单独设置。" error={errors.branchTemplate}>
+        <ResetLink shown={current.branchTemplate !== defaults.branchTemplate} busy={busy} onReset={() => { edit({ branchTemplate: defaults.branchTemplate }) }} />
+        <input className="dr__input dr__mono" spellCheck={false} aria-label="分支命名模板" placeholder={defaults.branchTemplate} value={current.branchTemplate} disabled={busy} onChange={(event) => { edit({ branchTemplate: event.target.value }) }} />
+      </Row>
+      <Row label="分支名规则" summary="正则表达式，新建的分支都要符合，例如 ^(feature|fix)/.+$；接着改已有分支不检查。留空不限。仓库可以单独设置。" error={errors.branchPattern}>
+        <ResetLink shown={current.branchPattern !== defaults.branchPattern} busy={busy} onReset={() => { edit({ branchPattern: defaults.branchPattern }) }} />
+        <input className="dr__input dr__mono" spellCheck={false} aria-label="分支名规则" placeholder="不限" value={current.branchPattern} disabled={busy} onChange={(event) => { edit({ branchPattern: event.target.value }) }} />
       </Row>
     </Section>
   )

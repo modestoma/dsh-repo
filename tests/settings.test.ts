@@ -250,14 +250,28 @@ describe('settings routes', () => {
     const mirrors = join(mkdtempSync(join(tmpdir(), 'dsh-repo-settings-mirrors-')), 'mirrors')
     expect((await call('/dsh-repo/mirror', json('PUT', { dir: mirrors }))).status).toBe(200)
 
-    response = await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir } }))
+    // The remote is asked before saving: a branch it lacks is refused with the field it was entered in.
+    expect(await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', base: 'dev', features: [{ id: 'log-analysis' }] }))).toMatchObject({ status: 400, body: { error: expect.stringContaining('没有分支 dev（基线分支）') } })
+    expect(await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', features: [{ id: 'log-analysis', branch: 'release' }] }))).toMatchObject({ status: 400, body: { error: expect.stringContaining('没有分支 release（「日志分析」的分支）') } })
+    // The entry's template is checked against the global pattern it inherits.
+    const { defaults } = (await call('/dsh-repo/state')).body as unknown as SettingsState
+    expect(await call('/dsh-repo/settings', json('PUT', { ...defaults, workspace: { ...defaults.workspace, branchPattern: '^dsh/' } }))).toMatchObject({ status: 200 })
+    expect(await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', features: [], branchTemplate: 'feat/{session}' }))).toMatchObject({ status: 400, body: { error: expect.stringContaining('不符合分支名规则 ^dsh/') } })
+    expect(await call('/dsh-repo/settings', json('PUT', defaults))).toMatchObject({ status: 200 })
+    response = await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', base: 'main', features: [{ id: 'log-analysis', branch: 'main' }], localSync: { enabled: true, dir } }))
     expect(response.status).toBe(200)
     ;[row] = (response.body.state as SettingsState).repos
-    expect(row).toMatchObject({ url: repo, access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir, intervalMinutes: 720 }, sync: { syncedBranch: 'main', state: 'idle' } })
+    expect(row).toMatchObject({ url: repo, access: 'write', base: 'main', features: [{ id: 'log-analysis', branch: 'main' }], localSync: { enabled: true, dir, intervalMinutes: 720 }, sync: { syncedBranch: 'main', state: 'idle' } })
+    // The mirror is fetched in the background after the entry is added; its branches are then listed without contacting the remote.
+    await vi.waitFor(async () => { expect(((await call('/dsh-repo/state')).body as unknown as SettingsState).repos[0]?.mirror).toMatchObject({ state: 'ready', fetchedAt: expect.any(String) }) })
+    expect((await call('/dsh-repo/repos/branches', json('POST', { id: row?.id }))).body).toEqual({ ok: true, branches: ['main'], defaultBranch: 'main' })
+    expect((await call('/dsh-repo/repos/fetch', json('POST', { id: row?.id }))).status).toBe(200)
+    expect((await call('/dsh-repo/repos/fetch', json('POST', { id: 'missing' }))).status).toBe(404)
+    expect((await call('/dsh-repo/repos/branches', json('POST', { id: 'missing' }))).status).toBe(404)
     expect(readFileSync(join(dir, 'skill-a', 'SKILL.md'), 'utf8')).toBe('a\n')
     expect(JSON.parse(readFileSync(file, 'utf8')).repos).toEqual([expect.objectContaining({ id: row?.id, url: repo, access: 'write' })])
     expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'local-syncs.json'), 'utf8')).syncs).toHaveLength(1)
-    expect(service.catalog.list({ feature: 'log-analysis' })).toEqual([{ id: row?.id, url: repo, access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir, intervalMinutes: 720 } }])
+    expect(service.catalog.list({ feature: 'log-analysis' })).toEqual([{ id: row?.id, url: repo, base: 'main', access: 'write', features: [{ id: 'log-analysis', branch: 'main' }], localSync: { enabled: true, dir, intervalMinutes: 720 } }])
 
     writeFileSync(join(origin, 'skill-a', 'SKILL.md'), 'a2\n')
     execFileSync('git', ['commit', '--quiet', '-am', 'two'], { cwd: origin, env: author })
@@ -293,11 +307,11 @@ describe('settings routes', () => {
   it('reports catalog entries whose host is no longer configured', async () => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-repo-settings-'))
     mkdirSync(join(home, 'dsh-repo'))
-    const entry = { id: 'abcdefabcdef', url: 'https://gone.example.com/a/b', access: 'read', features: ['old-feature'], addedAt: '2026-11-09T00:00:00.000Z' }
+    const entry = { id: 'abcdefabcdef', url: 'https://gone.example.com/a/b', access: 'read', features: [{ id: 'old-feature' }], addedAt: '2026-11-09T00:00:00.000Z' }
     writeFileSync(join(home, 'dsh-repo', 'hosts.json'), JSON.stringify({ hosts: [], repos: [entry] }))
     const { call, service } = await serve(undefined, {}, home)
     const [row] = ((await call('/dsh-repo/state')).body as unknown as SettingsState).repos
-    expect(row).toMatchObject({ id: entry.id, url: entry.url, features: ['old-feature'], problem: expect.stringContaining('gone.example.com') })
+    expect(row).toMatchObject({ id: entry.id, url: entry.url, features: [{ id: 'old-feature' }], problem: expect.stringContaining('gone.example.com') })
     expect(row?.key).toBeUndefined()
     expect(() => service.forge.resolve('https://gone.example.com/a/b')).toThrow(expect.objectContaining({ code: 'not-allowed' }))
   })
@@ -324,11 +338,14 @@ describe('settings routes', () => {
 
     expect((await call('/dsh-repo/workspaces', json('POST', { repo: id, name: '../x' }))).status).toBe(400)
     expect((await call('/dsh-repo/workspaces', json('POST', { repo: '000000000000' }))).status).toBe(404)
-    const created = await call('/dsh-repo/workspaces', json('POST', { repo: id, branch: 'fix/a' }))
+    // The page names no branch: the template generates one, random without a Session.
+    expect((await call('/dsh-repo/workspaces', json('POST', { repo: id, branch: 'fix/a' }))).status).toBe(400)
+    const created = await call('/dsh-repo/workspaces', json('POST', { repo: id }))
     expect(created.status).toBe(200)
     const row = created.body.workspace as WorkspaceRow
     const name = 'app'
-    expect(row).toMatchObject({ url: repo, repo: 'git.test/team/app', path: join(parent, name), base: 'main', branch: 'fix/a', currentBranch: 'fix/a', uncommittedFiles: 0, unpushed: 0, mrs: [] })
+    expect(row).toMatchObject({ url: repo, repo: 'git.test/team/app', path: join(parent, name), base: 'main', branch: expect.stringMatching(/^dsh\/[0-9a-f]{8}$/), uncommittedFiles: 0, unpushed: 0, mrs: [] })
+    expect(row.currentBranch).toBe(row.branch)
     expect(row).not.toHaveProperty('session')
     expect(readFileSync(join(row.path, 'README.md'), 'utf8')).toBe('hello\n')
     // The default name is taken now, so the next one is numbered.
@@ -351,7 +368,7 @@ describe('settings routes', () => {
 
   it('removes its routes when the Web server goes away', async () => {
     const { routes, disposers } = await serve()
-    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/mirror-usage', '/dsh-repo/pick-directory', '/dsh-repo/repos', '/dsh-repo/repos/sync', '/dsh-repo/settings', '/dsh-repo/state', '/dsh-repo/watches', '/dsh-repo/workspace-dir', '/dsh-repo/workspaces'])
+    expect([...routes.keys()].sort()).toEqual(['/dsh-repo/host-token', '/dsh-repo/hosts', '/dsh-repo/mirror', '/dsh-repo/mirror-usage', '/dsh-repo/pick-directory', '/dsh-repo/repos', '/dsh-repo/repos/branches', '/dsh-repo/repos/fetch', '/dsh-repo/repos/sync', '/dsh-repo/settings', '/dsh-repo/state', '/dsh-repo/watches', '/dsh-repo/workspace-dir', '/dsh-repo/workspaces'])
     for (const dispose of disposers) dispose()
     expect(routes.size).toBe(0)
   })

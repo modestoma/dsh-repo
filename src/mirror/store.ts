@@ -397,6 +397,50 @@ export class MirrorStore {
     }
   }
 
+  /**
+   * The branches the remote has right now.
+   * @param url - accepted git address.
+   * @param env - credentials of the network command.
+   * @param timeoutMs - deadline of the command.
+   * @param signal - cancellation.
+   * @returns the branch names and the remote's default branch, when it reports one.
+   * @throws {RepoError} `unavailable` when git fails (unreachable remote, refused token).
+   */
+  async remoteBranches(url: string, env: Readonly<Record<string, string>>, timeoutMs: number, signal?: AbortSignal): Promise<{ readonly branches: readonly string[]; readonly defaultBranch?: string }> {
+    let listed: string
+    try {
+      listed = await this.deps.git(['ls-remote', '--symref', '--', url, 'HEAD', 'refs/heads/*'], { timeoutMs, env, ...signal === undefined ? {} : { signal } })
+    } catch (error) {
+      throw gitFailure(error, `访问 ${url} `)
+    }
+    const defaultBranch = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(listed)?.[1]
+    const branches = listed.split('\n').flatMap((line) => {
+      const ref = /^[0-9a-f]+\trefs\/heads\/(.+)$/.exec(line)?.[1]
+      return ref === undefined ? [] : [ref]
+    })
+    return { branches, ...defaultBranch === undefined ? {} : { defaultBranch } }
+  }
+
+  /**
+   * The branches a mirror on disk holds, without contacting the remote.
+   * @param url - accepted git address.
+   * @param signal - cancellation.
+   * @returns the sorted branch names and the default branch the latest fetch recorded; no branches while the mirror was never fetched.
+   * @throws {RepoError} `invalid` for an unsupported address, `unavailable` while no root is chosen or git fails.
+   */
+  async localBranches(url: string, signal?: AbortSignal): Promise<{ readonly branches: readonly string[]; readonly defaultBranch?: string }> {
+    const dir = this.dirOf(url)
+    if (await pathKind(join(dir, 'objects')) === 'missing') return { branches: [] }
+    try {
+      const listed = await this.git(['for-each-ref', '--format=%(refname:lstrip=2)', '--sort=refname', 'refs/heads/'], dir, {}, signal)
+      // A detached HEAD names no default branch.
+      const head = (await this.git(['symbolic-ref', '--quiet', '--short', 'HEAD'], dir, {}, signal).catch((_detached: unknown) => '')).trim()
+      return { branches: listed.split('\n').filter(name => name !== ''), ...head === '' ? {} : { defaultBranch: head } }
+    } catch (error) {
+      throw gitFailure(error, `读取 ${url} 的镜像分支`)
+    }
+  }
+
   private mirror(dir: string): Mirror {
     let mirror = this.mirrors.get(dir)
     if (mirror === undefined) {

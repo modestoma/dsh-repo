@@ -5,7 +5,7 @@
  * @module dsh-repo/settings/contract
  */
 
-import type { ForgeKind, HostInfo, LocalSyncSpec, RepoAccess, RepoFeature } from '../contract.ts'
+import type { BranchRules, ForgeKind, HostInfo, LocalSyncSpec, RepoAccess, RepoFeature, RepoFeatureSwitch } from '../contract.ts'
 
 /** Where local mirrors live; there is no default. */
 export interface MirrorSettings {
@@ -33,6 +33,10 @@ export const WATCHES_ROUTE = '/dsh-repo/watches'
 export const REPOS_ROUTE = '/dsh-repo/repos'
 /** POST：body `{ id }` 立即执行一个仓库的本地同步，同步结束后响应。 */
 export const REPO_SYNC_ROUTE = '/dsh-repo/repos/sync'
+/** POST：body `{ id }` 在后台重新拉取一个仓库的镜像，开始后立即响应。 */
+export const REPO_FETCH_ROUTE = '/dsh-repo/repos/fetch'
+/** POST：body `{ id }`，响应 {@link RepoBranches}：镜像里已有的分支，不访问远端。 */
+export const REPO_BRANCHES_ROUTE = '/dsh-repo/repos/branches'
 /** GET：{@link MirrorUsage}，镜像目录里的仓库和占用空间。 */
 export const MIRROR_USAGE_ROUTE = '/dsh-repo/mirror-usage'
 /** GET：{@link WorkspaceRows}；POST：body {@link WorkspaceCreateInput} 新建工作区，响应 {@link WorkspaceCreated}；DELETE：body `{ id, force? }` 删除工作区，有未提交改动或未推送提交且没有 `force` 时 409。 */
@@ -152,6 +156,8 @@ export interface RepoSettingsWire {
     proxyPort: number
     commitName: string
     commitEmail: string
+    branchTemplate: string
+    branchPattern: string
   }
   watch: {
     enabled: boolean
@@ -192,11 +198,11 @@ export interface WatchInfo {
 export interface RepoInput {
   /** HTTPS address of the repository on a configured host. */
   url: string
-  /** Branch to follow; missing or empty follows the remote's default branch. */
-  branch?: string
+  /** Baseline branch; missing or empty uses the remote's default branch. */
+  base?: string
   access: RepoAccess
-  /** Ids of the features turned on. */
-  features: string[]
+  /** The features turned on; a missing or empty branch uses the baseline branch. */
+  features: RepoFeatureSwitch[]
   /** Local sync; omitted when no directory was ever entered. */
   localSync?: {
     enabled: boolean
@@ -204,7 +210,32 @@ export interface RepoInput {
     dir: string
     /** Minutes between two syncs; default {@link DEFAULT_SYNC_INTERVAL_MINUTES}. */
     intervalMinutes?: number
+    /** Branch to sync; missing or empty uses the baseline branch. */
+    branch?: string
   }
+  /** Branch name template of this repository; missing or empty uses the run-time setting. */
+  branchTemplate?: string
+  /** Branch name pattern of this repository; missing or empty uses the run-time setting. */
+  branchPattern?: string
+}
+
+/** Where a repository's mirror stands since the plugin started or the mirror directory changed. */
+export interface MirrorStatus {
+  /** `fetching`: a clone or fetch runs; `ready`: the latest one succeeded; `failed`: the latest one failed. */
+  state: 'fetching' | 'ready' | 'failed'
+  /** Last successful clone or fetch. */
+  fetchedAt?: string
+  /** Failure of the latest attempt, cleared by the next success. */
+  error?: string
+}
+
+/** `POST /dsh-repo/repos/branches` response. */
+export interface RepoBranches {
+  ok: true
+  /** Branches of the mirror, sorted; empty while the mirror was never fetched. */
+  branches: string[]
+  /** The remote's default branch as the latest fetch recorded it. */
+  defaultBranch?: string
 }
 
 /** Where a repository's local sync stands. */
@@ -226,11 +257,14 @@ export interface LocalSyncStatus {
 export interface RepoRow {
   id: string
   url: string
-  branch?: string
+  base?: string
   access: RepoAccess
-  features: string[]
+  features: RepoFeatureSwitch[]
   localSync?: LocalSyncSpec
+  branchRules?: BranchRules
   addedAt: string
+  /** Absent before the first clone or fetch since the plugin started. */
+  mirror?: MirrorStatus
   /** `host/path`; absent with {@link problem}. */
   key?: string
   /** Why the repository cannot be reached now, e.g. its host was removed. */
@@ -269,10 +303,8 @@ export interface MirrorUsage {
 export interface WorkspaceCreateInput {
   /** Catalog entry id of the repository. */
   repo: string
-  /** Branch the work merges into and starts from; missing or empty uses the default branch. */
+  /** Branch the work starts from and its PR/MR targets; missing or empty uses the repository's baseline branch. */
   base?: string
-  /** Branch to push to; an existing one is continued. Missing or empty: `dsh/<random>`. */
-  branch?: string
   /** Name of the new directory under the workspace directory; missing or empty: the repository name, numbered when taken. */
   name?: string
 }

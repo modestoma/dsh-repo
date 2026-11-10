@@ -7,6 +7,7 @@
  */
 
 import { MAX_IDENTITY_LENGTH, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
+import { branchRulesProblem, patternProblem, templateProblem } from '../settings/branch-names.ts'
 import type { RepoSettingsWire, WatchAction, WatchEventKind } from '../settings/contract.ts'
 
 /** Integer settings, named as in {@link SETTING_BOUNDS}. */
@@ -84,10 +85,12 @@ export interface SettingsDraft {
   readonly watchEvents: Readonly<Record<WatchEventKind, WatchAction>>
   readonly commitName: string
   readonly commitEmail: string
+  readonly branchTemplate: string
+  readonly branchPattern: string
 }
 
-/** Field of a rejected draft: an integer setting, the signature, or the commit identity. */
-export type DraftField = NumberKey | 'signature' | 'commitName' | 'commitEmail'
+/** Field of a rejected draft: an integer setting, the signature, the commit identity, or a branch rule. */
+export type DraftField = NumberKey | 'signature' | 'commitName' | 'commitEmail' | 'branchTemplate' | 'branchPattern'
 
 /** Drop float noise from `stored / scale` (e.g. 0.30000000000000004). */
 function tidy(value: number): number {
@@ -155,6 +158,8 @@ export function toDraft(settings: RepoSettingsWire): SettingsDraft {
     watchEvents: { ...settings.watch.events },
     commitName: settings.workspace.commitName,
     commitEmail: settings.workspace.commitEmail,
+    branchTemplate: settings.workspace.branchTemplate,
+    branchPattern: settings.workspace.branchPattern,
   }
 }
 
@@ -202,6 +207,14 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
   if (commitEmail.length > MAX_IDENTITY_LENGTH) errors.commitEmail = `提交邮箱最多 ${MAX_IDENTITY_LENGTH} 个字符`
   else if (/[<>\s]/.test(commitEmail)) errors.commitEmail = '提交邮箱不能包含 < > 或空白'
   if ((commitName === '') !== (commitEmail === '')) errors[commitName === '' ? 'commitName' : 'commitEmail'] = '提交姓名和邮箱要一起填，或者都留空'
+  const branchTemplate = draft.branchTemplate.trim()
+  const branchPattern = draft.branchPattern.trim()
+  const templateIssue = templateProblem(branchTemplate)
+  const patternIssue = patternProblem(branchPattern)
+  if (templateIssue !== undefined) errors.branchTemplate = templateIssue
+  if (patternIssue !== undefined) errors.branchPattern = patternIssue
+  const rulesIssue = templateIssue === undefined && patternIssue === undefined ? branchRulesProblem(branchTemplate, branchPattern) : undefined
+  if (rulesIssue !== undefined) errors.branchPattern = rulesIssue
   if (Object.keys(errors).length > 0) return { ok: false, errors }
   return {
     ok: true,
@@ -219,7 +232,7 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
       },
       tools: { enabled: draft.enabled, writes: draft.writes, deleteSourceBranch: draft.deleteSourceBranch, signature: draft.signature },
       mirror: { gitTimeoutMs: numbers.gitTimeoutMs },
-      workspace: { proxyPort: numbers.proxyPort, commitName: draft.commitName.trim(), commitEmail: draft.commitEmail.trim() },
+      workspace: { proxyPort: numbers.proxyPort, commitName, commitEmail, branchTemplate, branchPattern },
       watch: {
         enabled: draft.watchEnabled,
         activeIntervalMs: numbers.activeIntervalMs,

@@ -33,6 +33,17 @@ describe('settings form', () => {
     expect(fromDraft({ ...draft, commitName: 'A <b>', commitEmail: 'a b@example.com' })).toEqual({ ok: false, errors: { commitName: expect.stringContaining('<'), commitEmail: expect.stringContaining('空白') } })
   })
 
+  it('saves the branch rules trimmed and rejects a template or pattern that cannot be used', () => {
+    const draft = toDraft(DEFAULT_SETTINGS)
+    expect(draft).toMatchObject({ branchTemplate: 'dsh/{session}', branchPattern: '' })
+    expect(fromDraft({ ...draft, branchTemplate: ' feature/{date}-{random} ', branchPattern: ' ^feature/ ' })).toMatchObject({ ok: true, settings: { workspace: { branchTemplate: 'feature/{date}-{random}', branchPattern: '^feature/' } } })
+    expect(fromDraft({ ...draft, branchTemplate: 'feature/fixed' })).toEqual({ ok: false, errors: { branchTemplate: expect.stringContaining('{session} 或 {random}') } })
+    expect(fromDraft({ ...draft, branchTemplate: 'x/{user}' })).toEqual({ ok: false, errors: { branchTemplate: expect.stringContaining('{user} 不是可用的占位符') } })
+    expect(fromDraft({ ...draft, branchTemplate: 'x..{random}' })).toEqual({ ok: false, errors: { branchTemplate: expect.stringContaining('不是合法的分支名') } })
+    expect(fromDraft({ ...draft, branchPattern: '(' })).toEqual({ ok: false, errors: { branchPattern: expect.stringContaining('正则') } })
+    expect(fromDraft({ ...draft, branchPattern: '^fix/' })).toEqual({ ok: false, errors: { branchPattern: expect.stringContaining('不符合分支名规则 ^fix/') } })
+  })
+
   it('compares drafts by the settings they save', () => {
     const draft = toDraft(DEFAULT_SETTINGS)
     expect(sameDraft(draft, toDraft(DEFAULT_SETTINGS))).toBe(true)

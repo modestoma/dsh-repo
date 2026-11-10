@@ -8,23 +8,12 @@
  */
 
 import { RepoError } from './errors.ts'
-
-/** Branch names git accepts and that cannot be mistaken for options; see {@link isBranchName}. */
-const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
+import { isBranchName } from './settings/branch-names.ts'
 
 /** A full SHA-1 or SHA-256 commit id in lowercase hexadecimal. */
 export const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 
-/**
- * Whether a name is a branch git accepts and that cannot be mistaken for an
- * option: no leading `-` or `/`, no `..`, `//`, trailing `/` or `.lock`, no
- * whitespace, control characters, or `~^:?*[\`, and not `@`.
- * @param value - candidate branch name, without `refs/heads/`.
- * @returns whether it is accepted.
- */
-export function isBranchName(value: string): boolean {
-  return BRANCH.test(value) && !value.startsWith('/') && value !== '@'
-}
+export { isBranchName }
 
 /**
  * Whether a value is a full commit id.
