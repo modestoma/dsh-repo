@@ -258,6 +258,12 @@ describe('settings routes', () => {
     expect(await call('/dsh-repo/settings', json('PUT', { ...defaults, workspace: { ...defaults.workspace, branchPattern: '^dsh/' } }))).toMatchObject({ status: 200 })
     expect(await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', features: [], branchTemplate: 'feat/{session}' }))).toMatchObject({ status: 400, body: { error: expect.stringContaining('不符合分支名规则 ^dsh/') } })
     expect(await call('/dsh-repo/settings', json('PUT', defaults))).toMatchObject({ status: 200 })
+    // New global rules are checked against the rules a repository inherits beside its own.
+    const own = await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', features: [], branchTemplate: 'fix/{session}' }))
+    expect(own.status).toBe(200)
+    expect(await call('/dsh-repo/settings', json('PUT', { ...defaults, workspace: { ...defaults.workspace, branchTemplate: 'feature/{session}', branchPattern: '^feature/' } }))).toMatchObject({ status: 400, body: { error: expect.stringContaining(`仓库 ${repo} 自己的分支命名设置和新的全局设置合起来不可用`) } })
+    expect(service.settings.current.workspace.branchPattern).toBe('')
+    expect((await call('/dsh-repo/repos', json('DELETE', { id: (own.body.state as SettingsState).repos[0]?.id }))).status).toBe(200)
     response = await call('/dsh-repo/repos', json('POST', { url: repo, access: 'write', base: 'main', features: [{ id: 'log-analysis', branch: 'main' }], localSync: { enabled: true, dir } }))
     expect(response.status).toBe(200)
     ;[row] = (response.body.state as SettingsState).repos
@@ -299,7 +305,7 @@ describe('settings routes', () => {
     expect(existsSync(join(dir, 'skill-a', 'SKILL.md'))).toBe(true)
     expect(JSON.parse(readFileSync(join(env.DSH_HOME, 'dsh-repo', 'local-syncs.json'), 'utf8'))).toEqual({ syncs: [] })
     expect((await call('/dsh-repo/repos', json('DELETE', { id: row?.id }))).status).toBe(404)
-    expect(changes).toEqual([0, 1, 0, 1, 1, 0])
+    expect(changes).toEqual([0, 1, 0, 1, 0, 1, 1, 0])
     dispose()
     expect(((await call('/dsh-repo/state')).body as unknown as SettingsState).features).toEqual([])
   })

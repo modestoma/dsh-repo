@@ -16,7 +16,8 @@ import { RepoError } from '../errors.ts'
 import { isBranchName, requireBranch } from '../refs.ts'
 import { isAcceptedGitUrl } from '../mirror/store.ts'
 import { DEFAULT_SYNC_INTERVAL_MINUTES, MAX_REPO_FEATURES, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
-import { patternProblem, templateProblem } from '../settings/branch-names.ts'
+import { branchRulesProblem, patternProblem, templateProblem } from '../settings/branch-names.ts'
+import type { RepoSettings } from '../config.ts'
 import type { RepoInput } from '../settings/contract.ts'
 
 /** A catalog entry as the settings file stores it. */
@@ -199,6 +200,24 @@ export function checkInput(input: RepoInput): CheckedInput {
     ...localSync === undefined ? {} : { localSync },
     ...Object.keys(branchRules).length === 0 ? {} : { branchRules },
   }
+}
+
+/**
+ * Why proposed run-time workspace settings cannot be saved: a catalog entry
+ * overriding only one branch rule field would pair it with the other field of
+ * the proposed settings, and the names its template generates would not match
+ * its pattern.
+ * @param entries - catalog entries.
+ * @param workspace - proposed workspace settings.
+ * @returns the reason naming the first such entry, or undefined.
+ */
+export function inheritedBranchRulesProblem(entries: readonly CatalogEntry[], workspace: RepoSettings['workspace']): string | undefined {
+  for (const entry of entries) {
+    if (entry.branchRules === undefined) continue
+    const problem = branchRulesProblem(entry.branchRules.template ?? workspace.branchTemplate, entry.branchRules.pattern ?? workspace.branchPattern)
+    if (problem !== undefined) return `仓库 ${entry.url} 自己的分支命名设置和新的全局设置合起来不可用：${problem}；先改这个仓库的分支命名，或换一组全局设置`
+  }
+  return undefined
 }
 
 /**
