@@ -14,8 +14,9 @@ import type { HostContext, HostRequestGate, HostWebServer } from '../host.ts'
 import type { RepoService } from '../service.ts'
 import type { DirectoryPicker } from './directory-picker.ts'
 import { hostDirectoryPicker } from './directory-picker.ts'
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_RUN_ROUTE, SYNCS_ROUTE, WATCHES_ROUTE } from './contract.ts'
-import type { SettingsState, SyncInfo, SyncInput, WatchInfo } from './contract.ts'
+import type { WorkspacePanel } from '../workspace/panel.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE, WORKSPACE_DIR_ROUTE, WORKSPACES_ROUTE } from './contract.ts'
+import type { LocalSyncStatus, RepoInput, RepoRow, SettingsState, WatchInfo, WorkspaceCreateInput } from './contract.ts'
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 
@@ -33,6 +34,8 @@ const hostUrlSchema = z.object({ url: z.string() }).strict()
 const hostTokenSchema = z.object({ url: z.string(), value: z.string() }).strict()
 const mirrorSchema = z.object({ dir: z.string() }).strict()
 const watchIdSchema = z.object({ id: z.string() }).strict()
+const workspaceCreateSchema = z.object({ repo: z.string(), base: z.string().optional(), branch: z.string().optional(), name: z.string().optional() }).strict()
+const workspaceRemoveSchema = z.object({ id: z.string(), force: z.boolean().optional() }).strict()
 
 /** The PR/MR watcher as the settings page uses it. */
 export interface WatchList {
@@ -45,37 +48,88 @@ export interface WatchList {
 /** No watcher: nothing is watched. */
 const NO_WATCHES: WatchList = { active: false, list: () => [], remove: async () => false }
 
-const syncFields = {
+const repoFields = {
   url: z.string(),
   branch: z.string().optional(),
-  dir: z.string(),
-  intervalMinutes: z.number().optional(),
+  access: z.enum(['read', 'write', 'merge']),
+  features: z.array(z.string()),
+  localSync: z.object({ enabled: z.boolean(), dir: z.string(), intervalMinutes: z.number().optional() }).strict().optional(),
 }
-const syncAddSchema = z.object(syncFields).strict()
-const syncUpdateSchema = z.object({ id: z.string(), ...syncFields }).strict()
-const syncIdSchema = z.object({ id: z.string() }).strict()
+const repoAddSchema = z.object(repoFields).strict()
+const repoUpdateSchema = z.object({ id: z.string(), ...repoFields }).strict()
+const repoIdSchema = z.object({ id: z.string() }).strict()
+
+/** No workspaces: none are listed, and creating one is refused. */
+const NO_WORKSPACES: WorkspacePanel = {
+  dir: () => undefined,
+  setDir: async () => { throw new HttpError(404, '当前组合没有工作区') },
+  proxyPort: () => undefined,
+  rows: async () => [],
+  create: async () => { throw new HttpError(404, '当前组合没有工作区') },
+  remove: async () => { throw new HttpError(404, '当前组合没有工作区') },
+}
+
+function workspaceInput(body: z.output<typeof workspaceCreateSchema>): WorkspaceCreateInput {
+  return {
+    repo: body.repo,
+    ...body.base === undefined ? {} : { base: body.base },
+    ...body.branch === undefined ? {} : { branch: body.branch },
+    ...body.name === undefined ? {} : { name: body.name },
+  }
+}
 
 /** The local syncs as the settings page uses them. */
 export interface SyncList {
-  list(): SyncInfo[]
-  add(input: SyncInput): Promise<SyncInfo>
-  update(id: string, input: SyncInput): Promise<SyncInfo>
-  remove(id: string): Promise<boolean>
-  syncNow(id: string): Promise<SyncInfo>
+  /** @returns the status of a repository's enabled local sync, or undefined. */
+  status(id: string): LocalSyncStatus | undefined
+  /** Sync now; resolves when the attempt finished. */
+  syncNow(id: string): Promise<void>
+  /** @returns once the sync, or the deletion of a removed repository's progress, that a catalog change started finished. */
+  settled(id: string): Promise<void>
 }
 
-/** No syncer: nothing is synced, and changes are refused. */
+/** No syncer: nothing is synced, and syncing on demand is refused. */
 const NO_SYNCS: SyncList = {
-  list: () => [],
-  add: async () => { throw new HttpError(404, '当前组合没有本地同步') },
-  update: async () => { throw new HttpError(404, '当前组合没有本地同步') },
-  remove: async () => false,
+  status: () => undefined,
   syncNow: async () => { throw new HttpError(404, '当前组合没有本地同步') },
+  settled: async () => undefined,
 }
 
-function syncInput(body: z.output<typeof syncAddSchema>): SyncInput {
-  return { url: body.url, dir: body.dir, ...body.branch === undefined ? {} : { branch: body.branch }, ...body.intervalMinutes === undefined ? {} : { intervalMinutes: body.intervalMinutes } }
+function repoInput(body: z.output<typeof repoAddSchema>): RepoInput {
+  const { localSync } = body
+  return {
+    url: body.url,
+    ...body.branch === undefined ? {} : { branch: body.branch },
+    access: body.access,
+    features: body.features,
+    ...localSync === undefined ? {} : { localSync: { enabled: localSync.enabled, dir: localSync.dir, ...localSync.intervalMinutes === undefined ? {} : { intervalMinutes: localSync.intervalMinutes } } },
+  }
 }
+
+/**
+ * The settings page's rows of the catalog.
+ * @param service - the `dshRepos` implementation.
+ * @param syncs - the local syncs.
+ * @returns every entry with its key or problem and its local sync status.
+ */
+export function repoRows(service: RepoService, syncs: SyncList = NO_SYNCS): RepoRow[] {
+  return service.catalog.entries().map((entry) => {
+    const own = service.catalog.keyOf(entry)
+    const sync = syncs.status(entry.id)
+    return {
+      id: entry.id,
+      url: entry.url,
+      ...entry.branch === undefined ? {} : { branch: entry.branch },
+      access: entry.access,
+      features: [...entry.features],
+      ...entry.localSync === undefined ? {} : { localSync: { ...entry.localSync } },
+      addedAt: entry.addedAt,
+      ...'key' in own ? { key: own.key } : { problem: own.problem },
+      ...sync === undefined ? {} : { sync },
+    }
+  })
+}
+
 /** The service validates the settings fields and reports every bad one. */
 const settingsBodySchema = z.record(z.string(), z.unknown())
 
@@ -87,6 +141,7 @@ const STATUS: Readonly<Record<RepoErrorCode, number>> = {
   'forbidden': 403,
   'not-found': 404,
   'conflict': 409,
+  'declined': 403,
   'rate-limited': 429,
   'too-large': 413,
   'unavailable': 503,
@@ -188,19 +243,28 @@ function guarded(gate: HostRequestGate, methods: readonly string[], handler: Web
  * @param picker - the Host's directory dialog.
  * @param watches - the PR/MR watcher.
  * @param syncs - the local syncs.
- * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, whether a directory dialog is available, the watched PRs/MRs, and the local syncs.
+ * @param workspaces - the workspaces.
+ * @returns hosts with token status, the mirror directory, the run-time settings with their defaults, the settings file, whether a directory dialog is available, the watched PRs/MRs, the catalog with local sync status, the registered features, and the workspace directory and proxy port.
  */
-export async function settingsState(service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): Promise<SettingsState> {
+export async function settingsState(service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS, workspaces: WorkspacePanel = NO_WORKSPACES): Promise<SettingsState> {
+  const dir = workspaces.dir()
+  const listening = workspaces.proxyPort()
   return {
-    hosts: await service.listHosts(),
-    mirror: service.mirrorSettings(),
-    settings: service.settings,
-    defaults: service.defaultSettings,
-    file: service.settingsFile,
+    hosts: await service.hosts.list(),
+    mirror: service.mirrors.settings(),
+    settings: service.settings.current,
+    defaults: service.settings.defaults,
+    file: service.settings.file,
     pickerAvailable: picker.available,
     watches: watches.list(),
     watchAvailable: watches.active,
-    syncs: syncs.list(),
+    repos: repoRows(service, syncs),
+    features: service.catalog.registeredFeatures(),
+    workspace: {
+      available: workspaces !== NO_WORKSPACES,
+      ...dir === undefined ? {} : { dir },
+      ...listening === undefined ? {} : { proxyListening: listening },
+    },
   }
 }
 
@@ -212,10 +276,11 @@ export async function settingsState(service: RepoService, picker: DirectoryPicke
  * @param picker - the Host's directory dialog.
  * @param watches - the PR/MR watcher.
  * @param syncs - the local syncs.
+ * @param workspaces - the workspaces.
  * @returns disposer removing every route.
  */
-export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): () => void {
-  const state = (): Promise<SettingsState> => settingsState(service, picker, watches, syncs)
+export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestGate, service: RepoService, picker: DirectoryPicker, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS, workspaces: WorkspacePanel = NO_WORKSPACES): () => void {
+  const state = (): Promise<SettingsState> => settingsState(service, picker, watches, syncs, workspaces)
   const reply = async (res: ServerResponse): Promise<void> => { sendJson(res, 200, { ok: true, state: await state() }) }
   const disposers = [
     server.register({
@@ -228,10 +293,10 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       path: HOSTS_ROUTE,
       handler: guarded(gate, ['POST', 'DELETE'], async (req, res) => {
         if (req.method?.toUpperCase() === 'DELETE') {
-          await service.removeHost((await readJsonBody(req, hostUrlSchema)).url)
+          await service.hosts.remove((await readJsonBody(req, hostUrlSchema)).url)
         } else {
           const { kind, url, apiUrl, alias, token } = await readJsonBody(req, hostAddSchema)
-          await service.addHost({ url, ...kind === undefined ? {} : { kind }, ...apiUrl === undefined ? {} : { apiUrl }, ...alias === undefined ? {} : { alias }, ...token === undefined ? {} : { token } })
+          await service.hosts.add({ url, ...kind === undefined ? {} : { kind }, ...apiUrl === undefined ? {} : { apiUrl }, ...alias === undefined ? {} : { alias }, ...token === undefined ? {} : { token } })
         }
         await reply(res)
       }),
@@ -241,10 +306,10 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       path: HOST_TOKEN_ROUTE,
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
         if (req.method?.toUpperCase() === 'DELETE') {
-          await service.setHostToken((await readJsonBody(req, hostUrlSchema)).url, undefined)
+          await service.hosts.setToken((await readJsonBody(req, hostUrlSchema)).url, undefined)
         } else {
           const { url, value } = await readJsonBody(req, hostTokenSchema)
-          await service.setHostToken(url, value)
+          await service.hosts.setToken(url, value)
         }
         await reply(res)
       }),
@@ -253,7 +318,7 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       kind: 'exact',
       path: MIRROR_ROUTE,
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
-        await service.setMirrorDir(req.method?.toUpperCase() === 'DELETE' ? undefined : (await readJsonBody(req, mirrorSchema)).dir)
+        await service.mirrors.setDir(req.method?.toUpperCase() === 'DELETE' ? undefined : (await readJsonBody(req, mirrorSchema)).dir)
         await reply(res)
       }),
     }),
@@ -261,7 +326,7 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
       kind: 'exact',
       path: SETTINGS_ROUTE,
       handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
-        await service.updateSettings(req.method?.toUpperCase() === 'DELETE' ? undefined : await readJsonBody(req, settingsBodySchema))
+        await service.settings.update(req.method?.toUpperCase() === 'DELETE' ? undefined : await readJsonBody(req, settingsBodySchema))
         await reply(res)
       }),
     }),
@@ -275,32 +340,61 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
     }),
     server.register({
       kind: 'exact',
-      path: SYNCS_ROUTE,
+      path: REPOS_ROUTE,
       handler: guarded(gate, ['POST', 'PUT', 'DELETE'], async (req, res) => {
         const method = req.method?.toUpperCase()
         if (method === 'DELETE') {
-          if (!await syncs.remove((await readJsonBody(req, syncIdSchema)).id)) throw new HttpError(404, '没有这条本地同步，可能已经删除')
-        } else if (method === 'PUT') {
-          const { id, ...body } = await readJsonBody(req, syncUpdateSchema)
-          await syncs.update(id, syncInput(body))
+          const { id } = await readJsonBody(req, repoIdSchema)
+          if (await service.catalog.remove(id) === undefined) throw new HttpError(404, '仓库清单中没有这个仓库，可能已经删除')
+          await syncs.settled(id)
         } else {
-          await syncs.add(syncInput(await readJsonBody(req, syncAddSchema)))
+          const entry = method === 'PUT'
+            ? await (async () => {
+              const { id, ...body } = await readJsonBody(req, repoUpdateSchema)
+              return await service.catalog.update(id, repoInput(body))
+            })()
+            : await service.catalog.add(repoInput(await readJsonBody(req, repoAddSchema)))
+          await syncs.settled(entry.id)
         }
         await reply(res)
       }),
     }),
     server.register({
       kind: 'exact',
-      path: SYNC_RUN_ROUTE,
+      path: REPO_SYNC_ROUTE,
       handler: guarded(gate, ['POST'], async (req, res) => {
-        await syncs.syncNow((await readJsonBody(req, syncIdSchema)).id)
+        await syncs.syncNow((await readJsonBody(req, repoIdSchema)).id)
+        await reply(res)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: WORKSPACES_ROUTE,
+      handler: guarded(gate, ['GET', 'POST', 'DELETE'], async (req, res) => {
+        const method = req.method?.toUpperCase()
+        if (method === 'GET') {
+          sendJson(res, 200, { ok: true, workspaces: await workspaces.rows() })
+        } else if (method === 'POST') {
+          sendJson(res, 200, { ok: true, workspace: await workspaces.create(workspaceInput(await readJsonBody(req, workspaceCreateSchema))) })
+        } else {
+          const { id, force } = await readJsonBody(req, workspaceRemoveSchema)
+          await workspaces.remove(id, force === true)
+          sendJson(res, 200, { ok: true, workspaces: await workspaces.rows() })
+        }
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: WORKSPACE_DIR_ROUTE,
+      handler: guarded(gate, ['PUT', 'DELETE'], async (req, res) => {
+        await workspaces.setDir(req.method?.toUpperCase() === 'DELETE' ? undefined : (await readJsonBody(req, mirrorSchema)).dir)
         await reply(res)
       }),
     }),
     server.register({
       kind: 'exact',
       path: MIRROR_USAGE_ROUTE,
-      handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await service.mirrorUsage()) }),
+      handler: guarded(gate, ['GET'], async (_req, res) => { sendJson(res, 200, await service.mirrors.usage()) }),
     }),
     server.register({
       kind: 'exact',
@@ -328,13 +422,14 @@ export function registerSettingsRoutes(server: HostWebServer, gate: HostRequestG
  * @param service - the `dshRepos` implementation.
  * @param watches - the PR/MR watcher.
  * @param syncs - the local syncs.
+ * @param workspaces - the workspaces.
  */
-export function mountSettingsRoutes(ctx: HostContext, service: RepoService, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS): void {
+export function mountSettingsRoutes(ctx: HostContext, service: RepoService, watches: WatchList = NO_WATCHES, syncs: SyncList = NO_SYNCS, workspaces: WorkspacePanel = NO_WORKSPACES): void {
   const attach = (webCtx: HostContext): void => {
     const server = webCtx.get?.('webServer') as HostWebServer | undefined
     const gate = webCtx.get?.('connection') as HostRequestGate | undefined
     if (server === undefined || gate === undefined) return
-    webCtx.effect(() => registerSettingsRoutes(server, gate, service, hostDirectoryPicker(webCtx), watches, syncs), 'dsh-repo: settings routes')
+    webCtx.effect(() => registerSettingsRoutes(server, gate, service, hostDirectoryPicker(webCtx), watches, syncs, workspaces), 'dsh-repo: settings routes')
   }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer', 'connection'], attach)

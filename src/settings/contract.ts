@@ -5,7 +5,15 @@
  * @module dsh-repo/settings/contract
  */
 
-import type { ForgeKind, HostInfo, MirrorSettings } from '../contract.ts'
+import type { ForgeKind, HostInfo, LocalSyncSpec, RepoAccess, RepoFeature } from '../contract.ts'
+
+/** Where local mirrors live; there is no default. */
+export interface MirrorSettings {
+  /** Absolute directory holding the mirrors and snapshots; undefined while none is chosen or the stored choice is unusable. */
+  readonly dir: string | undefined
+  /** Why the directory stored in the settings file is not in use; absent otherwise. */
+  readonly problem?: string
+}
 
 /** GET：{@link SettingsState}。 */
 export const STATE_ROUTE = '/dsh-repo/state'
@@ -21,12 +29,16 @@ export const SETTINGS_ROUTE = '/dsh-repo/settings'
 export const PICK_DIRECTORY_ROUTE = '/dsh-repo/pick-directory'
 /** DELETE：body `{ id }` 停止跟踪一个 PR/MR。 */
 export const WATCHES_ROUTE = '/dsh-repo/watches'
-/** POST：body {@link SyncInput} 添加本地同步；PUT：body `{ id, ...SyncInput }` 修改；DELETE：body `{ id }` 删除（本地目录里的文件保留）。 */
-export const SYNCS_ROUTE = '/dsh-repo/syncs'
-/** POST：body `{ id }` 立即同步一条本地同步，同步结束后响应。 */
-export const SYNC_RUN_ROUTE = '/dsh-repo/syncs/run'
+/** POST：body {@link RepoInput} 向仓库清单添加仓库；PUT：body `{ id, ...RepoInput }` 修改；DELETE：body `{ id }` 删除（本地同步目录里的文件保留）。改动引起的本地同步结束后响应。 */
+export const REPOS_ROUTE = '/dsh-repo/repos'
+/** POST：body `{ id }` 立即执行一个仓库的本地同步，同步结束后响应。 */
+export const REPO_SYNC_ROUTE = '/dsh-repo/repos/sync'
 /** GET：{@link MirrorUsage}，镜像目录里的仓库和占用空间。 */
 export const MIRROR_USAGE_ROUTE = '/dsh-repo/mirror-usage'
+/** GET：{@link WorkspaceRows}；POST：body {@link WorkspaceCreateInput} 新建工作区，响应 {@link WorkspaceCreated}；DELETE：body `{ id, force? }` 删除工作区，有未提交改动或未推送提交且没有 `force` 时 409。 */
+export const WORKSPACES_ROUTE = '/dsh-repo/workspaces'
+/** PUT：body `{ dir }` 设置设置页新建工作区的目录（不存在会创建）；DELETE：清除。 */
+export const WORKSPACE_DIR_ROUTE = '/dsh-repo/workspace-dir'
 
 /** Largest delay Node's `setTimeout` honors (2^31 − 1 ms). */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647
@@ -50,19 +62,57 @@ export const SETTING_BOUNDS = {
   idleDays: { min: 1, max: 90 },
   dailyWakeLimit: { min: 1, max: 100 },
   maxWatches: { min: 1, max: 500 },
+  proxyPort: { min: 0, max: 65_535 },
 } as const satisfies Record<string, { readonly min: number; readonly max: number }>
 
 /** Inclusive range of a local sync's interval, in minutes. */
 export const SYNC_INTERVAL_BOUNDS = { min: 5, max: 30 * 24 * 60 } as const
 /** Interval of a local sync that names none: 12 hours. */
 export const DEFAULT_SYNC_INTERVAL_MINUTES = 12 * 60
-/** Most local syncs. */
-export const MAX_SYNCS = 50
+/** Most repositories in the catalog. */
+export const MAX_REPOS = 200
+/** Most features turned on for one repository. */
+export const MAX_REPO_FEATURES = 20
 
 /** Longest tool signature. */
 export const MAX_SIGNATURE_LENGTH = 500
-/** Most repository patterns. */
-export const MAX_REPO_PATTERNS = 200
+
+/** Longest workspace commit name or email. */
+export const MAX_IDENTITY_LENGTH = 200
+/** A code host family as the settings page and host validation describe it. */
+export interface ForgeKindInfo {
+  readonly id: ForgeKind
+  /** Product name, e.g. `GitHub`. */
+  readonly label: string
+  /** Example host address for the add-host form. */
+  readonly urlPlaceholder: string
+  /** The separate API address a host of this family may configure; absent when the API address follows from the host address. */
+  readonly apiUrl?: { readonly label: string; readonly placeholder: string }
+}
+
+const FORGE_KIND_INFO: Readonly<Record<ForgeKind, ForgeKindInfo>> = {
+  gitlab: { id: 'gitlab', label: 'GitLab', urlPlaceholder: 'https://gitlab.example.com' },
+  github: { id: 'github', label: 'GitHub', urlPlaceholder: 'https://github.com', apiUrl: { label: '接口地址（可选，GitHub Enterprise 非默认时填写）', placeholder: '默认 api.github.com 或 地址/api/v3' } },
+}
+
+/** The code host families, in the order the settings page offers them. */
+export const FORGE_KINDS: readonly ForgeKindInfo[] = [FORGE_KIND_INFO.gitlab, FORGE_KIND_INFO.github]
+
+/**
+ * The description of a code host family.
+ * @param kind - host kind.
+ * @returns its entry of {@link FORGE_KINDS}.
+ */
+export function forgeKindInfo(kind: ForgeKind): ForgeKindInfo {
+  return FORGE_KIND_INFO[kind]
+}
+
+/** Labels of the catalog access levels, from the least. */
+export const ACCESS_LEVELS: readonly { readonly id: RepoAccess; readonly label: string }[] = [
+  { id: 'read', label: '只读' },
+  { id: 'write', label: '可改代码' },
+  { id: 'merge', label: '可合并' },
+]
 
 /** PR/MR activity a watch reports, named as in {@link WatchEventsWire}. */
 export const WATCH_EVENT_KINDS = ['ciFailed', 'ciPassed', 'comment', 'changesRequested', 'approved', 'conflict', 'pushed', 'merged', 'closed', 'idle'] as const
@@ -78,8 +128,6 @@ export type WatchEventsWire = Record<WatchEventKind, WatchAction>
 
 /** Complete run-time settings as sent to and from the settings page. */
 export interface RepoSettingsWire {
-  /** Reachable repository patterns; empty = every repository on the hosts. */
-  repos: string[]
   timeoutMs: number
   limits: {
     perPage: number
@@ -94,13 +142,16 @@ export interface RepoSettingsWire {
   tools: {
     enabled: boolean
     writes: 'ask' | 'allow' | 'off'
-    merge: boolean
     deleteSourceBranch: boolean
     signature: string
   }
   mirror: {
     gitTimeoutMs: number
-    otherHosts: boolean
+  }
+  workspace: {
+    proxyPort: number
+    commitName: string
+    commitEmail: string
   }
   watch: {
     enabled: boolean
@@ -137,29 +188,30 @@ export interface WatchInfo {
   pending: number
 }
 
-/** What a local sync keeps up to date: the head of a branch, expanded into a local directory. */
-export interface SyncInput {
-  /** HTTPS address, `file:` URL, or absolute path of the repository. */
+/** A catalog repository as the settings page submits it. */
+export interface RepoInput {
+  /** HTTPS address of the repository on a configured host. */
   url: string
   /** Branch to follow; missing or empty follows the remote's default branch. */
   branch?: string
-  /** Absolute directory on the Host the files are expanded into; `~` expands to the home directory. */
-  dir: string
-  /** Minutes between two syncs; default {@link DEFAULT_SYNC_INTERVAL_MINUTES}. */
-  intervalMinutes?: number
+  access: RepoAccess
+  /** Ids of the features turned on. */
+  features: string[]
+  /** Local sync; omitted when no directory was ever entered. */
+  localSync?: {
+    enabled: boolean
+    /** Absolute directory on the Host; `~` expands to the home directory. Required while enabled. */
+    dir: string
+    /** Minutes between two syncs; default {@link DEFAULT_SYNC_INTERVAL_MINUTES}. */
+    intervalMinutes?: number
+  }
 }
 
-/** One local sync as the settings page lists it. */
-export interface SyncInfo {
-  id: string
-  url: string
-  /** Branch asked for; missing follows the remote's default branch. */
-  branch?: string
-  dir: string
-  intervalMinutes: number
+/** Where a repository's local sync stands. */
+export interface LocalSyncStatus {
   /** `queued`: waiting for another sync to finish; `running`: syncing now. */
   state: 'idle' | 'queued' | 'running'
-  /** Last successful sync: when, which commit, and the branch it resolved. */
+  /** Last successful sync into the current directory: when, which commit, and the branch it resolved. */
   syncedAt?: string
   commit?: string
   syncedBranch?: string
@@ -168,6 +220,23 @@ export interface SyncInfo {
   failedAt?: string
   /** When the next sync is due, while one is scheduled. */
   nextAt?: string
+}
+
+/** One catalog repository as the settings page lists it. */
+export interface RepoRow {
+  id: string
+  url: string
+  branch?: string
+  access: RepoAccess
+  features: string[]
+  localSync?: LocalSyncSpec
+  addedAt: string
+  /** `host/path`; absent with {@link problem}. */
+  key?: string
+  /** Why the repository cannot be reached now, e.g. its host was removed. */
+  problem?: string
+  /** Present while the local sync is enabled. */
+  sync?: LocalSyncStatus
 }
 
 /** One repository in the mirror directory. */
@@ -194,6 +263,68 @@ export interface MirrorUsage {
   /** Everything else: unfinished clones and stray files. */
   otherBytes: number
   totalBytes: number
+}
+
+/** A workspace as the settings page submits it. */
+export interface WorkspaceCreateInput {
+  /** Catalog entry id of the repository. */
+  repo: string
+  /** Branch the work merges into and starts from; missing or empty uses the default branch. */
+  base?: string
+  /** Branch to push to; an existing one is continued. Missing or empty: `dsh/<random>`. */
+  branch?: string
+  /** Name of the new directory under the workspace directory; missing or empty: the repository name, numbered when taken. */
+  name?: string
+}
+
+/** One open PR/MR from a workspace's branch. */
+export interface WorkspaceMr {
+  number: number
+  title: string
+  webUrl: string
+}
+
+/** One workspace as the settings page lists it. */
+export interface WorkspaceRow {
+  id: string
+  /** Catalog address of the repository. */
+  url: string
+  /** `host/path` of the repository, or its stored address when that no longer resolves. */
+  repo: string
+  /** Absolute directory. */
+  path: string
+  /** Branch the work merges into. */
+  base: string
+  /** Remote branch the workspace pushes to. */
+  branch: string
+  /** Session that created it; absent for one the settings page created. */
+  session?: string
+  createdAt: string
+  /** Local branch checked out now; absent on a detached head or when the state could not be read. */
+  currentBranch?: string
+  /** Changed files not committed; absent when the state could not be read. */
+  uncommittedFiles?: number
+  /** Commits only this clone holds; absent when the state could not be read. */
+  unpushed?: number
+  /** Latest git activity; absent when the state could not be read. */
+  activityAt?: string
+  /** Open PRs/MRs from {@link branch}; absent when the repository is no longer in the catalog or the host could not be asked. */
+  mrs?: WorkspaceMr[]
+  /** Why the state or the PRs/MRs could not be read. */
+  error?: string
+}
+
+/** `GET /dsh-repo/workspaces` response. */
+export interface WorkspaceRows {
+  ok: true
+  /** Oldest first. */
+  workspaces: WorkspaceRow[]
+}
+
+/** `POST /dsh-repo/workspaces` response. */
+export interface WorkspaceCreated {
+  ok: true
+  workspace: WorkspaceRow
 }
 
 /** Body of a host addition. */
@@ -224,8 +355,16 @@ export interface SettingsState {
   watches: readonly WatchInfo[]
   /** Whether this composition can start a turn of a Session, which PR/MR watching needs. */
   watchAvailable: boolean
-  /** Local syncs in the order they were added. */
-  syncs: readonly SyncInfo[]
+  /** The repository catalog in order. */
+  repos: readonly RepoRow[]
+  /** Features other plugins registered, in registration order. */
+  features: readonly RepoFeature[]
+  /** Workspaces: whether this composition can create them, the directory the page creates them in, and the port the local git proxy listens on. */
+  workspace: {
+    available: boolean
+    dir?: string
+    proxyListening?: number
+  }
 }
 
 /** `POST /dsh-repo/pick-directory` response: the chosen path, or null when cancelled. */

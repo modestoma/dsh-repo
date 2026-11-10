@@ -9,6 +9,8 @@
  */
 
 import { RepoPanelIcon } from './icon.tsx'
+import { setShellServices } from './navigation.ts'
+import type { ShellNavigation, ShellWorkspaces } from './navigation.ts'
 import { bundlePointer, PAGE_TITLE, RepoSettingsPage } from './page.tsx'
 import { installStyles } from './styles.ts'
 
@@ -26,11 +28,19 @@ export interface PanelLayout {
   selectPanel(panelId: string): void
 }
 
+/** Shell services the page opens workspaces through. */
+export interface WorkspaceScope extends ClientContext {
+  workspaces: ShellWorkspaces
+  uiWorkspace: ShellNavigation
+}
+
 /** Client plugin context. */
 export interface ClientContext {
   slots: ClientSlots
   effect?(callback: () => void | (() => void), label?: string): void
   get?(name: string): unknown
+  /** Run `callback` in a child scope while every named service is available. */
+  inject?(deps: string[], callback: (scope: WorkspaceScope) => void): void
 }
 
 /** Cordis client plugin name. */
@@ -52,7 +62,7 @@ export const PANEL_ORDER = 50
 
 /**
  * Mount the left-sidebar entry, its main-column page, the Plugins page
- * pointer, and the stylesheet.
+ * pointer, the stylesheet, and the bridge that opens workspaces in the shell.
  * @param ctx - client plugin context carrying the slots registry.
  */
 export function apply(ctx: ClientContext): void {
@@ -70,4 +80,19 @@ export function apply(ctx: ClientContext): void {
     return layout === undefined ? undefined : () => { layout.selectPanel(PANEL_ID) }
   }
   ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({ name: 'plugins.bundle.config', key: BUNDLE_KEY }, bundlePointer(openPage)))
+  ctx.inject?.(['workspaces', 'uiWorkspace'], mountWorkspaceOpener)
+}
+
+/**
+ * Let the page open workspace directories as DSH Workspaces while the shell's
+ * `workspaces` and `uiWorkspace` services live.
+ * @param scope - child context holding both services.
+ */
+export function mountWorkspaceOpener(scope: WorkspaceScope): void {
+  const publish = (): (() => void) => {
+    setShellServices({ workspaces: scope.workspaces, uiWorkspace: scope.uiWorkspace })
+    return () => { setShellServices(undefined) }
+  }
+  if (typeof scope.effect === 'function') scope.effect(publish, 'dsh-repo: workspace opener')
+  else publish()
 }

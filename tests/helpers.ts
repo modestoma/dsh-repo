@@ -5,13 +5,13 @@ import { tmpdir } from 'node:os'
 import { DEFAULT_SETTINGS, resolveConfig, resolveSettings, settingsOverrides } from '../src/config.ts'
 import type { RepoConfig, RepoSettings } from '../src/config.ts'
 import type { HostCredentials } from '../src/host.ts'
-import { HostStore } from '../src/hosts.ts'
+import { SettingsStore } from '../src/settings/store.ts'
 import { runGit } from '../src/mirror/git.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import type { MirrorLimits } from '../src/mirror/store.ts'
-import { WorkspaceStore } from '../src/mirror/workspace.ts'
-import type { GitRunner } from '../src/mirror/git.ts'
 import { RepoService } from '../src/service.ts'
+import type { CatalogEntry } from '../src/catalog/entry.ts'
+import type { RepoAccess } from '../src/contract.ts'
 
 /** One recorded request. */
 export interface Recorded {
@@ -65,34 +65,68 @@ export function credentials(values: Record<string, string>): HostCredentials & {
   }
 }
 
+/** Host repositories the provider and tool tests address, each in the default test catalog. */
+export const TEST_REPOS: readonly string[] = [
+  'https://github.com/a/b',
+  'https://github.com/a/lib',
+  'https://github.com/other/repo',
+  'https://github.com/modestoma/dsh-repo',
+  'https://github.com/modestoma/app',
+  'https://github.com/team/github',
+  'https://github.com/team/.github',
+  'https://ghe.example.com/platform/api',
+  'https://ghe.example.com/a/b',
+  'https://code.example.com/gitlab/team/backend/orders',
+  'https://code.example.com/gitlab/team/app',
+]
+
+/**
+ * Catalog entries for addresses, all with one access level.
+ * @param urls - repository addresses.
+ * @param access - access of every entry.
+ * @returns the entries with distinct ids.
+ */
+export function catalogEntries(urls: readonly string[], access: RepoAccess = 'merge'): CatalogEntry[] {
+  return urls.map((url, index) => ({ id: index.toString(16).padStart(12, '0'), url, access, features: [], addedAt: '2026-11-09T00:00:00.000Z' }))
+}
+
 /**
  * Host store over a configuration whose settings file under `root` starts
- * with `settings` (default: no file, so default settings).
+ * with `settings` and the catalog `repos` (default: no file, so default
+ * settings and an empty catalog).
  */
-export function hostStore(config: RepoConfig, root: string, settings?: RepoSettings): HostStore {
+export function settingsStore(config: RepoConfig, root: string, settings?: RepoSettings, repos?: readonly CatalogEntry[]): SettingsStore {
   const file = join(root, 'hosts.json')
-  if (settings !== undefined) writeFileSync(file, `${JSON.stringify({ hosts: [], settings: settingsOverrides(settings) })}\n`)
-  return new HostStore(config.hosts, file)
+  if (settings !== undefined || repos !== undefined) {
+    writeFileSync(file, `${JSON.stringify({ hosts: [], ...repos === undefined ? {} : { repos }, ...settings === undefined ? {} : { settings: settingsOverrides(settings) } })}\n`)
+  }
+  return new SettingsStore(config.hosts, file)
+}
+
+/**
+ * Add addresses to a service's catalog.
+ * @param service - the service.
+ * @param urls - repository addresses.
+ * @param access - access of every new entry.
+ */
+export async function allow(service: RepoService, urls: readonly string[], access: RepoAccess = 'merge'): Promise<void> {
+  for (const url of urls) await service.catalog.add({ url, access, features: [] })
 }
 
 /** Fixed mirror limits. */
-export function mirrorLimits(maxFileBytes: number, maxTreeEntries: number, timeoutMs = 30_000): () => MirrorLimits {
-  return () => ({ timeoutMs, maxFileBytes, maxTreeEntries })
+export function mirrorLimits(timeoutMs = 30_000): () => MirrorLimits {
+  return () => ({ timeoutMs })
 }
 
-/** Service over a configuration, fixed tokens, and settings, with its settings file and mirrors in a fresh directory. */
-export function createService(config: RepoConfig, tokens: Record<string, string> = {}, settings: RepoSettings = DEFAULT_SETTINGS): RepoService {
+/** Service over a configuration, fixed tokens, settings, and catalog (default {@link TEST_REPOS} with `merge` access), with its settings file and mirrors in a fresh directory. */
+export function createService(config: RepoConfig, tokens: Record<string, string> = {}, settings: RepoSettings = DEFAULT_SETTINGS, repos: readonly CatalogEntry[] = catalogEntries(TEST_REPOS)): RepoService {
   const root = mkdtempSync(join(tmpdir(), 'dsh-repo-test-'))
   return new RepoService({
+    forbiddenMirrorRoots: [],
     credentials: credentials(tokens),
-    hosts: hostStore(config, root, settings),
-    ...withMirrors(new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits(settings.limits.maxFileBytes, settings.limits.maxTreeEntries) })),
+    store: settingsStore(config, root, settings, repos),
+    mirrorStore: new MirrorStore({ git: runGit, root: join(root, 'mirrors'), limits: mirrorLimits() }),
   })
-}
-
-/** Service dependencies over a mirror store: the store and workspaces on it. */
-export function withMirrors(mirrors: MirrorStore, git: GitRunner = runGit, maxDiffBytes = 4096): { mirrors: MirrorStore; workspaces: WorkspaceStore } {
-  return { mirrors, workspaces: new WorkspaceStore({ git, mirrors, limits: () => ({ timeoutMs: 30_000, maxDiffBytes }) }) }
 }
 
 /** Settings with overrides on top of the defaults. */

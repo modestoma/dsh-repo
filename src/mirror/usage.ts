@@ -57,14 +57,13 @@ export async function treeSize(path: string): Promise<number> {
 function withoutCredentials(url: string): string {
   try {
     const parsed = new URL(url)
-    if (parsed.protocol === 'file:') return url
     parsed.username = ''
     parsed.password = ''
     parsed.search = ''
     parsed.hash = ''
     return parsed.href
   } catch {
-    // A local path has nothing to remove.
+    // Not a URL: shown as git reported it.
     return url
   }
 }
@@ -72,7 +71,7 @@ function withoutCredentials(url: string): string {
 async function lastFetch(dir: string): Promise<string | undefined> {
   for (const name of ['FETCH_HEAD', 'HEAD']) {
     try {
-      return (await lstat(join(dir, '.git', name))).mtime.toISOString()
+      return (await lstat(join(dir, name))).mtime.toISOString()
     } catch (error) {
       if (!isMissing(error)) throw error
     }
@@ -80,9 +79,11 @@ async function lastFetch(dir: string): Promise<string | undefined> {
   return undefined
 }
 
-async function hasGitDir(dir: string): Promise<boolean> {
+/** Whether a directory is a bare mirror: named `*.git` and holding `objects/` and `HEAD`. */
+async function isMirror(dir: string): Promise<boolean> {
+  if (!dir.endsWith('.git')) return false
   try {
-    return (await lstat(join(dir, '.git'))).isDirectory()
+    return (await lstat(join(dir, 'objects'))).isDirectory() && (await lstat(join(dir, 'HEAD'))).isFile()
   } catch (error) {
     if (isMissing(error)) return false
     throw error
@@ -90,7 +91,7 @@ async function hasGitDir(dir: string): Promise<boolean> {
 }
 
 /**
- * Measure the mirror directory. A directory holding `.git` is one mirror;
+ * Measure the mirror directory. A bare repository named `*.git` is one mirror;
  * `.snapshots` counts as snapshots; unfinished clones (`*.partial-*`) and
  * files count as other.
  * @param root - absolute mirror directory; a missing one measures empty.
@@ -127,7 +128,7 @@ export async function measureMirrors(root: string, origin: OriginReader): Promis
         continue
       }
       const rel = [...segments, name]
-      if (await hasGitDir(path)) {
+      if (await isMirror(path)) {
         const url = await origin(path)
         const fetchedAt = await lastFetch(path)
         mirrors.push({ path: rel.join('/'), ...url === undefined ? {} : { url: withoutCredentials(url) }, bytes: await treeSize(path), ...fetchedAt === undefined ? {} : { fetchedAt } })

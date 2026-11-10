@@ -4,8 +4,8 @@
  * @module dsh-repo/client/api
  */
 
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, SYNC_RUN_ROUTE, SYNCS_ROUTE, WATCHES_ROUTE } from '../settings/contract.ts'
-import type { HostAddRequest, MirrorUsage, MutationError, MutationOk, PickedDirectory, RepoSettingsWire, SettingsState, SyncInput } from '../settings/contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE, WORKSPACE_DIR_ROUTE, WORKSPACES_ROUTE } from '../settings/contract.ts'
+import type { HostAddRequest, MirrorUsage, MutationError, MutationOk, PickedDirectory, RepoInput, RepoSettingsWire, SettingsState, WorkspaceCreated, WorkspaceCreateInput, WorkspaceRow, WorkspaceRows } from '../settings/contract.ts'
 
 /**
  * Error text of a value thrown by a request.
@@ -14,6 +14,13 @@ import type { HostAddRequest, MirrorUsage, MutationError, MutationOk, PickedDire
  */
 export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** A failed request with the HTTP status the Host answered. */
+export class RequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message)
+  }
 }
 
 /**
@@ -39,11 +46,11 @@ async function request<T>(route: string, init?: RequestInit): Promise<T> {
     body = JSON.parse(text)
   } catch {
     // Non-JSON bodies (proxy errors) are reported by HTTP status below.
-    throw new Error(`HTTP ${response.status}`)
+    throw new RequestError(response.status, `HTTP ${response.status}`)
   }
   if (!response.ok) {
     const error = (body as Partial<MutationError>).error
-    throw new Error(typeof error === 'string' && error !== '' ? error : `HTTP ${response.status}`)
+    throw new RequestError(response.status, typeof error === 'string' && error !== '' ? error : `HTTP ${response.status}`)
   }
   return body as T
 }
@@ -103,8 +110,8 @@ export function saveMirrorDir(dir: string): Promise<SettingsState> {
   return mutate(MIRROR_ROUTE, 'PUT', { dir })
 }
 
-/** @returns the state after returning to the default mirror directory. */
-export function resetMirrorDir(): Promise<SettingsState> {
+/** @returns the state after clearing the mirror directory choice. */
+export function clearMirrorDir(): Promise<SettingsState> {
   return mutate(MIRROR_ROUTE, 'DELETE')
 }
 
@@ -132,40 +139,40 @@ export function stopWatch(id: string): Promise<SettingsState> {
 }
 
 /**
- * Add a local sync; responds after its first sync.
- * @param input - address, branch, directory, and interval.
+ * Add a repository to the catalog; responds after the first local sync it starts.
+ * @param input - address, branch, access, features, and local sync.
  * @returns the new state.
  */
-export function addSync(input: SyncInput): Promise<SettingsState> {
-  return mutate(SYNCS_ROUTE, 'POST', input)
+export function addRepo(input: RepoInput): Promise<SettingsState> {
+  return mutate(REPOS_ROUTE, 'POST', input)
 }
 
 /**
- * Change a local sync; responds after the sync a changed address, branch, or directory causes.
- * @param id - sync id.
+ * Change a catalog repository; responds after the local sync a changed address, branch, or directory starts.
+ * @param id - entry id.
  * @param input - the complete new fields.
  * @returns the new state.
  */
-export function updateSync(id: string, input: SyncInput): Promise<SettingsState> {
-  return mutate(SYNCS_ROUTE, 'PUT', { id, ...input })
+export function updateRepo(id: string, input: RepoInput): Promise<SettingsState> {
+  return mutate(REPOS_ROUTE, 'PUT', { id, ...input })
 }
 
 /**
- * Remove a local sync; its files stay.
- * @param id - sync id.
+ * Remove a repository from the catalog; files in its local sync directory stay.
+ * @param id - entry id.
  * @returns the new state.
  */
-export function removeSync(id: string): Promise<SettingsState> {
-  return mutate(SYNCS_ROUTE, 'DELETE', { id })
+export function removeRepo(id: string): Promise<SettingsState> {
+  return mutate(REPOS_ROUTE, 'DELETE', { id })
 }
 
 /**
- * Sync now; responds when the sync finished.
- * @param id - sync id.
+ * Run a repository's local sync now; responds when the sync finished.
+ * @param id - entry id.
  * @returns the new state.
  */
-export function runSync(id: string): Promise<SettingsState> {
-  return mutate(SYNC_RUN_ROUTE, 'POST', { id })
+export function syncRepo(id: string): Promise<SettingsState> {
+  return mutate(REPO_SYNC_ROUTE, 'POST', { id })
 }
 
 /** @returns the repositories in the mirror directory with their disk usage. */
@@ -176,4 +183,43 @@ export function fetchMirrorUsage(): Promise<MirrorUsage> {
 /** @returns the directory chosen in the Host's system dialog, or null when cancelled. */
 export async function pickDirectory(): Promise<string | null> {
   return (await request<PickedDirectory>(PICK_DIRECTORY_ROUTE, { method: 'POST' })).path
+}
+
+/**
+ * Choose the directory the page creates workspaces in.
+ * @param dir - absolute directory on the Host, created when missing.
+ * @returns the new state.
+ */
+export function saveWorkspaceDir(dir: string): Promise<SettingsState> {
+  return mutate(WORKSPACE_DIR_ROUTE, 'PUT', { dir })
+}
+
+/** @returns the state after clearing the workspace directory. */
+export function clearWorkspaceDir(): Promise<SettingsState> {
+  return mutate(WORKSPACE_DIR_ROUTE, 'DELETE')
+}
+
+/** @returns every workspace with its branch, unsaved work, and open PRs/MRs, oldest first. */
+export async function fetchWorkspaces(): Promise<WorkspaceRow[]> {
+  return (await request<WorkspaceRows>(WORKSPACES_ROUTE)).workspaces
+}
+
+/**
+ * Create a workspace under the workspace directory.
+ * @param input - catalog entry, base, branch, and directory name.
+ * @returns the new workspace.
+ */
+export async function createWorkspace(input: WorkspaceCreateInput): Promise<WorkspaceRow> {
+  return (await request<WorkspaceCreated>(WORKSPACES_ROUTE, { method: 'POST', body: JSON.stringify(input) })).workspace
+}
+
+/**
+ * Delete a workspace.
+ * @param id - workspace id.
+ * @param force - delete despite unsaved work.
+ * @returns the remaining workspaces.
+ * @throws {RequestError} status 409 when it has unsaved work and `force` is not set.
+ */
+export async function removeWorkspace(id: string, force: boolean): Promise<WorkspaceRow[]> {
+  return (await request<WorkspaceRows>(WORKSPACES_ROUTE, { method: 'DELETE', body: JSON.stringify({ id, force }) })).workspaces
 }

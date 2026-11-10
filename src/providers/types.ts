@@ -1,15 +1,17 @@
 /**
  * The per-family provider interface the service delegates to after resolving
- * a target, normalizing paging, and attaching the call deadline.
+ * a target, normalizing paging, and attaching the call deadline, and the
+ * adapter that holds everything else that differs between code host
+ * families.
  *
  * @module dsh-repo/providers/types
  */
 
 import type {
-  BranchInfo, ChangeDetail, CommitAuthor, ChangeDiff, ChangeInfo, ChangeState, ChangeStatus, CiActionResult, CiJob, CiRun, CiRunDetail, CiRunListOptions, CommentInfo, CommitInfo,
+  BranchInfo, MrDetail, CommitAuthor, MrDiff, MrInfo, MrState, MrStatus, CiActionResult, CiJob, CiRun, CiRunDetail, CommentInfo, CommitInfo,
   FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, RepoUser, TreeListing,
 } from '../contract.ts'
-import type { RepoLimits } from '../config.ts'
+import type { HostSpec, RepoLimits } from '../config.ts'
 
 /** Per-call input every provider method receives. */
 export interface Call {
@@ -22,6 +24,14 @@ export interface Call {
 export interface Paging {
   readonly page: number
   readonly perPage: number
+}
+
+/** Filters of a CI run listing after validation; `mr` is a pull/merge request number. */
+export interface CiRunQuery {
+  readonly ref?: string
+  readonly sha?: string
+  readonly mr?: number
+  readonly state?: 'pending' | 'running' | 'success' | 'failure' | 'canceled'
 }
 
 /** One code host family. Methods throw SDK errors or {@link RepoError}; the service classifies them. */
@@ -37,25 +47,25 @@ export interface Provider {
   listTree(ref: RepoRef, query: { readonly ref?: string; readonly path: string; readonly recursive: boolean }, call: Call): Promise<TreeListing>
   readFile(ref: RepoRef, path: string, at: string | undefined, call: Call): Promise<FileContent>
 
-  listIssues(ref: RepoRef, query: Paging & { readonly state: IssueState | 'all'; readonly labels?: readonly string[]; readonly assignee?: string }, call: Call): Promise<Page<IssueInfo>>
+  listIssues(ref: RepoRef, query: Paging & { readonly state: IssueState | 'all'; readonly labels?: readonly string[]; readonly assignee?: string; readonly search?: string }, call: Call): Promise<Page<IssueInfo>>
   getIssue(ref: RepoRef, number: number, call: Call): Promise<IssueDetail>
   createIssue(ref: RepoRef, issue: IssueFields & { readonly title: string }, call: Call): Promise<IssueInfo>
   updateIssue(ref: RepoRef, number: number, update: IssueFields & { readonly state?: IssueState }, call: Call): Promise<IssueInfo>
   commentIssue(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
 
-  listChanges(ref: RepoRef, query: Paging & { readonly state: ChangeState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string }, call: Call): Promise<Page<ChangeInfo>>
-  getChange(ref: RepoRef, number: number, call: Call): Promise<ChangeDetail>
-  changeDiff(ref: RepoRef, number: number, call: Call): Promise<ChangeDiff>
-  changeStatus(ref: RepoRef, number: number, call: Call): Promise<ChangeStatus>
-  createChange(ref: RepoRef, change: IssueFields & { readonly title: string; readonly sourceBranch: string; readonly targetBranch: string; readonly draft: boolean; readonly deleteSourceBranch: boolean }, call: Call): Promise<ChangeInfo>
-  updateChange(ref: RepoRef, number: number, update: IssueFields & { readonly state?: 'open' | 'closed'; readonly targetBranch?: string }, call: Call): Promise<ChangeInfo>
-  commentChange(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
+  listMrs(ref: RepoRef, query: Paging & { readonly state: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string }, call: Call): Promise<Page<MrInfo>>
+  getMr(ref: RepoRef, number: number, call: Call): Promise<MrDetail>
+  mrDiff(ref: RepoRef, number: number, call: Call): Promise<MrDiff>
+  mrStatus(ref: RepoRef, number: number, call: Call): Promise<MrStatus>
+  createMr(ref: RepoRef, change: IssueFields & { readonly title: string; readonly sourceBranch: string; readonly targetBranch: string; readonly draft: boolean; readonly deleteSourceBranch: boolean }, call: Call): Promise<MrInfo>
+  updateMr(ref: RepoRef, number: number, update: IssueFields & { readonly state?: 'open' | 'closed'; readonly targetBranch?: string }, call: Call): Promise<MrInfo>
+  commentMr(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
   /** With `deleteSourceBranch`, the result reports the source branch; a failed deletion does not throw. */
-  mergeChange(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod; readonly deleteSourceBranch: boolean }, call: Call): Promise<MergeResult>
-  /** One poll for a watch: always the change request, CI and comments only as `request` asks. */
-  changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity>
+  mergeMr(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod; readonly deleteSourceBranch: boolean }, call: Call): Promise<MergeResult>
+  /** One poll for a watch: always the PR/MR, CI and comments only as `request` asks. */
+  mrActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<MrActivity>
 
-  listRuns(ref: RepoRef, query: Paging & Pick<CiRunListOptions, 'ref' | 'sha' | 'change' | 'state'>, call: Call): Promise<Page<CiRun>>
+  listRuns(ref: RepoRef, query: Paging & CiRunQuery, call: Call): Promise<Page<CiRun>>
   /** The run with every job; failures are read only for a failed run. */
   getRun(ref: RepoRef, id: number, call: Call): Promise<CiRunDetail>
   /** Failed jobs of a run, for a watch's CI failure message. */
@@ -116,9 +126,9 @@ export async function okBody(response: Response): Promise<ReadableStream<Uint8Ar
   return response.body
 }
 
-/** What a watch already knows about a change request, so a poll reads only what may have changed. */
+/** What a watch already knows about a PR/MR, so a poll reads only what may have changed. */
 export interface ActivityRequest {
-  /** `updatedAt` of the last poll; comments and reviews are read only when the change request's differs. */
+  /** `updatedAt` of the last poll; comments and reviews are read only when the PR/MR's differs. */
   readonly updatedAt?: string
   /** Whether CI is read: the head moved, CI was still running, or CI had not reported yet. */
   readonly withStatus: boolean
@@ -126,7 +136,7 @@ export interface ActivityRequest {
   readonly since: string
 }
 
-/** One comment, review comment, or review on a change request, in creation order. */
+/** One comment, review comment, or review on a PR/MR, in creation order. */
 export interface ActivityItem {
   readonly id: string
   /** `comment` covers conversation comments, code-line comments, and reviews that only comment. */
@@ -139,18 +149,18 @@ export interface ActivityItem {
   readonly path?: string
 }
 
-/** One poll of a change request. */
-export interface ChangeActivity {
-  readonly change: ChangeInfo
-  /** Whether the change request conflicts with its target branch. */
+/** One poll of a PR/MR. */
+export interface MrActivity {
+  readonly mr: MrInfo
+  /** Whether the PR/MR conflicts with its target branch. */
   readonly conflict: boolean
   /** Present when CI was read. */
-  readonly status?: ChangeStatus
+  readonly status?: MrStatus
   /** Present when comments and reviews were read: those created at or after `since`, oldest first. */
   readonly items?: readonly ActivityItem[]
 }
 
-/** Editable fields shared by issues and change requests. */
+/** Editable fields shared by issues and PRs/MRs. */
 export interface IssueFields {
   readonly title?: string
   readonly body?: string
@@ -160,6 +170,68 @@ export interface IssueFields {
 
 /** Resolves a host's token for each request. */
 export type TokenSource = () => Promise<string>
+
+/**
+ * Everything that differs between code host families, so nothing outside a
+ * family's module branches on the host kind.
+ */
+export interface ForgeAdapter {
+  readonly kind: HostSpec['kind']
+  /** Product name for messages, e.g. `GitHub`. */
+  readonly title: string
+  /** HTTP username git sends with the host's token over HTTPS. */
+  readonly gitUsername: string
+  /** The form of a repository path for messages, e.g. `owner/name`. */
+  readonly pathHint: string
+  /**
+   * The REST API base URL of a host.
+   * @param host - host address and the configured API address, if the family allows one.
+   * @returns the base URL the provider sends requests to.
+   */
+  apiBaseUrl(host: { readonly url: string; readonly apiUrl?: string | undefined }): string
+  /**
+   * The repository path in an address.
+   * @param rest - the address path below the host's path prefix, e.g. `/group/sub/app/-/merge_requests/3`.
+   * @returns the repository path, or undefined when the address names none.
+   */
+  repoPath(rest: string): string | undefined
+  /**
+   * The label of a PR/MR in messages.
+   * @param number - PR/MR number as shown in the web UI.
+   * @returns e.g. `PR #12` or `MR !12`.
+   */
+  mrLabel(number: number): string
+  /**
+   * Build the provider of one host.
+   * @param spec - configured or added host of this family.
+   * @param token - resolves the host's token for every request.
+   * @param timeoutMs - API deadline, for clients that need it at construction.
+   * @returns the provider.
+   */
+  createProvider(spec: HostSpec, token: TokenSource, timeoutMs: number): Provider
+}
+
+const SEGMENT = /^[A-Za-z0-9._-]+$/
+
+/**
+ * Join path segments into a repository path, dropping a `.git` suffix of the last one.
+ * @param segments - repository path segments.
+ * @returns the path, or undefined when a segment is not a plain name.
+ */
+export function joinRepoPath(segments: readonly string[]): string | undefined {
+  const parts = [...segments]
+  if (parts.at(-1)?.endsWith('.git') === true) parts[parts.length - 1] = parts.at(-1)!.slice(0, -4)
+  return parts.every(segment => SEGMENT.test(segment) && segment !== '.' && segment !== '..') ? parts.join('/') : undefined
+}
+
+/**
+ * Path segments of an address path below the host, without a trailing `.git`.
+ * @param rest - address path.
+ * @returns the non-empty segments.
+ */
+export function pathSegments(rest: string): string[] {
+  return rest.replace(/\.git$/, '').split('/').filter(segment => segment !== '')
+}
 
 /**
  * The next page number after a page of `count` items.

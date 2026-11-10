@@ -1,19 +1,20 @@
 /**
  * GitHub provider on the official `@octokit/rest` SDK: github.com and GitHub
- * Enterprise Server (`<url>/api/v3`). Pull requests are this module's change
- * requests.
+ * Enterprise Server (`<url>/api/v3`). Pull requests are this module's PRs/MRs.
+ * {@link githubForge} is the family's adapter.
  *
  * @module dsh-repo/providers/github
  */
 
 import { Octokit } from '@octokit/rest'
 import type {
-  BranchInfo, ChangeInfo, ChangeState, ChangeStatus, CheckInfo, CheckState, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiRunListOptions, CiState, CommentInfo, CommitAuthor, CommitInfo,
+  BranchInfo, MrInfo, MrState, MrStatus, CheckInfo, CheckState, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiState, CommentInfo, CommitAuthor, CommitInfo,
   IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
-import { capFailures, errorText, nextPage, okBody, titleOf, truncateBytes } from './types.ts'
-import type { ActivityItem, ActivityRequest, Call, ChangeActivity, Paging, Provider, TokenSource } from './types.ts'
+import { forgeKindInfo } from '../settings/contract.ts'
+import { capFailures, errorText, joinRepoPath, nextPage, okBody, pathSegments, titleOf, truncateBytes } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ForgeAdapter, MrActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitHub's largest page. */
 const PAGE = 100
@@ -82,8 +83,8 @@ interface GithubPull {
   readonly html_url: string
 }
 
-function pull(value: GithubPull): ChangeInfo {
-  const state: ChangeState = value.merged_at !== null ? 'merged' : value.state === 'closed' ? 'closed' : 'open'
+function pull(value: GithubPull): MrInfo {
+  const state: MrState = value.merged_at !== null ? 'merged' : value.state === 'closed' ? 'closed' : 'open'
   return {
     number: value.number,
     title: value.title,
@@ -145,7 +146,7 @@ function ciState(status: string | null, conclusion: string | null | undefined): 
   }
 }
 
-/** {@link CiRunListOptions.state} as a workflow run status filter. */
+/** {@link CiRunQuery.state} as a workflow run status filter. */
 const RUN_STATUS = { pending: 'queued', running: 'in_progress', success: 'success', failure: 'failure', canceled: 'cancelled' } as const
 
 /** The workflow run and job of a GitHub Actions check run, read off its URL. */
@@ -343,7 +344,22 @@ export class GithubProvider implements Provider {
     return { path, ref: target, binary: false, ...truncateBytes(raw, call.limits.maxFileBytes) }
   }
 
-  async listIssues(ref: RepoRef, query: { page: number; perPage: number; state: 'open' | 'closed' | 'all'; labels?: readonly string[]; assignee?: string }, call: Call) {
+  async listIssues(ref: RepoRef, query: { page: number; perPage: number; state: 'open' | 'closed' | 'all'; labels?: readonly string[]; assignee?: string; search?: string }, call: Call) {
+    if (query.search !== undefined) {
+      // The issues endpoint has no text filter; the search API does, with the same filters as qualifiers.
+      // Every search word is quoted, so qualifiers such as `repo:` in it stay text and cannot widen the scope.
+      const words = query.search.split(/\s+/).map(word => word.replace(/"/g, '')).filter(word => word !== '').map(word => `"${word}"`)
+      const qualifiers = [
+        `repo:${ref.path}`,
+        'is:issue',
+        ...query.state === 'all' ? [] : [`state:${query.state}`],
+        ...(query.labels ?? []).map(label => `label:"${label.replace(/"/g, '')}"`),
+        ...query.assignee === undefined ? [] : [`assignee:"${query.assignee.replace(/"/g, '')}"`],
+      ]
+      const { data } = await this.octokit.rest.search.issuesAndPullRequests({ q: [...words, ...qualifiers].join(' '), page: query.page, per_page: query.perPage, request: { signal: call.signal } })
+      const own = `/repos/${ref.path}`.toLowerCase()
+      return { items: data.items.filter(entry => entry.pull_request === undefined && entry.repository_url.toLowerCase().endsWith(own)).map(entry => issue(entry as Parameters<typeof issue>[0])), ...nextPage(query, data.items.length) }
+    }
     const { data } = await this.octokit.rest.issues.listForRepo({
       ...split(ref.path),
       state: query.state,
@@ -353,7 +369,7 @@ export class GithubProvider implements Provider {
       ...query.assignee === undefined ? {} : { assignee: query.assignee },
       request: { signal: call.signal },
     })
-    // The issues endpoint also lists pull requests; they are change requests here.
+    // The issues endpoint also lists pull requests; they are PRs here.
     return { items: data.filter(entry => entry.pull_request === undefined).map(issue), ...nextPage(query, data.length) }
   }
 
@@ -398,7 +414,7 @@ export class GithubProvider implements Provider {
     return comment(data)
   }
 
-  async listChanges(ref: RepoRef, query: { page: number; perPage: number; state: ChangeState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
+  async listMrs(ref: RepoRef, query: { page: number; perPage: number; state: MrState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
     const repo = split(ref.path)
     const { data } = await this.octokit.rest.pulls.list({
       ...repo,
@@ -413,7 +429,7 @@ export class GithubProvider implements Provider {
     return { items, ...nextPage(query, data.length) }
   }
 
-  async getChange(ref: RepoRef, number: number, call: Call) {
+  async getMr(ref: RepoRef, number: number, call: Call) {
     const [{ data }, comments] = await Promise.all([
       this.octokit.rest.pulls.get({ ...split(ref.path), pull_number: number, request: { signal: call.signal } }),
       this.comments(ref, number, call),
@@ -421,21 +437,21 @@ export class GithubProvider implements Provider {
     return { ...pull(data), comments }
   }
 
-  async changeDiff(ref: RepoRef, number: number, call: Call) {
+  async mrDiff(ref: RepoRef, number: number, call: Call) {
     const response = await this.octokit.rest.pulls.get({ ...split(ref.path), pull_number: number, mediaType: { format: 'diff' }, request: { signal: call.signal } })
     const raw: unknown = response.data
     const { text, truncated } = truncateBytes(typeof raw === 'string' ? raw : '', call.limits.maxDiffBytes)
     return { diff: text, truncated }
   }
 
-  async changeStatus(ref: RepoRef, number: number, call: Call) {
+  async mrStatus(ref: RepoRef, number: number, call: Call) {
     const repo = split(ref.path)
     const { data: change } = await this.octokit.rest.pulls.get({ ...repo, pull_number: number, request: { signal: call.signal } })
     return await this.statusOf(repo, change, call.signal)
   }
 
   /** Pull request comments and reviews are read only when its `updated_at` moved; check runs never move it, so CI is read as asked. */
-  async changeActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<ChangeActivity> {
+  async mrActivity(ref: RepoRef, number: number, request: ActivityRequest, call: Call): Promise<MrActivity> {
     const repo = split(ref.path)
     const { data } = await this.octokit.rest.pulls.get({ ...repo, pull_number: number, request: { signal: call.signal } })
     const change = pull(data)
@@ -443,7 +459,7 @@ export class GithubProvider implements Provider {
       request.withStatus ? this.statusOf(repo, data, call.signal) : undefined,
       request.updatedAt === change.updatedAt ? undefined : this.activitySince(repo, number, request.since, call.signal),
     ])
-    return { change, conflict: data.mergeable_state === 'dirty', ...status === undefined ? {} : { status }, ...items === undefined ? {} : { items } }
+    return { mr: change, conflict: data.mergeable_state === 'dirty', ...status === undefined ? {} : { status }, ...items === undefined ? {} : { items } }
   }
 
   private async activitySince(repo: { owner: string; repo: string }, number: number, since: string, signal: AbortSignal): Promise<ActivityItem[]> {
@@ -464,7 +480,7 @@ export class GithubProvider implements Provider {
     return items.filter(item => item.createdAt >= since).sort((a, b) => a.createdAt.localeCompare(b.createdAt))
   }
 
-  private async statusOf(repo: { owner: string; repo: string }, change: { readonly head: { readonly sha: string }; readonly mergeable?: boolean | null }, signal: AbortSignal): Promise<ChangeStatus> {
+  private async statusOf(repo: { owner: string; repo: string }, change: { readonly head: { readonly sha: string }; readonly mergeable?: boolean | null }, signal: AbortSignal): Promise<MrStatus> {
     const sha = change.head.sha
     const [runs, statuses] = await Promise.all([
       this.allPages(page => this.octokit.rest.checks.listForRef({ ...repo, ref: sha, per_page: PAGE, page, request: { signal } }).then(response => response.data.check_runs), 'CI 检查'),
@@ -482,7 +498,7 @@ export class GithubProvider implements Provider {
   }
 
   /** GitHub has no per-request "delete source branch" option, so `deleteSourceBranch` is not sent. */
-  async createChange(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
+  async createMr(ref: RepoRef, fields: { title: string; body?: string; sourceBranch: string; targetBranch: string; draft: boolean; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
     const repo = split(ref.path)
     const { data } = await this.octokit.rest.pulls.create({
       ...repo,
@@ -505,7 +521,7 @@ export class GithubProvider implements Provider {
     return pull((await this.octokit.rest.pulls.get({ ...repo, pull_number: data.number, request: { signal: call.signal } })).data)
   }
 
-  async updateChange(ref: RepoRef, number: number, update: { title?: string; body?: string; state?: 'open' | 'closed'; targetBranch?: string; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
+  async updateMr(ref: RepoRef, number: number, update: { title?: string; body?: string; state?: 'open' | 'closed'; targetBranch?: string; labels?: readonly string[]; assignees?: readonly string[] }, call: Call) {
     const repo = split(ref.path)
     const signal = call.signal
     if (update.labels !== undefined || update.assignees !== undefined) {
@@ -529,11 +545,11 @@ export class GithubProvider implements Provider {
     return pull(data)
   }
 
-  async commentChange(ref: RepoRef, number: number, body: string, call: Call) {
+  async commentMr(ref: RepoRef, number: number, body: string, call: Call) {
     return await this.commentIssue(ref, number, body, call)
   }
 
-  async mergeChange(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase'; deleteSourceBranch: boolean }, call: Call) {
+  async mergeMr(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase'; deleteSourceBranch: boolean }, call: Call) {
     const { data } = await this.octokit.rest.pulls.merge({
       ...split(ref.path),
       pull_number: number,
@@ -567,12 +583,12 @@ export class GithubProvider implements Provider {
     }
   }
 
-  /** A change request selects the runs of its current head commit. */
-  async listRuns(ref: RepoRef, query: Paging & Pick<CiRunListOptions, 'ref' | 'sha' | 'change' | 'state'>, call: Call) {
+  /** A PR selects the runs of its current head commit. */
+  async listRuns(ref: RepoRef, query: Paging & CiRunQuery, call: Call) {
     const repo = split(ref.path)
-    const sha = query.change === undefined
+    const sha = query.mr === undefined
       ? query.sha
-      : (await this.octokit.rest.pulls.get({ ...repo, pull_number: query.change, request: { signal: call.signal } })).data.head.sha
+      : (await this.octokit.rest.pulls.get({ ...repo, pull_number: query.mr, request: { signal: call.signal } })).data.head.sha
     const { data } = await this.octokit.rest.actions.listWorkflowRunsForRepo({
       ...repo,
       per_page: query.perPage,
@@ -720,4 +736,22 @@ export class GithubProvider implements Provider {
     const { data } = await this.octokit.rest.issues.listComments({ ...split(ref.path), issue_number: number, per_page: call.limits.maxComments, request: { signal: call.signal } })
     return data.map(comment)
   }
+}
+
+/** The GitHub family: repositories are `owner/name`, git authenticates as `x-access-token`. */
+export const githubForge: ForgeAdapter = {
+  kind: 'github',
+  title: forgeKindInfo('github').label,
+  gitUsername: 'x-access-token',
+  pathHint: 'owner/name',
+  apiBaseUrl: (host) => {
+    if (host.apiUrl !== undefined) return host.apiUrl
+    return new URL(host.url).host === 'github.com' ? 'https://api.github.com' : `${host.url}/api/v3`
+  },
+  repoPath: (rest) => {
+    const segments = pathSegments(rest).slice(0, 2)
+    return segments.length === 2 ? joinRepoPath(segments) : undefined
+  },
+  mrLabel: number => `PR #${number}`,
+  createProvider: (spec, token) => new GithubProvider(githubForge.apiBaseUrl(spec), token),
 }

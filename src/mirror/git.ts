@@ -50,54 +50,69 @@ const MAX_BUFFER = 64 * 1024 * 1024
 const MAX_STDERR = 1024 * 1024
 
 /**
+ * Run a program non-interactively with git's environment, failing like a git command.
+ * @param argv - program and arguments, e.g. a sandbox runner wrapping `git`.
+ * @param options - working directory, timeout, extra environment, cancellation, and output cut.
+ * @returns stdout.
+ */
+export function runCommand(argv: readonly string[], options: GitRunOptions): Promise<string> {
+  const [program = 'git', ...rest] = argv
+  return spawnCommand(program, rest, argv.slice(1), options)
+}
+
+/**
  * Default runner backed by the `git` executable on PATH.
  * @param args - git arguments.
  * @param options - working directory, timeout, extra environment, cancellation, and output cut.
  * @returns stdout.
  */
-export const runGit: GitRunner = (args, options) => new Promise((resolve, reject) => {
-  const child = spawn('git', [...args], { cwd: options.cwd, env: { ...gitEnvironment(), ...options.env }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-  const limit = options.maxOutputBytes ?? MAX_BUFFER
-  const out: Buffer[] = []
-  const err: Buffer[] = []
-  let outBytes = 0
-  let errBytes = 0
-  let stopped: string | undefined
-  const stop = (why: string): void => {
-    stopped ??= why
-    child.kill('SIGTERM')
-  }
-  const timer = setTimeout(() => { stop(`超时（${options.timeoutMs} ms）后终止`) }, options.timeoutMs)
-  const onAbort = (): void => { stop('被取消后终止') }
-  options.signal?.addEventListener('abort', onAbort, { once: true })
-  if (options.signal?.aborted === true) onAbort()
-  child.stdout.on('data', (chunk: Buffer) => {
-    if (outBytes < limit) out.push(chunk.subarray(0, limit - outBytes))
-    outBytes += chunk.length
-    if (outBytes > limit && options.maxOutputBytes === undefined) stop(`输出超过 ${MAX_BUFFER} 字节后终止`)
-  })
-  child.stderr.on('data', (chunk: Buffer) => {
-    if (errBytes < MAX_STDERR) err.push(chunk.subarray(0, MAX_STDERR - errBytes))
-    errBytes += chunk.length
-  })
-  child.on('error', (error) => {
-    clearTimeout(timer)
-    options.signal?.removeEventListener('abort', onAbort)
-    reject(new GitError(args, error.message))
-  })
-  child.on('close', (code) => {
-    clearTimeout(timer)
-    options.signal?.removeEventListener('abort', onAbort)
-    const stdout = Buffer.concat(out).toString('utf8')
-    if (code === 0 && stopped === undefined) {
-      resolve(stdout)
-      return
+export const runGit: GitRunner = (args, options) => spawnCommand('git', args, args, options)
+
+function spawnCommand(program: string, argv: readonly string[], args: readonly string[], options: GitRunOptions): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(program, [...argv], { cwd: options.cwd, env: { ...gitEnvironment(), ...options.env }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const limit = options.maxOutputBytes ?? MAX_BUFFER
+    const out: Buffer[] = []
+    const err: Buffer[] = []
+    let outBytes = 0
+    let errBytes = 0
+    let stopped: string | undefined
+    const stop = (why: string): void => {
+      stopped ??= why
+      child.kill('SIGTERM')
     }
-    const stderr = Buffer.concat(err).toString('utf8').trim()
-    const output = [stderr, stdout.trim()].filter(part => part !== '').join('\n')
-    reject(new GitError(args, stopped === undefined ? output || `退出码 ${String(code)}` : `${stopped}${output === '' ? '' : `：${output}`}`))
+    const timer = setTimeout(() => { stop(`超时（${options.timeoutMs} ms）后终止`) }, options.timeoutMs)
+    const onAbort = (): void => { stop('被取消后终止') }
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+    if (options.signal?.aborted === true) onAbort()
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (outBytes < limit) out.push(chunk.subarray(0, limit - outBytes))
+      outBytes += chunk.length
+      if (outBytes > limit && options.maxOutputBytes === undefined) stop(`输出超过 ${MAX_BUFFER} 字节后终止`)
+    })
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (errBytes < MAX_STDERR) err.push(chunk.subarray(0, MAX_STDERR - errBytes))
+      errBytes += chunk.length
+    })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      options.signal?.removeEventListener('abort', onAbort)
+      reject(new GitError(args, error.message))
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      options.signal?.removeEventListener('abort', onAbort)
+      const stdout = Buffer.concat(out).toString('utf8')
+      if (code === 0 && stopped === undefined) {
+        resolve(stdout)
+        return
+      }
+      const stderr = Buffer.concat(err).toString('utf8').trim()
+      const output = [stderr, stdout.trim()].filter(part => part !== '').join('\n')
+      reject(new GitError(args, stopped === undefined ? output || `退出码 ${String(code)}` : `${stopped}${output === '' ? '' : `：${output}`}`))
+    })
   })
-})
+}
 
 /** Environment variables the helper reads; set only on git child processes. */
 const USERNAME_VARIABLE = 'DSH_REPO_GIT_USERNAME'

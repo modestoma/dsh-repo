@@ -14,7 +14,7 @@ afterEach(() => { vi.unstubAllGlobals() })
 describe('GitHub provider', () => {
   it('reads repository metadata through the REST API with the host token', async () => {
     const { requests } = fakeHttp([{ method: 'GET', path: API, reply: { body: repoBody } }])
-    const info = await createService(testConfig(), TOKENS).repoInfo(REPO)
+    const info = await createService(testConfig(), TOKENS).forge.repoInfo(REPO)
     expect(info).toMatchObject({ kind: 'github', path: 'modestoma/dsh-repo', defaultBranch: 'main', visibility: 'public', cloneUrl: `${REPO}.git` })
     expect(requests[0]?.url.origin).toBe('https://api.github.com')
     expect(requests[0]?.headers.get('authorization')).toBe('token gh-token')
@@ -22,7 +22,7 @@ describe('GitHub provider', () => {
 
   it('sends GitHub Enterprise Server requests to <url>/api/v3 with that host\'s token', async () => {
     const { requests } = fakeHttp([{ method: 'GET', path: '/api/v3/repos/platform/api', reply: { body: { ...repoBody, html_url: 'https://ghe.example.com/platform/api' } } }])
-    await createService(testConfig(), TOKENS).repoInfo('ghe.example.com/platform/api')
+    await createService(testConfig(), TOKENS).forge.repoInfo('ghe.example.com/platform/api')
     expect(requests[0]?.url.href).toBe('https://ghe.example.com/api/v3/repos/platform/api')
     expect(requests[0]?.headers.get('authorization')).toBe('token ghe-token')
   })
@@ -34,8 +34,8 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/contents/logo.png`, reply: { body: 'PNG\0data' } },
     ])
     const service = createService(testConfig(), TOKENS, testSettings({ limits: { maxFileBytes: 7 } }))
-    expect(await service.readFile(REPO, 'README.md')).toEqual({ path: 'README.md', ref: 'main', text: '你好', binary: false, truncated: true })
-    expect(await service.readFile(REPO, 'logo.png', { ref: 'dev' })).toMatchObject({ ref: 'dev', binary: true, text: '' })
+    expect(await service.forge.readFile(REPO, 'README.md')).toEqual({ path: 'README.md', ref: 'main', text: '你好', binary: false, truncated: true })
+    expect(await service.forge.readFile(REPO, 'logo.png', { ref: 'dev' })).toMatchObject({ ref: 'dev', binary: true, text: '' })
   })
 
   it('lists issues without pull requests', async () => {
@@ -44,11 +44,22 @@ describe('GitHub provider', () => {
       html_url: `${REPO}/issues/${number}`, ...pr ? { pull_request: {} } : {},
     })
     const { requests } = fakeHttp([{ method: 'GET', path: `${API}/issues`, reply: { body: [issue(1, false), issue(2, true)] } }])
-    const page = await createService(testConfig(), TOKENS).listIssues(REPO, { labels: ['bug'], perPage: 2 })
+    const page = await createService(testConfig(), TOKENS).forge.listIssues(REPO, { labels: ['bug'], perPage: 2 })
     expect(page.items.map(item => item.number)).toEqual([1])
     expect(page.items[0]).toMatchObject({ body: '', labels: ['bug'], author: { username: 'modestoma' } })
     expect(page.nextPage).toBe(2)
     expect(requests[0]?.url.searchParams.get('labels')).toBe('bug')
+  })
+
+  it('searches issues as text inside the repository only', async () => {
+    const found = (number: number, repository: string) => ({
+      number, title: `t${number}`, body: null, state: 'open', user: author, labels: [], assignees: [], created_at: 'c', updated_at: 'u',
+      html_url: `https://github.com/${repository}/issues/${number}`, repository_url: `https://api.github.com/repos/${repository}`,
+    })
+    const { requests } = fakeHttp([{ method: 'GET', path: '/search/issues', reply: { body: { total_count: 2, items: [found(1, 'modestoma/dsh-repo'), found(2, 'other/private')] } } }])
+    const page = await createService(testConfig(), TOKENS).forge.listIssues(REPO, { search: 'crash repo:other/private', assignee: 'a b' })
+    expect(page.items.map(item => item.number)).toEqual([1])
+    expect(requests[0]?.url.searchParams.get('q')).toBe('"crash" "repo:other/private" repo:modestoma/dsh-repo is:issue state:open assignee:"a b"')
   })
 
   it('reads one branch, and reports a missing or renamed branch as absent', async () => {
@@ -59,9 +70,9 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/branches/old`, reply: { body: { name: 'new', protected: false, commit: { sha: SHA } } } },
     ])
     const service = createService(testConfig(), TOKENS)
-    expect(await service.getBranch(REPO, 'main')).toEqual({ name: 'main', commit: SHA, protected: true, default: true })
-    expect(await service.getBranch(REPO, 'gone')).toBeUndefined()
-    expect(await service.getBranch(REPO, 'old')).toBeUndefined()
+    expect(await service.forge.getBranch(REPO, 'main')).toEqual({ name: 'main', commit: SHA, protected: true, default: true })
+    expect(await service.forge.getBranch(REPO, 'gone')).toBeUndefined()
+    expect(await service.forge.getBranch(REPO, 'old')).toBeUndefined()
   })
 
   it('maps merged pull requests, labels added after creation, and a moved head on merge', async () => {
@@ -73,10 +84,10 @@ describe('GitHub provider', () => {
       { method: 'PUT', path: `${API}/pulls/5/merge`, reply: { status: 409, body: { message: 'Head branch was modified' } } },
     ])
     const service = createService(testConfig(), TOKENS)
-    const created = await service.createChange(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', labels: ['x'] })
+    const created = await service.forge.createMr(REPO, { title: 'T', sourceBranch: 'f', targetBranch: 'main', labels: ['x'] })
     expect(created).toMatchObject({ number: 5, state: 'merged', labels: ['x'], assignees: [{ username: 'modestoma' }] })
     expect(requests.find(request => request.method === 'PATCH')?.body).toEqual({ labels: ['x'] })
-    await expect(service.mergeChange(REPO, 5, { headSha: SHA, method: 'squash' })).rejects.toMatchObject({ code: 'conflict' })
+    await expect(service.forge.mergeMr(REPO, 5, { headSha: SHA, method: 'squash' })).rejects.toMatchObject({ code: 'conflict' })
     expect(requests.at(-1)?.body).toEqual({ sha: SHA, merge_method: 'squash' })
   })
 
@@ -94,25 +105,25 @@ describe('GitHub provider', () => {
     ])
     const service = createService(testConfig(), TOKENS)
     const deletes = () => requests.filter(request => request.method === 'DELETE').length
-    expect(await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: true } })
+    expect(await service.forge.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).toEqual({ sha: 'm1', sourceBranch: { name: 'f', deleted: true } })
     expect(deletes()).toBe(1)
     deleteReply = { status: 422, body: { message: 'Reference does not exist' } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
+    expect((await service.forge.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
     deleteReply = { status: 403, body: { message: 'Resource not accessible by integration' } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'f', deleted: false, reason: expect.stringContaining('not accessible') })
+    expect((await service.forge.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'f', deleted: false, reason: expect.stringContaining('not accessible') })
     const attempted = deletes()
 
     branch = { status: 200, body: { name: 'f', protected: true, commit: { sha: SHA } } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('受保护') })
+    expect((await service.forge.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('受保护') })
     branch = { status: 200, body: { name: 'f', protected: false, commit: { sha: 'c'.repeat(40) } } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('新提交') })
+    expect((await service.forge.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('新提交') })
     branch = { status: 404, body: { message: 'Branch not found' } }
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
+    expect((await service.forge.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toEqual({ name: 'f', deleted: true })
     pull = merged(2)
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('fork') })
+    expect((await service.forge.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ deleted: false, reason: expect.stringContaining('fork') })
     pull = merged(1, 'main')
-    expect((await service.mergeChange(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'main', deleted: false })
-    expect(await service.mergeChange(REPO, 5, { headSha: SHA })).toEqual({ sha: 'm1' })
+    expect((await service.forge.mergeMr(REPO, 5, { headSha: SHA, deleteSourceBranch: true })).sourceBranch).toMatchObject({ name: 'main', deleted: false })
+    expect(await service.forge.mergeMr(REPO, 5, { headSha: SHA })).toEqual({ sha: 'm1' })
     expect(deletes()).toBe(attempted)
   })
 
@@ -129,22 +140,22 @@ describe('GitHub provider', () => {
       { method: 'DELETE', path: new RegExp(`${API}/git/refs/heads(/|%2F)f$`), reply: { status: 204 } },
     ])
     const service = createService(testConfig(), TOKENS)
-    expect(await service.deleteMergedBranch(REPO, 'f')).toEqual({ branch: 'f', commit: SHA, change: { number: 5, webUrl: `${REPO}/pull/5` } })
+    expect(await service.forge.deleteMergedBranch(REPO, 'f')).toEqual({ branch: 'f', commit: SHA, mr: { number: 5, webUrl: `${REPO}/pull/5` } })
     const list = requests.find(request => request.url.pathname === `${API}/pulls`)
     expect(list?.url.searchParams.get('head')).toBe('modestoma:f')
     expect(list?.url.searchParams.get('state')).toBe('all')
     expect(requests.filter(request => request.method === 'DELETE')).toHaveLength(1)
 
     pulls = [pr(5, 'closed', '2026-10-30'), pr(6, 'open', null)]
-    await expect(service.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('#6') })
+    await expect(service.forge.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('#6') })
     pulls = [pr(5, 'closed', '2026-10-30', 'c'.repeat(40))]
-    await expect(service.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('没有通过已合并') })
+    await expect(service.forge.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('没有通过已合并') })
     pulls = [pr(5, 'closed', null)]
-    await expect(service.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'conflict' })
+    await expect(service.forge.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'conflict' })
     branch = { ...branch, protected: true }
-    await expect(service.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'forbidden' })
-    await expect(service.deleteMergedBranch(REPO, 'main')).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('默认分支') })
-    await expect(service.deleteMergedBranch(REPO, 'none')).rejects.toMatchObject({ code: 'not-found' })
+    await expect(service.forge.deleteMergedBranch(REPO, 'f')).rejects.toMatchObject({ code: 'forbidden' })
+    await expect(service.forge.deleteMergedBranch(REPO, 'main')).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('默认分支') })
+    await expect(service.forge.deleteMergedBranch(REPO, 'none')).rejects.toMatchObject({ code: 'not-found' })
     expect(requests.filter(request => request.method === 'DELETE')).toHaveLength(1)
   })
 
@@ -157,7 +168,7 @@ describe('GitHub provider', () => {
         : { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure', html_url: 'u' }] } } },
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [{ context: 'ci/lint', state: 'pending', target_url: null }] } } },
     ])
-    const status = await createService(testConfig(), TOKENS).changeStatus(REPO, 5)
+    const status = await createService(testConfig(), TOKENS).forge.mrStatus(REPO, 5)
     expect(status.checks).toHaveLength(102)
     expect(status.overall).toBe('failure')
   })
@@ -166,7 +177,7 @@ describe('GitHub provider', () => {
     const { requests } = fakeHttp([
       { method: 'GET', path: new RegExp(`${API}/git/trees/dev(:|%3A)src$`), reply: { body: { truncated: true, tree: [{ path: 'a.ts', type: 'blob', mode: '100644', size: 3 }, { path: 'lib', type: 'tree', mode: '040000' }] } } },
     ])
-    expect(await createService(testConfig(), TOKENS).listTree(REPO, { ref: 'dev', path: 'src/' })).toEqual({
+    expect(await createService(testConfig(), TOKENS).forge.listTree(REPO, { ref: 'dev', path: 'src/' })).toEqual({
       ref: 'dev', truncated: true, entries: [{ path: 'src/a.ts', type: 'file', size: 3 }, { path: 'src/lib', type: 'dir' }],
     })
     expect(requests[0]?.url.searchParams.has('recursive')).toBe(false)
@@ -178,7 +189,7 @@ describe('GitHub provider', () => {
       { method: 'GET', path: `${API}/commits/${SHA}/check-runs`, reply: { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'success', html_url: 'u' }] } } },
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [{ context: 'ci/lint', state: 'pending', target_url: null }] } } },
     ])
-    expect(await createService(testConfig(), TOKENS).changeStatus(REPO, 5)).toEqual({
+    expect(await createService(testConfig(), TOKENS).forge.mrStatus(REPO, 5)).toEqual({
       headSha: SHA,
       checks: [{ name: 'test', state: 'success', webUrl: 'u' }, { name: 'ci/lint', state: 'pending' }],
       overall: 'pending',
@@ -188,8 +199,8 @@ describe('GitHub provider', () => {
 
   it('reports a missing token and host failures as RepoError codes', async () => {
     fakeHttp([{ method: 'GET', path: API, reply: { status: 404, body: { message: 'Not Found' } } }])
-    await expect(createService(testConfig(), {}).repoInfo(REPO)).rejects.toMatchObject({ code: 'unauthenticated', message: expect.stringContaining('GITHUB_TOKEN') })
-    await expect(createService(testConfig(), TOKENS).repoInfo(REPO)).rejects.toMatchObject({ code: 'not-found' })
+    await expect(createService(testConfig(), {}).forge.repoInfo(REPO)).rejects.toMatchObject({ code: 'unauthenticated', message: expect.stringContaining('GITHUB_TOKEN') })
+    await expect(createService(testConfig(), TOKENS).forge.repoInfo(REPO)).rejects.toMatchObject({ code: 'not-found' })
   })
 })
 
@@ -224,7 +235,7 @@ describe('GitHub token account', () => {
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [] } } },
     ])
     const service = createService(testConfig(), TOKENS)
-    const first = await service.changeActivity(REPO, 5, { withStatus: true, since: '2026-11-01T00:30:00Z' })
+    const first = await service.forge.mrActivity(REPO, 5, { withStatus: true, since: '2026-11-01T00:30:00Z' })
     expect(first.conflict).toBe(true)
     expect(first.status).toMatchObject({ headSha: SHA, overall: 'failure' })
     expect(first.items?.map(item => [item.id, item.kind, item.author.username])).toEqual([
@@ -233,12 +244,12 @@ describe('GitHub token account', () => {
     expect(first.items?.[2]?.path).toBe('src/a.ts')
     expect(requests.find(request => request.url.pathname.endsWith('/issues/5/comments'))?.url.searchParams.get('since')).toBe('2026-11-01T00:30:00Z')
     requests.length = 0
-    const second = await service.changeActivity(REPO, 5, { updatedAt: updated, withStatus: false, since: '2026-11-01T00:50:00Z' })
+    const second = await service.forge.mrActivity(REPO, 5, { updatedAt: updated, withStatus: false, since: '2026-11-01T00:50:00Z' })
     expect(second.items).toBeUndefined()
     expect(second.status).toBeUndefined()
     expect(requests.map(request => request.url.pathname)).toEqual([`${API}/pulls/5`])
     updated = '2026-11-01T02:00:00Z'
-    expect((await service.changeActivity(REPO, 5, { updatedAt: '2026-11-01T01:00:00Z', withStatus: false, since: '2026-11-01T00:50:00Z' })).items?.map(item => item.id)).toEqual(['line-9'])
+    expect((await service.forge.mrActivity(REPO, 5, { updatedAt: '2026-11-01T01:00:00Z', withStatus: false, since: '2026-11-01T00:50:00Z' })).items?.map(item => item.id)).toEqual(['line-9'])
   })
   it('reads every page of new comments before reporting them', async () => {
     const page = (start: number, count: number) => Array.from({ length: count }, (_, index) => ({
@@ -253,7 +264,7 @@ describe('GitHub token account', () => {
       { method: 'GET', path: `${API}/pulls/5/comments`, reply: { body: [] } },
       { method: 'GET', path: `${API}/pulls/5/reviews`, reply: { body: [] } },
     ])
-    const polled = await createService(testConfig(), TOKENS).changeActivity(REPO, 5, { withStatus: false, since: '2026-11-01T00:30:00Z' })
+    const polled = await createService(testConfig(), TOKENS).forge.mrActivity(REPO, 5, { withStatus: false, since: '2026-11-01T00:30:00Z' })
     expect(polled.items).toHaveLength(120)
   })
 })
@@ -273,7 +284,7 @@ describe('GitHub Actions CI', () => {
       { method: 'GET', path: `${API}/pulls/5`, reply: { body: { head: { sha: SHA } } } },
       { method: 'GET', path: `${API}/actions/runs`, reply: { body: { total_count: 1, workflow_runs: [runBody()] } } },
     ])
-    expect(await createService(testConfig(), TOKENS).listCiRuns(REPO, { change: 5, state: 'failure' })).toEqual({
+    expect(await createService(testConfig(), TOKENS).forge.listCiRuns(REPO, { mr: 5, state: 'failure' })).toEqual({
       items: [{ id: 77, name: 'CI', state: 'failure', status: 'failure', ref: 'fix', sha: SHA, event: 'pull_request', createdAt: '2026-11-02T10:00:00Z', updatedAt: '2026-11-02T10:05:00Z', attempt: 1, webUrl: `${REPO}/actions/runs/77` }],
     })
     expect(Object.fromEntries(requests.at(-1)!.url.searchParams)).toMatchObject({ head_sha: SHA, status: 'failure', per_page: '30', page: '1' })
@@ -289,7 +300,7 @@ describe('GitHub Actions CI', () => {
         { annotation_level: 'failure', title: '', message: 'Process completed with exit code 1.', path: '.github', start_line: 1 },
       ] } },
     ])
-    const run = await createService(testConfig(), TOKENS).getCiRun(REPO, 77)
+    const run = await createService(testConfig(), TOKENS).forge.getCiRun(REPO, 77)
     expect(run).toMatchObject({ id: 77, state: 'failure', startedAt: '2026-11-02T10:00:30Z', finishedAt: '2026-11-02T10:05:00Z', durationSeconds: 270, jobsTruncated: false, failuresTruncated: false })
     expect(run.jobs[1]).toEqual({
       id: 2, name: 'job-2', state: 'failure', status: 'failure', allowFailure: false, startedAt: '2026-11-02T10:01:00Z', finishedAt: '2026-11-02T10:02:30Z', durationSeconds: 90,
@@ -311,7 +322,7 @@ describe('GitHub Actions CI', () => {
         ? { body: warnings }
         : { body: [{ annotation_level: 'failure', title: 'TS2322', message: 'Type mismatch', path: 'src/a.ts', start_line: 4 }] } },
     ])
-    const run = await createService(testConfig(), TOKENS).getCiRun(REPO, 77)
+    const run = await createService(testConfig(), TOKENS).forge.getCiRun(REPO, 77)
     expect(run.failures).toEqual([{ job: 'job-2', name: 'TS2322', message: 'Type mismatch', path: 'src/a.ts', line: 4 }])
     expect(run.failuresTruncated).toBe(false)
     expect(requests.filter(request => request.url.pathname.endsWith('/annotations'))).toHaveLength(2)
@@ -324,7 +335,7 @@ describe('GitHub Actions CI', () => {
       { method: 'GET', path: `${API}/actions/jobs/2/logs`, reply: { status: 302, body: '', headers: { location: storage } } },
       { method: 'GET', path: '/logs/2.txt', reply: { body: '2026-11-02T10:00:00.0Z ##[group]Run npm test\n2026-11-02T10:00:01.0Z FAIL a.test.ts\n2026-11-02T10:00:02.0Z ##[endgroup]\n' } },
     ])
-    const log = await createService(testConfig(), TOKENS).ciJobLog(REPO, 2)
+    const log = await createService(testConfig(), TOKENS).forge.ciJobLog(REPO, 2)
     expect(log).toMatchObject({ job: { id: 2 }, totalLines: 2, text: '▶ Run npm test\nFAIL a.test.ts', sections: ['Run npm test'] })
     const [api, blob] = requests.slice(-2)
     expect(api?.headers.get('authorization')).toBe('token gh-token')
@@ -339,10 +350,10 @@ describe('GitHub Actions CI', () => {
       { method: 'POST', path: `${API}/actions/runs/77/cancel`, reply: { status: 202, body: {} } },
     ])
     const service = createService(testConfig(), TOKENS)
-    expect(await service.retryCi(REPO, { runId: 77 })).toEqual({ runId: 77 })
-    expect(await service.retryCi(REPO, { jobId: 2 })).toEqual({ jobId: 2 })
-    expect(await service.cancelCi(REPO, { runId: 77 })).toEqual({ runId: 77 })
-    await expect(service.cancelCi(REPO, { jobId: 2 })).rejects.toMatchObject({ code: 'invalid' })
+    expect(await service.forge.retryCi(REPO, { runId: 77 })).toEqual({ runId: 77 })
+    expect(await service.forge.retryCi(REPO, { jobId: 2 })).toEqual({ jobId: 2 })
+    expect(await service.forge.cancelCi(REPO, { runId: 77 })).toEqual({ runId: 77 })
+    await expect(service.forge.cancelCi(REPO, { jobId: 2 })).rejects.toMatchObject({ code: 'invalid' })
     expect(requests).toHaveLength(3)
   })
 
@@ -352,6 +363,6 @@ describe('GitHub Actions CI', () => {
       { method: 'GET', path: `${API}/commits/${SHA}/check-runs`, reply: { body: { check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure', html_url: `${REPO}/actions/runs/77/job/2` }] } } },
       { method: 'GET', path: `${API}/commits/${SHA}/status`, reply: { body: { statuses: [] } } },
     ])
-    expect((await createService(testConfig(), TOKENS).changeStatus(REPO, 5)).checks).toEqual([{ name: 'test', state: 'failure', webUrl: `${REPO}/actions/runs/77/job/2`, runId: 77, jobId: 2 }])
+    expect((await createService(testConfig(), TOKENS).forge.mrStatus(REPO, 5)).checks).toEqual([{ name: 'test', state: 'failure', webUrl: `${REPO}/actions/runs/77/job/2`, runId: 77, jobId: 2 }])
   })
 })

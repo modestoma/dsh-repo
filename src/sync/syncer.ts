@@ -1,7 +1,13 @@
 /**
- * Local syncs: each one keeps a local directory equal to the head of a
- * repository branch, on a schedule.
+ * Local syncs: every catalog repository whose local sync is enabled keeps a
+ * local directory equal to the head of its branch, on a schedule.
  *
+ * - The catalog decides which repository syncs where and how often;
+ *   {@link LocalSyncer.reconcile} applies a catalog change: a new or changed
+ *   address, branch, or directory syncs at once, a changed interval only
+ *   moves the next due time, and a disabled or removed sync stops. The
+ *   progress of a disabled sync is kept so enabling it again continues in the
+ *   same directory; the progress and git index of a removed one are deleted.
  * - A sync fetches the repository into its mirror ({@link ../mirror/store.ts})
  *   and expands the branch head into the directory with
  *   `git --git-dir=<mirror> --work-tree=<dir> read-tree --reset -u`, using an
@@ -15,10 +21,8 @@
  *   existing files are never overwritten. The directory is then recorded as
  *   claimed before any file is written, so a first sync interrupted after
  *   writing files is retried there. Each directory of a sync has its own
- *   index file. Removing a sync, or moving it to another directory, leaves
- *   the files in the old directory.
- * - Directory overlap is checked on real paths: existing ancestors are
- *   resolved through symbolic links.
+ *   index file. Moving a sync to another directory leaves the files in the
+ *   old directory.
  * - Syncs run one at a time. A sync is due `intervalMinutes` after its last
  *   success; a failed attempt is retried after the interval or
  *   {@link RETRY_MS}, whichever is shorter. Due times survive restarts
@@ -27,35 +31,58 @@
  * @module dsh-repo/sync/syncer
  */
 
-import { createHash, randomBytes } from 'node:crypto'
-import { mkdir, readdir, realpath, rm, stat } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join, parse, relative, sep } from 'node:path'
-import { expandHome } from '../config.ts'
-import type { MirrorState, MirrorSyncOptions } from '../contract.ts'
+import { createHash } from 'node:crypto'
+import { mkdir, readdir, rm, stat } from 'node:fs/promises'
+import { basename, join } from 'node:path'
+import type { CatalogEntry } from '../catalog/entry.ts'
+import type { MirrorState } from '../mirror/store.ts'
 import { RepoError, toRepoError } from '../errors.ts'
 import type { HostLogger } from '../host.ts'
 import type { GitRunner } from '../mirror/git.ts'
-import { isAcceptedGitUrl } from '../mirror/store.ts'
-import { DEFAULT_SYNC_INTERVAL_MINUTES, MAX_SYNCS, MAX_TIMER_DELAY_MS, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
-import type { SyncInfo, SyncInput } from '../settings/contract.ts'
-import type { SyncRecord, SyncStore } from './store.ts'
+import { overlaps, realPathOf } from '../paths.ts'
+import { MAX_TIMER_DELAY_MS } from '../settings/contract.ts'
+import type { LocalSyncStatus } from '../settings/contract.ts'
+import type { SyncStore } from './store.ts'
 
 /** Longest wait before a failed sync is attempted again. */
 export const RETRY_MS = 30 * 60 * 1000
 
-const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\.lock$)(?!.*\/$)[^\s~^:?*[\\\u0000-\u001f\u007f]+$/
+/** One enabled local sync, as the catalog defines it. */
+export interface SyncRecord {
+  /** Catalog entry id. */
+  readonly id: string
+  readonly url: string
+  readonly branch?: string
+  readonly dir: string
+  readonly intervalMinutes: number
+}
 
-/** The service calls a sync makes. */
-export interface SyncService {
-  syncMirror(url: string, options?: MirrorSyncOptions): Promise<MirrorState>
-  /** @returns the mirror directory now in use; sync directories must stay outside it. */
-  mirrorSettings(): { readonly dir: string }
+/**
+ * The enabled local syncs of catalog entries.
+ * @param entries - catalog entries.
+ * @returns one record for each entry whose local sync is enabled, following the entry's branch.
+ */
+export function syncRecords(entries: readonly CatalogEntry[]): SyncRecord[] {
+  return entries.flatMap(entry => entry.localSync?.enabled === true
+    ? [{ id: entry.id, url: entry.url, ...entry.branch === undefined ? {} : { branch: entry.branch }, dir: entry.localSync.dir, intervalMinutes: entry.localSync.intervalMinutes }]
+    : [])
+}
+
+/** The mirror calls a sync makes. */
+export interface SyncMirrors {
+  /** Clone or fetch the mirror of `url` and resolve `branch` (default: the remote's default branch). */
+  sync(url: string, options?: { readonly branch?: string; readonly signal?: AbortSignal }): Promise<MirrorState>
+  /** @returns the mirror directory now in use, or undefined while none is chosen; sync directories must stay outside it. */
+  settings(): { readonly dir: string | undefined }
 }
 
 /** Collaborators of the syncer. */
 export interface SyncerDeps {
-  readonly service: SyncService
+  readonly mirrors: SyncMirrors
+  /** The enabled local syncs of the catalog, read on every use. */
+  readonly records: () => readonly SyncRecord[]
+  /** Ids of every catalog entry, enabled or not; progress of other ids is deleted. */
+  readonly ids: () => ReadonlySet<string>
   readonly git: GitRunner
   readonly store: SyncStore
   /** Directory holding each sync's git index. */
@@ -80,61 +107,6 @@ interface Status {
   abort?: AbortController
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-/** Whether `inner` is `outer` or lies inside it. */
-function within(outer: string, inner: string): boolean {
-  const rel = relative(outer, inner)
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
-}
-
-/**
- * Validate a sync's fields, filling the defaults.
- * @param input - fields from the settings page.
- * @returns the address, branch, absolute directory, and interval.
- * @throws {RepoError} `invalid` naming the bad field.
- */
-function resolveInput(input: SyncInput): Pick<SyncRecord, 'url' | 'branch' | 'dir' | 'intervalMinutes'> {
-  const url = input.url.trim()
-  if (!isAcceptedGitUrl(url)) throw new RepoError('invalid', `不支持的 git 地址：${input.url}（只支持 https 地址、file URL 或绝对路径；SSH 地址请改用仓库的 https 地址）`)
-  const branch = input.branch?.trim()
-  if (branch !== undefined && branch !== '' && (!BRANCH.test(branch) || branch.startsWith('/') || branch === '@')) throw new RepoError('invalid', `分支名不合法：${branch}`)
-  const rawDir = input.dir.trim()
-  if (rawDir === '' || /[\u0000-\u001f\u007f]/.test(rawDir)) throw new RepoError('invalid', '本地目录不能为空或包含控制字符')
-  if (!isAbsolute(rawDir) && rawDir !== '~' && !rawDir.startsWith('~/')) throw new RepoError('invalid', `本地目录必须是绝对路径：${rawDir}`)
-  const dir = expandHome(rawDir)
-  if (dir === parse(dir).root || dir === homedir()) throw new RepoError('invalid', `本地目录不能是根目录或用户主目录：${dir}`)
-  const intervalMinutes = input.intervalMinutes ?? DEFAULT_SYNC_INTERVAL_MINUTES
-  if (!Number.isSafeInteger(intervalMinutes) || intervalMinutes < SYNC_INTERVAL_BOUNDS.min || intervalMinutes > SYNC_INTERVAL_BOUNDS.max) {
-    throw new RepoError('invalid', `同步间隔必须是 ${SYNC_INTERVAL_BOUNDS.min} 到 ${SYNC_INTERVAL_BOUNDS.max} 之间的整数分钟：${intervalMinutes}`)
-  }
-  return { url, ...branch === undefined || branch === '' ? {} : { branch }, dir, intervalMinutes }
-}
-
-/**
- * The path with its longest existing ancestor resolved through symbolic links.
- * @param path - absolute path, existing or not.
- * @returns the real path of the existing part joined with the rest.
- */
-export async function realPathOf(path: string): Promise<string> {
-  const missing: string[] = []
-  let current = path
-  for (;;) {
-    try {
-      return join(await realpath(current), ...missing.reverse())
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error
-      const parent = dirname(current)
-      if (parent === current) return path
-      missing.push(basename(current))
-      current = parent
-    }
-  }
-}
-
 async function requireEmpty(dir: string): Promise<void> {
   let names: string[]
   try {
@@ -150,21 +122,27 @@ async function requireEmpty(dir: string): Promise<void> {
 /** Keeps local directories equal to repository branches. */
 export class LocalSyncer {
   private readonly statuses = new Map<string, Status>()
+  /** The enabled syncs as of the last {@link start} or {@link reconcile}. */
+  private known = new Map<string, SyncRecord>()
   private queue: Promise<void> = Promise.resolve()
+  /** Deleting the progress of removed repositories; never rejects. */
+  private cleanup: Promise<void> = Promise.resolve()
   private started = false
   private stopped = false
   private readonly now: () => number
 
-  /** @param deps - service, git, store, index directory, and limits. */
+  /** @param deps - mirrors, catalog view, git, store, index directory, and limits. */
   constructor(private readonly deps: SyncerDeps) {
     this.now = deps.now ?? Date.now
   }
 
-  /** Schedule every sync; overdue and never-synced ones are queued at once. */
+  /** Schedule every enabled sync; overdue and never-synced ones are queued at once. Forgets progress of repositories no longer in the catalog. */
   start(): void {
     if (this.started) return
     this.started = true
-    for (const record of this.deps.store.all()) this.schedule(record.id)
+    this.known = new Map(this.deps.records().map(record => [record.id, record]))
+    this.forgetRemoved()
+    for (const id of this.known.keys()) this.schedule(id)
   }
 
   /**
@@ -177,125 +155,105 @@ export class LocalSyncer {
       clearTimeout(status.timer)
       status.abort?.abort(new RepoError('unavailable', '插件停止，同步已取消'))
     }
-    await this.queue
+    await Promise.all([this.queue, this.cleanup])
   }
 
-  /** @returns every sync with its status, in the order they were added. */
-  list(): SyncInfo[] {
-    return this.deps.store.all().map(record => this.info(record))
-  }
-
-  /**
-   * Add a sync and run its first sync.
-   * @param input - address, branch, directory, and interval.
-   * @returns the sync after its first attempt; a failed attempt is reported in `error`.
-   * @throws {RepoError} `invalid` for a bad field, `conflict` when the directory overlaps another sync's or the mirror directory, `too-large` past {@link MAX_SYNCS}, `unavailable` when the list cannot be saved.
-   */
-  async add(input: SyncInput): Promise<SyncInfo> {
-    const fields = resolveInput(input)
-    const id = randomBytes(6).toString('hex')
-    const real = await this.realPaths(fields.dir)
-    await this.deps.store.update((current) => {
-      if (current.length >= MAX_SYNCS) throw new RepoError('too-large', `本地同步最多 ${MAX_SYNCS} 条`)
-      this.checkDir(fields.dir, current, undefined, real)
-      return [...current, { id, ...fields, createdAt: new Date(this.now()).toISOString() }]
-    })
-    await this.run(id)
-    return this.infoOf(id)
-  }
-
-  /**
-   * Change a sync. A changed address, branch, or directory syncs at once; a
-   * changed interval only moves the next due time.
-   * @param id - sync id.
-   * @param input - the complete new fields.
-   * @returns the sync, after the sync a change caused.
-   * @throws {RepoError} `not-found`, plus the failures of {@link add}.
-   */
-  async update(id: string, input: SyncInput): Promise<SyncInfo> {
-    const fields = resolveInput(input)
-    const real = await this.realPaths(fields.dir)
-    let resync = false
-    await this.deps.store.update((current) => {
-      const record = current.find(item => item.id === id)
-      if (record === undefined) throw new RepoError('not-found', '没有这条本地同步，可能已经删除')
-      this.checkDir(fields.dir, current, id, real)
-      resync = record.url !== fields.url || record.branch !== fields.branch || record.dir !== fields.dir
-      const { branch: _branch, ...rest } = record
-      return current.map(item => item.id === id ? { ...rest, ...fields } : item)
-    })
-    const status = this.status(id)
-    if (resync) {
-      delete status.failedAt
-      delete status.error
-      await this.run(id, true)
-    } else {
-      this.schedule(id)
+  /** Apply the catalog as it is now: start, restart, reschedule, or stop syncs. */
+  reconcile(): void {
+    if (!this.started || this.stopped) return
+    const current = new Map(this.deps.records().map(record => [record.id, record]))
+    for (const id of this.known.keys()) {
+      if (!current.has(id)) this.cancel(id)
     }
-    return this.infoOf(id)
+    for (const [id, record] of current) {
+      const before = this.known.get(id)
+      if (before === undefined || before.url !== record.url || before.branch !== record.branch || before.dir !== record.dir) {
+        const status = this.entry(id)
+        delete status.failedAt
+        delete status.error
+        void this.run(id, true)
+      } else if (before.intervalMinutes !== record.intervalMinutes) {
+        this.schedule(id)
+      }
+    }
+    this.known = current
+    this.forgetRemoved()
   }
 
   /**
-   * Remove a sync, cancelling it when it runs, and delete its git index. The
-   * files in its directory stay.
-   * @param id - sync id.
-   * @returns whether the sync existed.
-   * @throws {RepoError} `unavailable` when the list cannot be saved.
+   * Where one repository's local sync stands.
+   * @param id - catalog entry id.
+   * @returns the status, or undefined while its local sync is not enabled.
    */
-  async remove(id: string): Promise<boolean> {
-    if (this.deps.store.get(id) === undefined) return false
-    await this.deps.store.update(current => current.filter(item => item.id !== id))
+  status(id: string): LocalSyncStatus | undefined {
+    if (!this.deps.records().some(record => record.id === id)) return undefined
     const status = this.statuses.get(id)
-    if (status !== undefined) {
-      clearTimeout(status.timer)
-      status.abort?.abort(new RepoError('unavailable', '本地同步已删除'))
-      await status.pending
-      this.statuses.delete(id)
-    }
-    await this.removeIndexes(id, undefined)
-    return true
-  }
-
-  /**
-   * Sync now, or wait for the sync already queued or running.
-   * @param id - sync id.
-   * @returns the sync after the attempt; a failed attempt is reported in `error`.
-   * @throws {RepoError} `not-found` for an unknown id.
-   */
-  async syncNow(id: string): Promise<SyncInfo> {
-    if (this.deps.store.get(id) === undefined) throw new RepoError('not-found', '没有这条本地同步，可能已经删除')
-    await this.run(id)
-    return this.infoOf(id)
-  }
-
-  /** @returns once every queued and running sync finished. */
-  idle(): Promise<void> {
-    return this.queue
-  }
-
-  private infoOf(id: string): SyncInfo {
-    const record = this.deps.store.get(id)
-    if (record === undefined) throw new RepoError('not-found', '本地同步在同步期间被删除')
-    return this.info(record)
-  }
-
-  private info(record: SyncRecord): SyncInfo {
-    const status = this.statuses.get(record.id)
+    const progress = this.deps.store.get(id)
+    const record = this.deps.records().find(item => item.id === id)
+    const last = progress?.last !== undefined && progress.last.dir === record?.dir ? progress.last : undefined
     return {
-      id: record.id,
-      url: record.url,
-      ...record.branch === undefined ? {} : { branch: record.branch },
-      dir: record.dir,
-      intervalMinutes: record.intervalMinutes,
       state: status?.state ?? 'idle',
-      ...record.last === undefined ? {} : { syncedAt: record.last.syncedAt, commit: record.last.commit, syncedBranch: record.last.branch },
+      ...last === undefined ? {} : { syncedAt: last.syncedAt, commit: last.commit, syncedBranch: last.branch },
       ...status?.error === undefined ? {} : { error: status.error },
       ...status?.failedAt === undefined ? {} : { failedAt: new Date(status.failedAt).toISOString() },
       ...status?.nextAt === undefined || status.state !== 'idle' ? {} : { nextAt: new Date(status.nextAt).toISOString() },
     }
   }
 
-  private status(id: string): Status {
+  /**
+   * Sync now, or wait for the sync already queued or running.
+   * @param id - catalog entry id.
+   * @returns once the attempt finished; a failed attempt is reported by {@link status}.
+   * @throws {RepoError} `not-found` while the repository's local sync is not enabled.
+   */
+  async syncNow(id: string): Promise<void> {
+    if (!this.deps.records().some(record => record.id === id)) throw new RepoError('not-found', '这个仓库没有打开本地同步')
+    await this.run(id)
+  }
+
+  /**
+   * @param id - catalog entry id.
+   * @returns once the sync queued or running for it and the deletion of removed repositories' progress finished.
+   */
+  async settled(id: string): Promise<void> {
+    await Promise.all([this.statuses.get(id)?.pending, this.cleanup])
+  }
+
+  /** @returns once every queued and running sync and the deletion of removed repositories' progress finished. */
+  async idle(): Promise<void> {
+    await Promise.all([this.queue, this.cleanup])
+  }
+
+  /** Stop one sync's timer and running attempt. */
+  private cancel(id: string): void {
+    const status = this.statuses.get(id)
+    if (status === undefined) return
+    clearTimeout(status.timer)
+    delete status.timer
+    delete status.nextAt
+    status.abort?.abort(new RepoError('unavailable', '本地同步已关闭或仓库已从清单删除'))
+  }
+
+  /** Queue deleting the progress and index files of repositories no longer in the catalog. */
+  private forgetRemoved(): void {
+    this.cleanup = this.cleanup.then(() => this.deleteRemoved())
+  }
+
+  private async deleteRemoved(): Promise<void> {
+    const ids = this.deps.ids()
+    for (const progress of this.deps.store.all()) {
+      if (ids.has(progress.id)) continue
+      this.statuses.delete(progress.id)
+      try {
+        await this.deps.store.update(progress.id, () => undefined)
+        await this.removeIndexes(progress.id, undefined)
+      } catch (error) {
+        this.deps.logger?.warn?.(`dsh-repo: 清理已删除仓库的本地同步进度失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  }
+
+  private entry(id: string): Status {
     let status = this.statuses.get(id)
     if (status === undefined) {
       status = { state: 'idle' }
@@ -322,40 +280,18 @@ export class LocalSyncer {
     await Promise.all(names.filter(name => name.startsWith(`${id}-`) && name !== kept).map(name => rm(join(this.deps.indexDir, name), { force: true })))
   }
 
-  /**
-   * Real paths of a candidate directory, the mirror directory, and every
-   * sync's directory, read before the list changes so the check itself stays synchronous.
-   */
-  private async realPaths(dir: string): Promise<Map<string, string>> {
-    const paths = [dir, this.deps.service.mirrorSettings().dir, ...this.deps.store.all().map(record => record.dir)]
-    return new Map(await Promise.all(paths.map(async path => [path, await realPathOf(path)] as const)))
-  }
-
-  /**
-   * Refuse a directory that overlaps the mirror directory or another sync's,
-   * comparing real paths where they were read and the paths themselves otherwise.
-   * @throws {RepoError} `conflict`.
-   */
-  private checkDir(dir: string, current: readonly SyncRecord[], self: string | undefined, real: ReadonlyMap<string, string>): void {
-    const overlap = (a: string, b: string): boolean => {
-      const ra = real.get(a) ?? a
-      const rb = real.get(b) ?? b
-      return within(a, b) || within(b, a) || within(ra, rb) || within(rb, ra)
-    }
-    const mirrors = this.deps.service.mirrorSettings().dir
-    if (overlap(mirrors, dir)) throw new RepoError('conflict', `本地目录 ${dir} 与镜像目录 ${mirrors} 重叠，请换一个目录`)
-    const other = current.find(item => item.id !== self && overlap(item.dir, dir))
-    if (other !== undefined) throw new RepoError('conflict', `本地目录 ${dir} 与 ${other.url} 的本地目录 ${other.dir} 重叠，请换一个目录`)
+  private record(id: string): SyncRecord | undefined {
+    return this.deps.records().find(record => record.id === id)
   }
 
   /**
    * Queue a sync unless one is queued or running.
-   * @param id - sync id.
+   * @param id - catalog entry id.
    * @param again - when one is queued or running, sync once more after it, so changed fields are used.
    * @returns settles when the sync finished; never rejects.
    */
   private run(id: string, again = false): Promise<void> {
-    const status = this.status(id)
+    const status = this.entry(id)
     if (status.pending !== undefined) {
       if (!again) return status.pending
       status.again = true
@@ -365,7 +301,7 @@ export class LocalSyncer {
     delete status.timer
     status.state = 'queued'
     const pending = this.queue.then(async () => {
-      const record = this.deps.store.get(id)
+      const record = this.record(id)
       if (record === undefined || this.stopped) return
       status.state = 'running'
       const abort = new AbortController()
@@ -398,8 +334,8 @@ export class LocalSyncer {
   }
 
   private schedule(id: string): void {
-    const record = this.deps.store.get(id)
-    const status = this.statuses.get(id) ?? (record === undefined ? undefined : this.status(id))
+    const record = this.record(id)
+    const status = this.statuses.get(id) ?? (record === undefined ? undefined : this.entry(id))
     if (status === undefined) return
     clearTimeout(status.timer)
     delete status.timer
@@ -407,10 +343,11 @@ export class LocalSyncer {
     if (record === undefined || this.stopped || !this.started) return
     const now = this.now()
     const interval = record.intervalMinutes * 60_000
+    const last = this.deps.store.get(id)?.last
     let next: number
     if (status.failedAt !== undefined) next = status.failedAt + Math.min(interval, RETRY_MS)
-    else if (record.last?.dir !== record.dir) next = now
-    else next = Date.parse(record.last.syncedAt) + interval
+    else if (last?.dir !== record.dir) next = now
+    else next = Date.parse(last.syncedAt) + interval
     status.nextAt = next
     const timer = setTimeout(() => {
       // A delay capped at the timer maximum reschedules instead of syncing early.
@@ -426,22 +363,25 @@ export class LocalSyncer {
    * @throws {RepoError} the mirror's failures; `conflict` when the directory now overlaps the mirror directory or a first sync finds a non-empty directory; `unavailable` when the claim or the result cannot be saved.
    */
   private async expand(record: SyncRecord, signal: AbortSignal): Promise<void> {
-    // The mirror directory can change after the sync was added, so the overlap is checked again here.
-    const mirrors = this.deps.service.mirrorSettings().dir
-    const [realDir, realMirrors] = await Promise.all([realPathOf(record.dir), realPathOf(mirrors)])
-    if (within(mirrors, record.dir) || within(record.dir, mirrors) || within(realMirrors, realDir) || within(realDir, realMirrors)) {
-      throw new RepoError('conflict', `本地目录 ${record.dir} 与镜像目录 ${mirrors} 重叠，没有同步；请把本地同步或镜像目录换到不重叠的位置`)
+    // The mirror directory can change after the sync was configured, so the overlap is checked again here; an unset directory fails the mirror sync itself.
+    const mirrors = this.deps.mirrors.settings().dir
+    if (mirrors !== undefined) {
+      const real = new Map([[record.dir, await realPathOf(record.dir)], [mirrors, await realPathOf(mirrors)]])
+      if (overlaps(mirrors, record.dir, real)) {
+        throw new RepoError('conflict', `本地目录 ${record.dir} 与镜像目录 ${mirrors} 重叠，没有同步；请把本地同步或镜像目录换到不重叠的位置`)
+      }
     }
-    const mirror = await this.deps.service.syncMirror(record.url, { ...record.branch === undefined ? {} : { branch: record.branch }, signal })
+    const mirror = await this.deps.mirrors.sync(record.url, { ...record.branch === undefined ? {} : { branch: record.branch }, signal })
     const index = this.indexFile(record.id, record.dir)
-    if (record.last?.dir !== record.dir && record.claimedDir !== record.dir) {
+    const progress = this.deps.store.get(record.id)
+    if (progress?.last?.dir !== record.dir && progress?.claimedDir !== record.dir) {
       await requireEmpty(record.dir)
       await rm(index, { force: true })
-      await this.deps.store.update(current => current.map(item => item.id === record.id && item.dir === record.dir ? { ...item, claimedDir: record.dir } : item))
+      await this.deps.store.update(record.id, current => ({ ...current, id: record.id, claimedDir: record.dir }))
     }
     await mkdir(record.dir, { recursive: true })
     await mkdir(this.deps.indexDir, { recursive: true })
-    const git = (args: readonly string[]): Promise<string> => this.deps.git(['--git-dir', join(mirror.dir, '.git'), '--work-tree', record.dir, ...args], {
+    const git = (args: readonly string[]): Promise<string> => this.deps.git(['--git-dir', mirror.dir, '--work-tree', record.dir, ...args], {
       cwd: record.dir,
       timeoutMs: this.deps.timeoutMs(),
       env: { GIT_INDEX_FILE: index },
@@ -455,11 +395,7 @@ export class LocalSyncer {
     }
     if ((await git(['diff-files', '--name-only', '-z'])) !== '') await git(['checkout-index', '--all', '--force'])
     const last = { dir: record.dir, commit: mirror.commit, branch: mirror.branch, syncedAt: new Date(this.now()).toISOString() }
-    await this.deps.store.update(current => current.map((item) => {
-      if (item.id !== record.id || item.dir !== record.dir) return item
-      const { claimedDir: _claimed, ...rest } = item
-      return { ...rest, last }
-    }))
+    await this.deps.store.update(record.id, () => ({ id: record.id, last }))
     await this.removeIndexes(record.id, record.dir)
   }
 }

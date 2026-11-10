@@ -6,7 +6,7 @@
  * @module dsh-repo/client/form
  */
 
-import { MAX_REPO_PATTERNS, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
+import { MAX_IDENTITY_LENGTH, MAX_SIGNATURE_LENGTH, SETTING_BOUNDS, SYNC_INTERVAL_BOUNDS } from '../settings/contract.ts'
 import type { RepoSettingsWire, WatchAction, WatchEventKind } from '../settings/contract.ts'
 
 /** Integer settings, named as in {@link SETTING_BOUNDS}. */
@@ -42,6 +42,7 @@ export const NUMBER_FIELDS: Readonly<Record<NumberKey, NumberField>> = {
   idleDays: { key: 'idleDays', label: '无动态停止跟踪', summary: '停止时通知会话一次', unit: '天', scale: 1 },
   dailyWakeLimit: { key: 'dailyWakeLimit', label: '每天唤醒上限', summary: '每个 PR/MR；超出后动态只记入会话，不再唤醒', unit: '次', scale: 1 },
   maxWatches: { key: 'maxWatches', label: '同时跟踪上限', summary: '超出时结束最久没有动态的一个', unit: '个', scale: 1 },
+  proxyPort: { key: 'proxyPort', label: '本机 git 代理端口', summary: '工作区里的 git 经 127.0.0.1 的这个端口访问远端；0 表示自动选一个并沿用', unit: '', scale: 1 },
 }
 
 /** Every kind of PR/MR activity with its label, in page order. */
@@ -72,22 +73,21 @@ export const WRITE_MODES: readonly { readonly id: RepoSettingsWire['tools']['wri
   { id: 'off', label: '关闭' },
 ]
 
-/** Editable form of {@link RepoSettingsWire}: numbers as typed text in display units, repositories one per line. */
+/** Editable form of {@link RepoSettingsWire}: numbers as typed text in display units. */
 export interface SettingsDraft {
-  readonly repos: string
   readonly numbers: Readonly<Record<NumberKey, string>>
   readonly enabled: boolean
   readonly writes: RepoSettingsWire['tools']['writes']
-  readonly merge: boolean
   readonly deleteSourceBranch: boolean
   readonly signature: string
-  readonly otherHosts: boolean
   readonly watchEnabled: boolean
   readonly watchEvents: Readonly<Record<WatchEventKind, WatchAction>>
+  readonly commitName: string
+  readonly commitEmail: string
 }
 
-/** Field of a rejected draft: an integer setting or the repository list. */
-export type DraftField = NumberKey | 'repos' | 'signature'
+/** Field of a rejected draft: an integer setting, the signature, or the commit identity. */
+export type DraftField = NumberKey | 'signature' | 'commitName' | 'commitEmail'
 
 /** Drop float noise from `stored / scale` (e.g. 0.30000000000000004). */
 function tidy(value: number): number {
@@ -121,6 +121,8 @@ export function storedNumber(settings: RepoSettingsWire, key: NumberKey): number
     case 'dailyWakeLimit':
     case 'maxWatches':
       return settings.watch[key]
+    case 'proxyPort':
+      return settings.workspace.proxyPort
   }
 }
 
@@ -132,7 +134,7 @@ export function storedNumber(settings: RepoSettingsWire, key: NumberKey): number
  */
 export function displayNumber(key: NumberKey, stored: number): string {
   const field = NUMBER_FIELDS[key]
-  return `${tidy(stored / field.scale)} ${field.unit}`
+  return field.unit === '' ? String(tidy(stored / field.scale)) : `${tidy(stored / field.scale)} ${field.unit}`
 }
 
 /**
@@ -144,16 +146,15 @@ export function toDraft(settings: RepoSettingsWire): SettingsDraft {
   const numbers = {} as Record<NumberKey, string>
   for (const key of Object.keys(NUMBER_FIELDS) as NumberKey[]) numbers[key] = String(tidy(storedNumber(settings, key) / NUMBER_FIELDS[key].scale))
   return {
-    repos: settings.repos.join('\n'),
     numbers,
     enabled: settings.tools.enabled,
     writes: settings.tools.writes,
-    merge: settings.tools.merge,
     deleteSourceBranch: settings.tools.deleteSourceBranch,
     signature: settings.tools.signature,
-    otherHosts: settings.mirror.otherHosts,
     watchEnabled: settings.watch.enabled,
     watchEvents: { ...settings.watch.events },
+    commitName: settings.workspace.commitName,
+    commitEmail: settings.workspace.commitEmail,
   }
 }
 
@@ -193,14 +194,18 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
     else errors[key] = parsed.message
   }
   if (errors.perPage === undefined && errors.maxPerPage === undefined && numbers.perPage > numbers.maxPerPage) errors.perPage = '默认每页条数不能大于每页上限'
-  const repos = [...new Set(draft.repos.split('\n').map(line => line.trim().toLowerCase()).filter(line => line !== ''))]
-  if (repos.length > MAX_REPO_PATTERNS) errors.repos = `最多 ${MAX_REPO_PATTERNS} 条`
   if (draft.signature.length > MAX_SIGNATURE_LENGTH) errors.signature = `签名最多 ${MAX_SIGNATURE_LENGTH} 个字符`
+  const commitName = draft.commitName.trim()
+  const commitEmail = draft.commitEmail.trim()
+  if (commitName.length > MAX_IDENTITY_LENGTH) errors.commitName = `提交姓名最多 ${MAX_IDENTITY_LENGTH} 个字符`
+  else if (/[<>\n]/.test(commitName)) errors.commitName = '提交姓名不能包含 < > 或换行'
+  if (commitEmail.length > MAX_IDENTITY_LENGTH) errors.commitEmail = `提交邮箱最多 ${MAX_IDENTITY_LENGTH} 个字符`
+  else if (/[<>\s]/.test(commitEmail)) errors.commitEmail = '提交邮箱不能包含 < > 或空白'
+  if ((commitName === '') !== (commitEmail === '')) errors[commitName === '' ? 'commitName' : 'commitEmail'] = '提交姓名和邮箱要一起填，或者都留空'
   if (Object.keys(errors).length > 0) return { ok: false, errors }
   return {
     ok: true,
     settings: {
-      repos,
       timeoutMs: numbers.timeoutMs,
       limits: {
         perPage: numbers.perPage,
@@ -212,8 +217,9 @@ export function fromDraft(draft: SettingsDraft): { ok: true; settings: RepoSetti
         maxLogBytes: numbers.maxLogBytes,
         maxCiFailures: numbers.maxCiFailures,
       },
-      tools: { enabled: draft.enabled, writes: draft.writes, merge: draft.merge, deleteSourceBranch: draft.deleteSourceBranch, signature: draft.signature },
-      mirror: { gitTimeoutMs: numbers.gitTimeoutMs, otherHosts: draft.otherHosts },
+      tools: { enabled: draft.enabled, writes: draft.writes, deleteSourceBranch: draft.deleteSourceBranch, signature: draft.signature },
+      mirror: { gitTimeoutMs: numbers.gitTimeoutMs },
+      workspace: { proxyPort: numbers.proxyPort, commitName: draft.commitName.trim(), commitEmail: draft.commitEmail.trim() },
       watch: {
         enabled: draft.watchEnabled,
         activeIntervalMs: numbers.activeIntervalMs,

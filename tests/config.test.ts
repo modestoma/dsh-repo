@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_SETTINGS, apiBaseUrl, resolveConfig, resolveSettings, settingsOverrides } from '../src/config.ts'
+import { DEFAULT_SETTINGS, resolveConfig, resolveSettings, settingsOverrides } from '../src/config.ts'
+import { forgeOf } from '../src/providers/forges.ts'
 
 describe('resolveConfig', () => {
   it('accepts an omitted config with safe defaults', () => {
@@ -23,12 +24,12 @@ describe('resolveConfig', () => {
 
 describe('resolveSettings', () => {
   it('fills every missing field with its default', () => {
-    expect(DEFAULT_SETTINGS.tools).toEqual({ enabled: true, writes: 'ask', merge: false, deleteSourceBranch: true, signature: '' })
+    expect(DEFAULT_SETTINGS.tools).toEqual({ enabled: true, writes: 'ask', deleteSourceBranch: true, signature: '' })
     expect(resolveSettings({ limits: { perPage: 50 } })).toEqual({ ...DEFAULT_SETTINGS, limits: { ...DEFAULT_SETTINGS.limits, perPage: 50 } })
   })
 
   it('rejects bad values as invalid, naming each field', () => {
-    expect(() => resolveSettings({ repos: ['github.com/*/x'] })).toThrow(/仓库格式/)
+    expect(() => resolveSettings({ repos: ['github.com/a/*'] })).toThrow()
     expect(() => resolveSettings({ limits: { perPage: 80, maxPerPage: 50 } })).toThrow(/limits\.perPage/)
     expect(() => resolveSettings({ timeoutMs: 10 })).toThrow(expect.objectContaining({ code: 'invalid' }))
     expect(() => resolveSettings({ unknown: 1 })).toThrow()
@@ -36,8 +37,8 @@ describe('resolveSettings', () => {
 
   it('stores only the fields that differ from the defaults', () => {
     expect(settingsOverrides(DEFAULT_SETTINGS)).toEqual({})
-    const settings = resolveSettings({ repos: ['github.com/a/*'], tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
-    expect(settingsOverrides(settings)).toEqual({ repos: ['github.com/a/*'], tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
+    const settings = resolveSettings({ tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
+    expect(settingsOverrides(settings)).toEqual({ tools: { writes: 'off' }, mirror: { gitTimeoutMs: 60_000 } })
     expect(resolveSettings(settingsOverrides(settings))).toEqual(settings)
     const watch = resolveSettings({ watch: { idleDays: 3, events: { comment: 'note' } } })
     expect(watch.watch).toMatchObject({ enabled: true, idleDays: 3, activeIntervalMs: 60_000, events: { comment: 'note', ciFailed: 'wake', merged: 'wake', idle: 'wake' } })
@@ -47,11 +48,16 @@ describe('resolveSettings', () => {
   })
 })
 
-describe('apiBaseUrl', () => {
-  it('derives the REST base of github.com, GitHub Enterprise Server, and GitLab', () => {
-    expect(apiBaseUrl({ kind: 'github', url: 'https://github.com' })).toBe('https://api.github.com')
-    expect(apiBaseUrl({ kind: 'github', url: 'https://ghe.example.com' })).toBe('https://ghe.example.com/api/v3')
-    expect(apiBaseUrl({ kind: 'github', url: 'https://ghe.example.com', apiUrl: 'https://api.ghe.example.com' })).toBe('https://api.ghe.example.com')
-    expect(apiBaseUrl({ kind: 'gitlab', url: 'https://code.example.com/gitlab' })).toBe('https://code.example.com/gitlab')
+describe('forge adapters', () => {
+  it('derive the REST base of github.com, GitHub Enterprise Server, and GitLab', () => {
+    expect(forgeOf('github').apiBaseUrl({ url: 'https://github.com' })).toBe('https://api.github.com')
+    expect(forgeOf('github').apiBaseUrl({ url: 'https://ghe.example.com' })).toBe('https://ghe.example.com/api/v3')
+    expect(forgeOf('github').apiBaseUrl({ url: 'https://ghe.example.com', apiUrl: 'https://api.ghe.example.com' })).toBe('https://api.ghe.example.com')
+    expect(forgeOf('gitlab').apiBaseUrl({ url: 'https://code.example.com/gitlab' })).toBe('https://code.example.com/gitlab')
+  })
+
+  it('name each family\'s git username and PR/MR label', () => {
+    expect([forgeOf('github').gitUsername, forgeOf('github').mrLabel(12)]).toEqual(['x-access-token', 'PR #12'])
+    expect([forgeOf('gitlab').gitUsername, forgeOf('gitlab').mrLabel(12)]).toEqual(['oauth2', 'MR !12'])
   })
 })

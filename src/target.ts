@@ -1,6 +1,7 @@
 /**
  * Repository targets: map a URL or `host/path` to a configured host and a
- * repository path, and apply the configured repository patterns.
+ * repository path. Whether the repository may be reached is the catalog's
+ * decision (see `dsh-repo/catalog`).
  *
  * @module dsh-repo/target
  */
@@ -8,8 +9,8 @@
 import type { RepoRef } from './contract.ts'
 import type { HostSpec } from './config.ts'
 import { RepoError } from './errors.ts'
+import { forgeOf } from './providers/forges.ts'
 
-const SEGMENT = /^[A-Za-z0-9._-]+$/
 const SCP_LIKE = /^[A-Za-z0-9._-]+@([A-Za-z0-9.-]+):(.+)$/
 
 /** A target resolved to its host. */
@@ -40,38 +41,6 @@ function parse(input: string): ParsedTarget | undefined {
   if (url.protocol === 'https:' || url.protocol === 'http:') return { host: url.host.toLowerCase(), web: true, pathname: decodeURIComponent(url.pathname) }
   if (url.protocol === 'ssh:' || url.protocol === 'git:') return { host: url.hostname.toLowerCase(), web: false, pathname: decodeURIComponent(url.pathname) }
   return undefined
-}
-
-function repoPath(kind: HostSpec['kind'], rest: string): string | undefined {
-  let segments = rest.replace(/\.git$/, '').split('/').filter(segment => segment !== '')
-  if (kind === 'github') {
-    segments = segments.slice(0, 2)
-    if (segments.length !== 2) return undefined
-  } else {
-    const marker = segments.indexOf('-')
-    if (marker >= 0) segments = segments.slice(0, marker)
-    if (segments.length < 2) return undefined
-  }
-  if (segments.at(-1)?.endsWith('.git') === true) segments[segments.length - 1] = segments.at(-1)!.slice(0, -4)
-  return segments.every(segment => SEGMENT.test(segment) && segment !== '.' && segment !== '..') ? segments.join('/') : undefined
-}
-
-/**
- * Whether a repository key matches one configured pattern.
- * @param key - lowercase `host/path`.
- * @param pattern - lowercase pattern; a final `*` matches one segment, `**` one or more.
- * @returns whether it matches.
- */
-export function matchesPattern(key: string, pattern: string): boolean {
-  const keySegments = key.split('/')
-  const patternSegments = pattern.split('/')
-  const last = patternSegments.at(-1)
-  if (last === '**') {
-    const prefix = patternSegments.slice(0, -1)
-    return keySegments.length > prefix.length && prefix.every((segment, index) => segment === keySegments[index])
-  }
-  if (keySegments.length !== patternSegments.length) return false
-  return patternSegments.every((segment, index) => segment === '*' ? index === patternSegments.length - 1 : segment === keySegments[index])
 }
 
 /** The host serving a parsed target and the path below the host's prefix. */
@@ -106,23 +75,17 @@ export function hostOf(input: string, hosts: readonly HostSpec[]): HostSpec | un
  * Resolve a repository target.
  * @param input - URL or `host/path`.
  * @param hosts - configured hosts.
- * @param patterns - configured repository patterns; empty allows every repository on the hosts.
  * @returns the host and repository path.
- * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no host or pattern admits it.
+ * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no host serves it.
  */
-export function resolveTarget(input: string, hosts: readonly HostSpec[], patterns: readonly string[]): ResolvedTarget {
+export function resolveTarget(input: string, hosts: readonly HostSpec[]): ResolvedTarget {
   const parsed = parse(input)
   if (parsed === undefined) throw new RepoError('invalid', `无法识别的仓库：${input}（填仓库网址、git 地址或 主机/路径）`)
   const best = matchHost(parsed, hosts)
   if (best === undefined) throw new RepoError('not-allowed', `没有为 ${parsed.host} 配置主机，dsh-repo 不能访问 ${input}`)
-  const path = repoPath(best.spec.kind, best.rest)
-  if (path === undefined) {
-    throw new RepoError('invalid', best.spec.kind === 'github' ? `GitHub 仓库路径应为 owner/name：${input}` : `GitLab 仓库路径应为 group/project（可有多级 group）：${input}`)
-  }
+  const forge = forgeOf(best.spec.kind)
+  const path = forge.repoPath(best.rest)
+  if (path === undefined) throw new RepoError('invalid', `${forge.title} 仓库路径应为 ${forge.pathHint}：${input}`)
   const host = new URL(best.spec.url).host
-  const key = `${host}/${path}`.toLowerCase()
-  if (patterns.length > 0 && !patterns.some(pattern => matchesPattern(key, pattern))) {
-    throw new RepoError('not-allowed', `${host}/${path} 不在 dsh-repo 配置的仓库范围内`)
-  }
   return { spec: best.spec, kind: best.spec.kind, host, path, webUrl: `${best.spec.url}/${path}` }
 }
