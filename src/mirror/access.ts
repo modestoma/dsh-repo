@@ -54,8 +54,10 @@ export class Mirrors {
   private problem: string | undefined
   /** Latest fetch of each catalog address, keyed by the address as the catalog stores it. */
   private readonly statuses = new Map<string, MirrorStatus>()
-  /** Background fetches running, keyed like {@link statuses}. */
-  private readonly background = new Map<string, Promise<void>>()
+  /** Background fetches running, keyed like {@link statuses}, with the {@link generation} they started in. */
+  private readonly background = new Map<string, { readonly generation: number; readonly done: Promise<void> }>()
+  /** Incremented when the mirror directory changes, so fetches begun for the previous directory neither report a state nor stand in for a fetch of the new one. */
+  private generation = 0
   private readonly now: () => number
 
   /**
@@ -103,6 +105,7 @@ export class Mirrors {
     this.store.setRoot(target)
     this.problem = undefined
     // Mirrors in the new directory are cloned afresh, so earlier states say nothing about them.
+    this.generation += 1
     this.statuses.clear()
     this.deps.hosts.notify({ kind: 'mirror', dir: target })
     return this.settings()
@@ -125,15 +128,16 @@ export class Mirrors {
    * @throws {RepoError} `not-allowed` outside the catalog, `unavailable` while no mirror directory is set, and the mirror's failures.
    */
   async sync(url: string, options: { readonly branch?: string; readonly signal?: AbortSignal } = {}): Promise<MirrorState> {
+    const generation = this.generation
     const previous = this.statuses.get(url)
     this.statuses.set(url, { state: 'fetching', ...previous?.fetchedAt === undefined ? {} : { fetchedAt: previous.fetchedAt } })
     try {
       const env = await this.auth(url)
       const state = await this.store.sync(url, options.branch, env, options.signal)
-      this.statuses.set(url, { state: 'ready', fetchedAt: new Date(this.now()).toISOString() })
+      if (generation === this.generation) this.statuses.set(url, { state: 'ready', fetchedAt: new Date(this.now()).toISOString() })
       return state
     } catch (error) {
-      this.record(url, previous, error, options.signal)
+      if (generation === this.generation) this.record(url, previous, error, options.signal)
       throw error
     }
   }
@@ -163,18 +167,23 @@ export class Mirrors {
   }
 
   /**
-   * Fetch a catalog address in the background; a fetch already running in the background is not started again.
+   * Fetch a catalog address in the background; a fetch already running in the background for the current mirror directory is not started again.
    * @param url - address as the catalog stores it.
    * @returns when the fetch ended; its failure is recorded in {@link status}, never thrown.
    */
   prefetch(url: string): Promise<void> {
     const running = this.background.get(url)
-    if (running !== undefined) return running
-    const started = this.sync(url).then(() => undefined, (error: unknown) => {
-      this.deps.logger?.warn?.('dsh-repo: 后台拉取 %s 失败：%s', url, error instanceof Error ? error.message : String(error))
-    }).finally(() => { this.background.delete(url) })
-    this.background.set(url, started)
-    return started
+    if (running !== undefined && running.generation === this.generation) return running.done
+    const entry = {
+      generation: this.generation,
+      done: this.sync(url).then(() => undefined, (error: unknown) => {
+        this.deps.logger?.warn?.('dsh-repo: 后台拉取 %s 失败：%s', url, error instanceof Error ? error.message : String(error))
+      }).finally(() => {
+        if (this.background.get(url) === entry) this.background.delete(url)
+      }),
+    }
+    this.background.set(url, entry)
+    return entry.done
   }
 
   /**

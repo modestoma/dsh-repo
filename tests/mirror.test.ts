@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { SettingsStore } from '../src/settings/store.ts'
 import { credentialEnvironment, runGit } from '../src/mirror/git.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
@@ -215,6 +215,34 @@ describe('mirror fetch state', () => {
     fail = true
     await service.mirrors.prefetch(repo.url)
     expect(service.mirrors.status(repo.url)).toEqual({ state: 'failed', fetchedAt, error: expect.stringContaining('remote hung up') })
+  })
+
+  it('starts a new background fetch after the mirror directory changes, and ignores the outcome of the one for the old directory', async () => {
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let held = true
+    const remote = fileRemote()
+    const { root, service } = setup({ git: async (args, options) => {
+      if (held && args.includes('clone')) {
+        held = false
+        await gate
+      }
+      return await remote.git(args, options)
+    } })
+    const repo = origin(remote)
+    await allow(service, [repo.url])
+    const old = service.mirrors.prefetch(repo.url)
+    await vi.waitFor(() => { expect(held).toBe(false) })
+    const moved = join(root, 'moved')
+    await service.mirrors.setDir(moved)
+    await service.mirrors.prefetch(repo.url)
+    expect(service.mirrors.status(repo.url)).toMatchObject({ state: 'ready' })
+    expect((await service.mirrors.branches(repo.url)).branches).toEqual(['main'])
+    await service.mirrors.setDir(join(root, 'third'))
+    release?.()
+    await old
+    // The fetch begun for the first directory finished after two changes and reports nothing.
+    expect(service.mirrors.status(repo.url)).toBeUndefined()
   })
 
   it('checks that a repository can be reached and has the branches an entry names, before it is in the catalog', async () => {
