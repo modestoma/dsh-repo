@@ -121,25 +121,29 @@ function record(path: string, fields: Partial<WorkspaceRecord> = {}): WorkspaceR
 
 describe('operation registry', () => {
   it('pairs every tool with a service method of the same name scheme', () => {
-    expect(OPERATIONS).toHaveLength(33)
+    expect(OPERATIONS).toHaveLength(38)
     for (const operation of OPERATIONS) {
       const words = operation.tool.replace(/^repo_/, '').split('_')
       const method = words.length === 1 ? `repo${words[0]![0]!.toUpperCase()}${words[0]!.slice(1)}` : words.map((word, index) => index === 0 ? word : `${word[0]!.toUpperCase()}${word.slice(1)}`).join('')
       expect(operation.method).toBe(method)
       expect(typeof Reflect.get(DshReposApi.prototype, operation.method)).toBe('function')
     }
-    expect(new Set(OPERATIONS.map(operation => operation.tool)).size).toBe(33)
+    expect(new Set(OPERATIONS.map(operation => operation.tool)).size).toBe(38)
   })
 
   it('offers tools by the settings and the highest catalog access', () => {
     const offered = (settings: RepoSettings, highest: RepoAccess | undefined) => OPERATIONS.filter(operation => toolOffered(operation.access, settings.tools, highest)).map(operation => operation.tool)
-    expect(offered(testSettings(), 'merge')).toHaveLength(33)
+    expect(offered(testSettings(), 'merge')).toHaveLength(38)
     const read = offered(testSettings(), 'read')
     expect(read).toContain('repo_workspace_create')
     expect(read).toContain('repo_snapshot_acquire')
+    expect(read).toContain('repo_mr_compare')
+    expect(read).toContain('repo_mr_discussions')
     expect(read).not.toContain('repo_workspace_push')
+    expect(read).not.toContain('repo_mr_review')
     expect(offered(testSettings(), 'write')).not.toContain('repo_mr_merge')
-    expect(offered(testSettings({ tools: { writes: 'off' } }), 'merge').filter(tool => /push|create$|merge|delete|retry|cancel|update|comment|add$/.test(tool))).toEqual(['repo_workspace_create'])
+    expect(offered(testSettings(), 'write')).toContain('repo_mr_review')
+    expect(offered(testSettings({ tools: { writes: 'off' } }), 'merge').filter(tool => /push|create$|merge|delete|retry|cancel|update|comment|add$|review$|reply$|resolve$/.test(tool))).toEqual(['repo_workspace_create'])
     expect(offered(testSettings(), undefined)).toEqual([])
     expect(offered(testSettings({ tools: { enabled: false } }), 'merge')).toEqual([])
   })
@@ -481,5 +485,123 @@ describe('PR/MR watching', () => {
     await expect(tool.execute({ repo: 'github.com/a/b', number: 7 }, exec)).rejects.toThrow(/\[invalid\].*会话/)
     watch.active = false
     await expect(tool.execute({ repo: 'github.com/a/b', number: 7 }, run)).rejects.toThrow(/\[unavailable\]/)
+  })
+})
+
+describe('contract v8 review, discussion, compare, and bot user operations', () => {
+  it('validates repo_mr_list sort and updatedAfter, and wires repo_mr_compare and repo_mr_discussions', async () => {
+    const listMrs = vi.fn(async () => ({ items: [] }))
+    const mrCompare = vi.fn(async () => ({ diff: '+ok', truncated: false }))
+    const mrDiscussions = vi.fn(async () => ({ items: [], nextPage: 2 }))
+    const all = tools(fakeService({ forge: { listMrs, mrCompare, mrDiscussions } }))
+
+    await all.get('repo_mr_list')!.execute({ repo: 'github.com/a/b', sort: 'updated', updatedAfter: '2026-11-13T10:00:00Z' }, exec)
+    expect(listMrs).toHaveBeenCalledWith('github.com/a/b', expect.objectContaining({ sort: 'updated', updatedAfter: '2026-11-13T10:00:00Z', signal: exec.signal }))
+    await expect(all.get('repo_mr_list')!.execute({ repo: 'github.com/a/b', updatedAfter: 'not-iso' }, exec)).rejects.toThrow(/^\[invalid\] repo_mr_list 参数不合法/)
+    await expect(all.get('repo_mr_list')!.execute({ repo: 'github.com/a/b', updatedAfter: '2026-11-13T10:00:00' }, exec)).rejects.toThrow(/^\[invalid\] repo_mr_list 参数不合法/)
+
+    expect(await all.get('repo_mr_compare')!.execute({ repo: 'github.com/a/b', baseSha: 'main', headSha: 'feat/x' }, exec)).toEqual({ diff: '+ok', truncated: false })
+    expect(mrCompare).toHaveBeenCalledWith('github.com/a/b', 'main', 'feat/x', { signal: exec.signal })
+
+    expect(await all.get('repo_mr_discussions')!.execute({ repo: 'github.com/a/b', number: 5, onlyUnresolved: true, page: 2, perPage: 10 }, exec)).toEqual({ items: [], nextPage: 2 })
+    expect(mrDiscussions).toHaveBeenCalledWith('github.com/a/b', 5, { onlyUnresolved: true, page: 2, perPage: 10, signal: exec.signal })
+  })
+
+  it('gates repo_mr_review, repo_mr_discussion_reply, and repo_mr_discussion_resolve, applies signatures, and remembers own comments', async () => {
+    const sha = 'a'.repeat(40)
+    const reviewMr = vi.fn(async () => ({
+      verdict: 'request-changes' as const,
+      postedComments: 1,
+      fallbackInlineCount: 0,
+      webUrl: 'https://github.com/a/b/pull/5#pullrequestreview-99',
+      ownCommentIds: ['review-99'],
+    }))
+    const replyMrDiscussion = vi.fn(async () => ({
+      note: { id: 'PRRC_1', author: { username: 'bot' }, body: 'Fixed\n\n_via DSH_', createdAt: '2026-11-13T10:00:00Z' },
+      ownCommentIds: ['PRRC_1', 'line-77'],
+    }))
+    const resolveMrDiscussion = vi.fn(async () => ({ discussionId: 'PRRT_1', resolved: true }))
+    const currentBotUser = vi.fn(async () => ({ username: 'dsh-bot', webUrl: 'https://github.com/dsh-bot' }))
+
+    const request = vi.fn(async (_req: { readonly reason?: string }) => 'allowed-once' as const)
+    const parallel = vi.fn(async () => {})
+    const ownComment = vi.fn(async () => {})
+    const watch = { active: true, track: vi.fn(async () => ({}) as WatchInfo), untrack: vi.fn(async () => true), ownComment }
+    const { exec: run } = session()
+    const service = fakeService({ forge: { reviewMr, replyMrDiscussion, resolveMrDiscussion, currentBotUser } }, () => testSettings({ tools: { signature: '_via DSH_' } }), 'write')
+    const all = tools(service, { approval: { request }, parallel, watch })
+    const repos = api(service, { approval: { request }, parallel, watch })
+
+    const reviewOutcome = await all.get('repo_mr_review')!.execute({
+      repo: 'github.com/a/b',
+      number: 5,
+      headSha: sha,
+      verdict: 'request-changes',
+      body: 'Please guard null.',
+      comments: [{ path: 'src/a.ts', newLine: 12, body: 'Possible null deref' }],
+    }, run)
+    expect(reviewOutcome).toEqual({
+      verdict: 'request-changes',
+      postedComments: 1,
+      fallbackInlineCount: 0,
+      webUrl: 'https://github.com/a/b/pull/5#pullrequestreview-99',
+    })
+    expect(reviewOutcome).not.toHaveProperty('ownCommentIds')
+    expect(parallel).toHaveBeenCalledWith('access/authorize', expect.objectContaining({ session: 'session-1', level: 'code-write', action: 'mrReview' }))
+    expect(request.mock.calls.at(-1)?.[0].reason).toBe(`评审 github.com/a/b 的 PR/MR #5（request-changes，head ${sha.slice(0, 12)}，1 条行级评论）`)
+    expect(reviewMr).toHaveBeenCalledWith('github.com/a/b', 5, {
+      headSha: sha,
+      verdict: 'request-changes',
+      body: 'Please guard null.',
+      comments: [{ path: 'src/a.ts', newLine: 12, body: 'Possible null deref' }],
+      signature: '_via DSH_',
+      signal: run.signal,
+    })
+    expect(ownComment).toHaveBeenCalledWith('github.com/a/b', 5, 'review-99')
+
+    // Validation guards: short headSha, empty comment review, inline comment missing line numbers, >50 inline comments.
+    await expect(all.get('repo_mr_review')!.execute({ repo: 'github.com/a/b', number: 5, headSha: 'abc', verdict: 'approve' }, run)).rejects.toThrow(/^\[invalid\]/)
+    await expect(all.get('repo_mr_review')!.execute({ repo: 'github.com/a/b', number: 5, headSha: sha, verdict: 'comment' }, run)).rejects.toThrow(/^\[invalid\]/)
+    await expect(all.get('repo_mr_review')!.execute({ repo: 'github.com/a/b', number: 5, headSha: sha, verdict: 'comment', comments: [{ path: 'src/a.ts', body: 'no line' }] }, run)).rejects.toThrow(/^\[invalid\]/)
+    await expect(all.get('repo_mr_review')!.execute({
+      repo: 'github.com/a/b',
+      number: 5,
+      headSha: sha,
+      verdict: 'comment',
+      comments: Array.from({ length: 51 }, (_, index) => ({ path: 'src/a.ts', newLine: index + 1, body: 'x' })),
+    }, run)).rejects.toThrow(/^\[invalid\]/)
+
+    // Plugin-authorized service call (no `agent`) skips access/authorize and approval card.
+    request.mockClear()
+    parallel.mockClear()
+    await repos.mrReview({ repo: 'github.com/a/b', number: 5, headSha: sha, verdict: 'approve', body: 'LGTM' })
+    expect(request).not.toHaveBeenCalled()
+    expect(parallel).not.toHaveBeenCalled()
+
+    const replyOutcome = await all.get('repo_mr_discussion_reply')!.execute({
+      repo: 'github.com/a/b',
+      number: 5,
+      discussionId: 'PRRT_1',
+      body: 'Fixed',
+    }, run)
+    expect(replyOutcome).toEqual({ id: 'PRRC_1', author: { username: 'bot' }, body: 'Fixed\n\n_via DSH_', createdAt: '2026-11-13T10:00:00Z' })
+    expect(replyMrDiscussion).toHaveBeenCalledWith('github.com/a/b', 5, 'PRRT_1', 'Fixed\n\n_via DSH_', { signal: run.signal })
+    expect(ownComment).toHaveBeenCalledWith('github.com/a/b', 5, 'PRRC_1')
+    expect(ownComment).toHaveBeenCalledWith('github.com/a/b', 5, 'line-77')
+
+    expect(await all.get('repo_mr_discussion_resolve')!.execute({
+      repo: 'github.com/a/b',
+      number: 5,
+      discussionId: 'PRRT_1',
+      resolved: true,
+    }, run)).toEqual({ discussionId: 'PRRT_1', resolved: true })
+    expect(resolveMrDiscussion).toHaveBeenCalledWith('github.com/a/b', 5, 'PRRT_1', true, { signal: run.signal })
+
+    // currentBotUser is exposed only on the DshReposApi service, never as a model tool.
+    expect(all.has('repo_current_bot_user')).toBe(false)
+    expect(await repos.currentBotUser({ repo: 'github.com/a/b' })).toEqual({ username: 'dsh-bot', webUrl: 'https://github.com/dsh-bot' })
+    expect(currentBotUser).toHaveBeenCalledWith('github.com/a/b', {})
+    await repos.currentBotUser({ repo: 'github.com/a/b', signal: run.signal })
+    expect(currentBotUser).toHaveBeenLastCalledWith('github.com/a/b', { signal: run.signal })
   })
 })

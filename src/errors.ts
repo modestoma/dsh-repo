@@ -27,6 +27,23 @@ interface HttpFailure {
   readonly rateLimited: boolean
 }
 
+function graphqlStatusOf(type: string | undefined): number | undefined {
+  switch (type) {
+    case 'RATE_LIMITED': return 429
+    case 'UNAUTHENTICATED': return 401
+    case 'FORBIDDEN':
+    case 'INSUFFICIENT_SCOPES': return 403
+    case 'NOT_FOUND': return 404
+    case 'CONFLICT': return 409
+    case 'UNPROCESSABLE':
+    case 'BAD_USER_INPUT':
+    case 'VALIDATION_ERROR':
+    case 'ARGUMENT_ERROR':
+    case 'EXCESSIVE_PAGINATION': return 422
+    default: return undefined
+  }
+}
+
 function httpFailureOf(error: unknown): HttpFailure | undefined {
   if (!(error instanceof Error)) return undefined
   // Octokit `RequestError`: `status` plus `response.headers`.
@@ -34,6 +51,17 @@ function httpFailureOf(error: unknown): HttpFailure | undefined {
   if (error.name === 'HttpError' && typeof octokit.status === 'number') {
     const remaining = octokit.response?.headers?.['x-ratelimit-remaining']
     return { status: octokit.status, message: error.message, rateLimited: octokit.status === 429 || (octokit.status === 403 && String(remaining) === '0') }
+  }
+  // Octokit `@octokit/graphql` `GraphqlResponseError`: `errors[].type` plus `headers`.
+  const graphql = error as Error & { errors?: readonly { readonly type?: string; readonly message?: string }[]; headers?: Record<string, string | number | undefined> }
+  if (error.name === 'GraphqlResponseError') {
+    const entries = Array.isArray(graphql.errors) ? graphql.errors : []
+    const messages = entries.map(entry => entry?.message).filter((msg): msg is string => typeof msg === 'string' && msg !== '')
+    const message = messages.length > 0 ? messages.join('; ') : error.message
+    const status = entries.map(entry => graphqlStatusOf(entry?.type)).find((code): code is number => code !== undefined)
+    const remaining = graphql.headers?.['x-ratelimit-remaining']
+    const rateLimited = status === 429 || String(remaining) === '0'
+    return { ...rateLimited ? { status: 429 } : status === undefined ? {} : { status }, message, rateLimited }
   }
   // GitBeaker `GitbeakerRequestError`: `cause.response`.
   const gitbeaker = error as Error & { cause?: { response?: { status?: unknown } } }

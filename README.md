@@ -6,7 +6,7 @@
 
 ## 项目状态
 
-测试版：提供统一接口（服务版本 7）、模型工具、运行时主机管理、仓库清单、本地镜像、工作区与本机 git 代理、PR/MR 跟踪、本地同步和左侧栏「代码仓库」设置页。接口仍可能调整。
+测试版：提供统一接口（服务版本 8）、模型工具、运行时主机管理、仓库清单、本地镜像、工作区与本机 git 代理、PR/MR 跟踪、本地同步和左侧栏「代码仓库」设置页。接口仍可能调整。
 
 ## 安装
 
@@ -128,8 +128,9 @@ cordis.yml 在加载时校验，写入其他键（例如以前的 `repos`、`lim
 | `repo_tree_list` / `repo_file_read` | 经主机接口读目录与文件；浏览整个检出用 `repo_snapshot_acquire` | 否 |
 | `repo_issue_list` / `repo_issue_get` | issue 列表（可用 `search` 搜索标题和描述）、单个 issue 及评论 | 否 |
 | `repo_issue_create` / `repo_issue_update` / `repo_issue_comment` | 创建、修改、关闭或重开、评论 issue | 是 |
-| `repo_mr_list` / `repo_mr_get` / `repo_mr_diff` / `repo_mr_status` | PR/MR 列表、详情与评论、diff、CI 与可合并状态；CI 检查带 `runId` / `jobId` 时可以接着用 CI 工具查看 | 否 |
-| `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、评论 PR/MR；创建时不给目标分支就合回仓库清单里的基线分支，没设基线时合回默认分支；创建和重开的 PR/MR 自动跟踪 | 是 |
+| `repo_mr_list` / `repo_mr_get` / `repo_mr_diff` / `repo_mr_compare` / `repo_mr_discussions` / `repo_mr_status` | PR/MR 列表（支持 `sort` 与 `updatedAfter` 增量筛选）、详情与对话评论、完整 diff、两提交间增量 diff、讨论线程（行级位置、已解决状态与回复）、CI 与可合并状态；CI 检查带 `runId` / `jobId` 时可以接着用 CI 工具查看 | 否 |
+| `repo_mr_create` / `repo_mr_update` / `repo_mr_comment` | 创建（可为草稿）、修改、关闭或重开、发表顶层评论；创建时不给目标分支就合回仓库清单里的基线分支，没设基线时合回默认分支；创建和重开的 PR/MR 自动跟踪 | 是 |
+| `repo_mr_review` / `repo_mr_discussion_reply` / `repo_mr_discussion_resolve` | 按 `headSha` 提交结构化评审（`comment` / `approve` / `request-changes`、总评与最多 50 条行级评论；自审自动降级为 `comment`，超出 diff hunk 的行号自动折入总评引用块）、回复讨论线程、标记线程已解决或重新打开 | 是 |
 | `repo_mr_merge` | 按 `headSha` 合并，head 已变化时拒绝；按设置一并删除源分支；只合并权限为「可合并」的仓库 | 是 |
 | `repo_mr_watch` | 让本会话跟踪一个打开中的 PR/MR，或停止跟踪，见[跟踪 PR/MR](#跟踪-prmr)；跟踪可用时才提供 | 否 |
 | `repo_ci_list` | CI 运行列表（GitLab 流水线、GitHub Actions workflow run），可按分支或 tag、提交、PR/MR、状态过滤，见[查看 CI](#查看-ci) | 否 |
@@ -218,7 +219,7 @@ GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支�
 |---|---|---|
 | CI 失败 | 唤醒 | 当前 head 的检查或流水线失败，其他检查还在运行时也立即报；之后又有检查失败（包括重跑后再次失败）时再报一次 |
 | CI 通过 | 只记录 | 当前 head 的检查全部通过，包括失败后在同一个 head 上重跑通过 |
-| 新评论 | 唤醒 | 对话评论、代码行评论、只有评论的评审；通过 `repo_mr_comment` / `repo_issue_comment` 发的评论不算 |
+| 新评论 | 唤醒 | 对话评论、代码行评论、只有评论的评审；通过 `repo_mr_comment` / `repo_mr_review` / `repo_mr_discussion_reply` / `repo_issue_comment` 发的评论和评审不算 |
 | 要求修改 | 唤醒 | GitHub 评审 `CHANGES_REQUESTED`；GitLab 系统备注「requested changes」 |
 | 批准 | 只记录 | GitHub 评审 `APPROVED`；GitLab 系统备注「approved this merge request」 |
 | 出现冲突 | 唤醒 | GitHub `mergeable_state` 为 `dirty`；GitLab `has_conflicts` |
@@ -243,12 +244,12 @@ GitHub 和 GitLab 的删除分支接口都不接受预期提交，所以分支�
 import type { DshRepoService } from 'dsh-repo/contract'
 
 const repos = ctx.get('dshRepos') as DshRepoService | undefined
-if (repos?.version === 7) {
+if (repos?.version === 8) {
   const issue = await repos.issueGet({ repo: 'https://gitlab.example.com/team/orders', number: 12 })
 }
 ```
 
-服务版本是 7。每个模型工具都有一个同名的服务方法（见[模型工具](#模型工具)的命名规则），参数是同一个对象，用同一个参数校验；服务调用另外可以带调用方字段：
+服务版本是 8。每个模型工具都有一个同名的服务方法（见[模型工具](#模型工具)的命名规则），参数是同一个对象，用同一个参数校验；服务调用另外可以带调用方字段：
 
 | 字段 | 作用 |
 |---|---|
@@ -258,13 +259,13 @@ if (repos?.version === 7) {
 
 不带 `agent` 的写操作只检查写操作开关和仓库清单的权限（写操作关闭时同样以 `forbidden` 失败），不发授权事件也不审批，由调用方插件负责。`mrWatch` 必须带 `agent`。工作区方法的 `path` 必须是绝对路径，服务调用不切换会话的工作目录。
 
-除这些方法外，服务还提供插件和设置页用的方法：`repoResolve`、`repoOnChange`、`featureRegister`、`hostList`、`hostAdd`、`hostRemove`、`hostSetToken`、`hostOnChange`、`settingsGet`、`settingsUpdate`（镜像目录、工作区默认目录、代理端口、提交身份）。完整定义见 [`src/contract.ts`](src/contract.ts)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`、`declined`。
+除这些方法外，服务还提供插件和设置页用的方法：`currentBotUser`（按主机缓存当前令牌账号 `{ username, webUrl? }`，`hostOnChange` 时失效；要求仓库在清单内）、`repoResolve`、`repoOnChange`、`featureRegister`、`hostList`、`hostAdd`、`hostRemove`、`hostSetToken`、`hostOnChange`、`settingsGet`、`settingsUpdate`（镜像目录、工作区默认目录、代理端口、提交身份）。完整定义见 [`src/contract.ts`](src/contract.ts)。所有预期内的失败都以 `name === 'RepoError'` 的错误拒绝，`code` 取值为 `invalid`、`not-allowed`、`unauthenticated`、`forbidden`、`not-found`、`conflict`、`rate-limited`、`too-large`、`unavailable`、`declined`。
 
 一个功能插件的用法：
 
 ```ts
 const repos = ctx.get('dshRepos') as DshRepoService | undefined
-if (repos?.version === 7) {
+if (repos?.version === 8) {
   ctx.effect(() => repos.featureRegister({ id: 'log-analysis', title: '日志分析' }))
   ctx.effect(() => repos.repoOnChange(() => { void repos.repoList({ feature: 'log-analysis' }).then(reload) }))
   // 功能的分支：打开时选的分支，没选时是基线分支，再没有就是远端默认分支。
@@ -278,6 +279,13 @@ if (repos?.version === 7) {
   }
 }
 ```
+
+从 7 升到 8：
+
+- `mrList`（`repo_mr_list`）新增可选 `sort?: 'created' | 'updated'` 与 `updatedAfter?: string`（ISO-8601 时间戳；传 `updatedAfter` 时默认按更新时间降序，只保留严格晚于该时间的项，页尾条目不晚于 `updatedAfter` 时省略 `nextPage` 提前截断分页）。
+- 新增读方法与工具：`mrCompare`（`repo_mr_compare`）比较两个提交/引用间的增量 diff；`mrDiscussions`（`repo_mr_discussions`）分页读取讨论线程（含行级定位、`resolvable` / `resolved` 与 `onlyUnresolved` 过滤）。
+- 新增写方法与工具（均要求 `write` 权限与 `code-write` 授权）：`mrReview`（`repo_mr_review`，按 `headSha` 锚定提交总评与行级意见，远端 head 漂移时报 `conflict`，自审自动降级为 `comment` 并标 `downgradedVerdict: true`，行号越界自动折入总评并返回 `postedComments` / `fallbackInlineCount`）、`mrDiscussionReply`（`repo_mr_discussion_reply`）和 `mrDiscussionResolve`（`repo_mr_discussion_resolve`）。
+- 新增仅面向插件的服务方法 `currentBotUser({ repo })`，返回该仓库所属主机当前令牌对应的 `RepoUser`（按主机内存缓存，`hostOnChange` 时失效）。
 
 从 6 升到 7：
 
@@ -374,11 +382,13 @@ ctx.on('repo/commit-trailers', (event: CommitTrailersEvent) => {
 | CI 失败信息 | GitLab 读测试报告；GitHub 读失败作业的错误注解 |
 | 合并方式 | GitHub 支持 merge / squash / rebase；GitLab 支持 merge / squash |
 | 合并后删除源分支 | GitLab 创建 MR 时勾选 `remove_source_branch`、合并时带 `should_remove_source_branch`；GitHub 没有逐个 PR 的选项，合并成功后删除 `heads/<分支>` |
+| 讨论线程与解决状态 | GitHub 经 GraphQL（GHES 为 `<url>/api/graphql`）读取、回复并解决/重开 `reviewThreads`；GitLab 经 `MergeRequestDiscussions` 读取（过滤 `system: true` 系统记录）、回复并解决/重开 |
+| 行内评审与自审降级 | GitHub 调 `pulls.createReview` 一次性提交；GitLab 用 MR `diff_refs` 逐条建行级讨论、发总评备注并在 `approve` 时调 `MergeRequestApprovals.approve`。令牌账号与作者相同时自动将 `approve` / `request-changes` 降为 `comment`，行号不在 diff hunk 内时折入总评引用块 |
 
 ## 已知限制
 
 - GitBeaker 不接受逐次调用的取消信号，GitLab 请求只受 `timeoutMs` 约束；调用被取消后，已发出的请求可能仍会完成。
-- 修改 PR/MR 时不能切换草稿状态；GitHub 的行内评审评论、评审（approve / request changes）不在第一版范围内。
+- 修改 PR/MR 时不能切换草稿状态。
 - 工作区不支持 Git LFS：代理不转发 LFS 接口，插件推送时也不上传 LFS 对象，改动 LFS 文件的推送只会带上指针文件。使用 LFS 的仓库请在工作区之外推送 LFS 文件。
 - 代理分辨不出 `git push --force` 和 `--force-with-lease`，两者都按普通推送规则放行（仍不能推默认分支和受保护分支）；要保护的分支请在主机上设为受保护分支。
 - 代理用 Node 内置的 `fetch` 转发推送，和两个 SDK 一样需要 `NODE_USE_ENV_PROXY=1` 才走 `HTTPS_PROXY`。

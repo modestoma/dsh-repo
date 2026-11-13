@@ -116,6 +116,12 @@ const ciTarget = z.object({ repo, runId: runId.optional(), jobId: jobId.optional
   .refine(args => (args.runId === undefined) !== (args.jobId === undefined), { message: 'Give exactly one of runId and jobId' })
 const mrBody = z.string().optional().describe('Description for reviewers: what changed and why, how it was verified, and anything risky or left undone. Keep it short; link issues instead of restating them; never paste conversation transcripts')
 const workspacePath = z.string().min(1).optional().describe('Workspace directory or a directory inside it; default: the current working directory')
+const draftInlineComment = z.object({
+  path: z.string().min(1).describe('File path from the repository root, /-separated'),
+  newLine: z.number().int().min(1).optional().describe('1-based line number in the new file (added or context lines)'),
+  oldLine: z.number().int().min(1).optional().describe('1-based line number in the old file (deleted lines)'),
+  body: z.string().min(1).describe('Inline review comment body'),
+}).strict().refine(item => item.newLine !== undefined || item.oldLine !== undefined, { message: 'Give at least one of newLine and oldLine' })
 
 function define<S extends z.ZodType, R>(operation: Operation<S, R>): Operation<S, R> {
   return operation
@@ -277,8 +283,17 @@ export const OPERATIONS: readonly Operation[] = [
     tool: 'repo_mr_list',
     method: 'mrList',
     access: 'read',
-    description: 'List pull requests (GitHub) or merge requests (GitLab).',
-    schema: z.object({ repo, state: z.enum(['open', 'closed', 'merged', 'all']).optional(), sourceBranch: z.string().optional().describe('Branch of this repository the PRs/MRs come from; ones from forks are left out'), targetBranch: z.string().optional(), page, perPage }).strict(),
+    description: 'List pull requests (GitHub) or merge requests (GitLab), optionally sorted by creation or update time and filtered to ones updated after an ISO-8601 timestamp.',
+    schema: z.object({
+      repo,
+      state: z.enum(['open', 'closed', 'merged', 'all']).optional(),
+      sourceBranch: z.string().optional().describe('Branch of this repository the PRs/MRs come from; ones from forks are left out'),
+      targetBranch: z.string().optional(),
+      sort: z.enum(['created', 'updated']).optional().describe('Sort field (descending); defaults to updated when updatedAfter is given'),
+      updatedAfter: z.iso.datetime({ offset: true }).optional().describe('ISO-8601 timestamp; keep only PRs/MRs with updatedAt strictly after this time'),
+      page,
+      perPage,
+    }).strict(),
     run: (args, { service }, caller) => service.forge.listMrs(args.repo, { ...args, signal: caller.signal }),
   }),
   define({
@@ -296,6 +311,37 @@ export const OPERATIONS: readonly Operation[] = [
     description: 'Read the unified diff of a pull/merge request. Long diffs are cut at the configured size limit.',
     schema: z.object({ repo, number }).strict(),
     run: (args, { service }, caller) => service.forge.mrDiff(args.repo, args.number, { signal: caller.signal }),
+  }),
+  define({
+    tool: 'repo_mr_compare',
+    method: 'mrCompare',
+    access: 'read',
+    description: 'Read the incremental unified diff between two commits or refs (`baseSha` → `headSha`). Long diffs are cut at the configured size limit.',
+    schema: z.object({
+      repo,
+      baseSha: z.string().min(1).describe('Base commit SHA or ref'),
+      headSha: z.string().min(1).describe('Head commit SHA or ref'),
+    }).strict(),
+    run: (args, { service }, caller) => service.forge.mrCompare(args.repo, args.baseSha, args.headSha, { signal: caller.signal }),
+  }),
+  define({
+    tool: 'repo_mr_discussions',
+    method: 'mrDiscussions',
+    access: 'read',
+    description: 'List discussion threads (inline code review threads and resolvable threads) on a pull/merge request, with diff line positions, resolution state, and replies.',
+    schema: z.object({
+      repo,
+      number,
+      onlyUnresolved: z.boolean().optional().describe('Keep only unresolved resolvable threads'),
+      page,
+      perPage,
+    }).strict(),
+    run: (args, { service }, caller) => service.forge.mrDiscussions(args.repo, args.number, {
+      ...args.onlyUnresolved === undefined ? {} : { onlyUnresolved: args.onlyUnresolved },
+      ...args.page === undefined ? {} : { page: args.page },
+      ...args.perPage === undefined ? {} : { perPage: args.perPage },
+      signal: caller.signal,
+    }),
   }),
   define({
     tool: 'repo_mr_status',
@@ -354,6 +400,90 @@ export const OPERATIONS: readonly Operation[] = [
       await rememberComment(deps, args.repo, args.number, comment.id)
       return comment
     },
+  }),
+  define({
+    tool: 'repo_mr_review',
+    method: 'mrReview',
+    access: 'write',
+    description: 'Submit a structured review on a pull/merge request at `headSha`: verdict (`comment`, `approve`, or `request-changes`), optional summary `body`, and up to 50 inline diff `comments`. Self-reviews automatically downgrade `approve`/`request-changes` to `comment`; inline comments whose line lies outside the remote diff hunk gracefully fold into the summary body as Markdown blockquotes. Requires user approval.',
+    schema: z.object({
+      repo,
+      number,
+      headSha: z.string().min(40).describe('Full head commit SHA the review targets (from repo_mr_get or repo_mr_status)'),
+      verdict: z.enum(['comment', 'approve', 'request-changes']).describe('Review verdict; auto-downgraded to comment on self-review'),
+      body: z.string().optional().describe('Overall review summary; signature is appended automatically'),
+      comments: z.array(draftInlineComment).max(50).optional().describe('Inline diff comments (at most 50)'),
+    }).strict().refine(
+      args => args.verdict === 'approve' || (args.body !== undefined && args.body.trim() !== '') || (args.comments !== undefined && args.comments.length > 0),
+      { message: 'Provide body or at least one inline comment' },
+    ),
+    write: {
+      level: 'write',
+      authorize: 'code-write',
+      prompt: args => ({
+        zh: `评审 ${args.repo} 的 PR/MR #${args.number}（${args.verdict}，head ${args.headSha.slice(0, 12)}${args.comments === undefined || args.comments.length === 0 ? '' : `，${args.comments.length} 条行级评论`}）`,
+        en: `Review PR/MR #${args.number} in ${args.repo} (${args.verdict} at ${args.headSha.slice(0, 12)})`,
+      }),
+    },
+    run: async (args, deps, caller) => {
+      const { ownCommentIds, ...result } = await deps.service.forge.reviewMr(args.repo, args.number, {
+        headSha: args.headSha,
+        verdict: args.verdict,
+        ...args.body === undefined ? {} : { body: args.body },
+        ...args.comments === undefined ? {} : { comments: args.comments },
+        signature: deps.service.settings.current.tools.signature,
+        signal: caller.signal,
+      })
+      for (const id of ownCommentIds ?? []) await rememberComment(deps, args.repo, args.number, id)
+      return result
+    },
+  }),
+  define({
+    tool: 'repo_mr_discussion_reply',
+    method: 'mrDiscussionReply',
+    access: 'write',
+    description: 'Reply to an existing discussion thread on a pull/merge request. Requires user approval.',
+    schema: z.object({
+      repo,
+      number,
+      discussionId: z.string().min(1).describe('Discussion thread id from repo_mr_discussions'),
+      body: z.string().min(1).describe('Reply body'),
+    }).strict(),
+    write: {
+      level: 'write',
+      authorize: 'code-write',
+      prompt: args => ({
+        zh: `回复 ${args.repo} 的 PR/MR #${args.number} 讨论线程 ${args.discussionId}`,
+        en: `Reply to discussion ${args.discussionId} on PR/MR #${args.number} in ${args.repo}`,
+      }),
+    },
+    run: async (args, deps, caller) => {
+      const signed = withSignature(args.body, deps.service.settings.current.tools.signature) ?? args.body
+      const { note, ownCommentIds } = await deps.service.forge.replyMrDiscussion(args.repo, args.number, args.discussionId, signed, { signal: caller.signal })
+      for (const id of ownCommentIds ?? [note.id]) await rememberComment(deps, args.repo, args.number, id)
+      return note
+    },
+  }),
+  define({
+    tool: 'repo_mr_discussion_resolve',
+    method: 'mrDiscussionResolve',
+    access: 'write',
+    description: 'Resolve or reopen a resolvable discussion thread on a pull/merge request. Requires user approval.',
+    schema: z.object({
+      repo,
+      number,
+      discussionId: z.string().min(1).describe('Discussion thread id from repo_mr_discussions'),
+      resolved: z.boolean().describe('true marks resolved, false reopens'),
+    }).strict(),
+    write: {
+      level: 'write',
+      authorize: 'code-write',
+      prompt: args => ({
+        zh: `${args.resolved ? '解决' : '重新打开'} ${args.repo} 的 PR/MR #${args.number} 讨论线程 ${args.discussionId}`,
+        en: `${args.resolved ? 'Resolve' : 'Reopen'} discussion ${args.discussionId} on PR/MR #${args.number} in ${args.repo}`,
+      }),
+    },
+    run: (args, { service }, caller) => service.forge.resolveMrDiscussion(args.repo, args.number, args.discussionId, args.resolved, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_merge',

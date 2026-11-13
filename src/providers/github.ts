@@ -8,13 +8,13 @@
 
 import { Octokit } from '@octokit/rest'
 import type {
-  BranchInfo, MrInfo, MrState, MrStatus, CheckInfo, CheckState, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiState, CommentInfo, CommitAuthor, CommitInfo,
-  IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
+  BranchInfo, MrDiff, MrDiscussion, MrDiscussionResolveResult, MrInfo, MrState, MrStatus, CheckInfo, CheckState, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiState,
+  CommentInfo, CommitAuthor, CommitInfo, DiffPosition, DiscussionNote, DraftInlineComment, IssueInfo, Page, RepoInfo, RepoRef, RepoUser, ReviewVerdict, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { forgeKindInfo } from '../settings/contract.ts'
-import { capFailures, errorText, joinRepoPath, nextPage, okBody, pathSegments, titleOf, truncateBytes } from './types.ts'
-import type { ActivityItem, ActivityRequest, Call, ForgeAdapter, MrActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
+import { capFailures, composeReviewBody, errorText, joinRepoPath, nextPage, okBody, pathSegments, titleOf, truncateBytes } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ForgeAdapter, MrActivity, MrReplyOutcome, MrReviewOutcome, MrReviewRequest, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitHub's largest page. */
 const PAGE = 100
@@ -113,6 +113,161 @@ interface GithubComment {
 
 function comment(value: GithubComment): CommentInfo {
   return { id: String(value.id), author: user(value.user), body: value.body ?? '', createdAt: value.created_at, webUrl: value.html_url }
+}
+
+interface GithubGraphqlActor {
+  readonly login: string
+  readonly url?: string | null
+}
+
+interface GithubGraphqlComment {
+  readonly id: string
+  readonly databaseId?: number | null
+  readonly body?: string | null
+  readonly createdAt: string
+  readonly updatedAt?: string | null
+  readonly url?: string | null
+  readonly author?: GithubGraphqlActor | null
+}
+
+interface GithubReviewThread {
+  readonly id: string
+  readonly isResolved: boolean
+  readonly isOutdated?: boolean
+  readonly path: string
+  readonly diffSide?: 'LEFT' | 'RIGHT' | null
+  readonly line?: number | null
+  readonly originalLine?: number | null
+  readonly startLine?: number | null
+  readonly resolvedBy?: GithubGraphqlActor | null
+  readonly comments?: { readonly nodes?: ReadonlyArray<GithubGraphqlComment | null> | null } | null
+}
+
+function graphqlUser(actor: GithubGraphqlActor | null | undefined): RepoUser {
+  if (actor === null || actor === undefined) return { username: 'ghost' }
+  return { username: actor.login, ...actor.url === undefined || actor.url === null || actor.url === '' ? {} : { webUrl: actor.url } }
+}
+
+function graphqlNote(entry: GithubGraphqlComment): DiscussionNote {
+  return {
+    id: String(entry.id),
+    author: graphqlUser(entry.author),
+    body: entry.body ?? '',
+    createdAt: entry.createdAt,
+    ...entry.updatedAt === undefined || entry.updatedAt === null ? {} : { updatedAt: entry.updatedAt },
+    ...entry.url === undefined || entry.url === null || entry.url === '' ? {} : { webUrl: entry.url },
+  }
+}
+
+function reviewThread(node: GithubReviewThread): MrDiscussion {
+  const lineNo = node.line ?? node.originalLine ?? undefined
+  const side = node.diffSide === 'LEFT' ? 'LEFT' : 'RIGHT'
+  const position: DiffPosition = {
+    path: node.path,
+    ...typeof lineNo === 'number' ? (side === 'LEFT' ? { oldLine: lineNo } : { newLine: lineNo }) : {},
+  }
+  const notes = (node.comments?.nodes ?? [])
+    .filter((entry): entry is GithubGraphqlComment => entry !== null && entry !== undefined)
+    .map(graphqlNote)
+  return {
+    id: node.id,
+    inline: true,
+    position,
+    resolvable: true,
+    resolved: node.isResolved,
+    ...node.resolvedBy === null || node.resolvedBy === undefined ? {} : { resolvedBy: graphqlUser(node.resolvedBy) },
+    notes,
+  }
+}
+
+const REVIEW_THREADS_QUERY = `
+  query($owner: String!, $repoName: String!, $pullNumber: Int!, $first: Int!, $after: String) {
+    repository(owner: $owner, name: $repoName) {
+      pullRequest(number: $pullNumber) {
+        reviewThreads(first: $first, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            id
+            isResolved
+            isOutdated
+            path
+            diffSide
+            line
+            originalLine
+            startLine
+            resolvedBy {
+              login
+              url
+            }
+            comments(first: 100) {
+              nodes {
+                id
+                databaseId
+                body
+                createdAt
+                updatedAt
+                url
+                author {
+                  login
+                  url
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`
+
+const REPLY_THREAD_MUTATION = `
+  mutation($threadId: ID!, $commentBody: String!) {
+    addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $commentBody }) {
+      comment {
+        id
+        databaseId
+        body
+        createdAt
+        updatedAt
+        url
+        author {
+          login
+          url
+        }
+      }
+    }
+  }
+`
+
+const RESOLVE_THREAD_MUTATION = `
+  mutation($threadId: ID!) {
+    resolveReviewThread(input: { threadId: $threadId }) {
+      thread {
+        id
+        isResolved
+      }
+    }
+  }
+`
+
+const UNRESOLVE_THREAD_MUTATION = `
+  mutation($threadId: ID!) {
+    unresolveReviewThread(input: { threadId: $threadId }) {
+      thread {
+        id
+        isResolved
+      }
+    }
+  }
+`
+
+function isSelfReviewFailure(error: unknown): boolean {
+  const payload = (error as { response?: { data?: unknown } } | null | undefined)?.response?.data
+  const detail = `${errorText(error)} ${payload === undefined ? '' : JSON.stringify(payload)}`
+  return /own pull request|can\s*not\s+(?:approve|request\s+changes)/i.test(detail)
 }
 
 function overall(checks: readonly CheckInfo[]): CheckState {
@@ -224,6 +379,7 @@ function actionsJob(value: GithubJob): CiJob {
 /** GitHub provider bound to one host. */
 export class GithubProvider implements Provider {
   private readonly octokit: Octokit
+  private readonly graphql: Octokit['graphql']
 
   /**
    * @param baseUrl - REST base URL (`https://api.github.com` or `<url>/api/v3`).
@@ -238,6 +394,9 @@ export class GithubProvider implements Provider {
     this.octokit.hook.before('request', async (options) => {
       options.headers.authorization = `token ${await token()}`
     })
+    // GHES REST uses `<url>/api/v3`, whereas its GraphQL endpoint is `<url>/api/graphql`.
+    const graphqlBase = baseUrl.replace(/\/api\/v3\/?$/, '/api').replace(/\/+$/, '')
+    this.graphql = this.octokit.graphql.defaults({ baseUrl: graphqlBase })
   }
 
   async currentUser(call: Call): Promise<CommitAuthor> {
@@ -245,6 +404,11 @@ export class GithubProvider implements Provider {
     const api = new URL(this.baseUrl)
     const web = api.hostname === 'api.github.com' ? 'github.com' : api.host
     return { name: data.name ?? data.login, email: data.email ?? `${data.id}+${data.login}@users.noreply.${web}` }
+  }
+
+  async botUser(call: Call): Promise<RepoUser> {
+    const { data } = await this.octokit.rest.users.getAuthenticated({ request: { signal: call.signal } })
+    return user(data)
   }
 
   async repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo> {
@@ -414,7 +578,7 @@ export class GithubProvider implements Provider {
     return comment(data)
   }
 
-  async listMrs(ref: RepoRef, query: { page: number; perPage: number; state: MrState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
+  async listMrs(ref: RepoRef, query: { page: number; perPage: number; state: MrState | 'all'; sourceBranch?: string; targetBranch?: string; sort?: 'created' | 'updated'; updatedAfter?: string }, call: Call) {
     const repo = split(ref.path)
     const { data } = await this.octokit.rest.pulls.list({
       ...repo,
@@ -423,10 +587,14 @@ export class GithubProvider implements Provider {
       per_page: query.perPage,
       ...query.sourceBranch === undefined ? {} : { head: `${repo.owner}:${query.sourceBranch}` },
       ...query.targetBranch === undefined ? {} : { base: query.targetBranch },
+      ...query.sort === undefined ? {} : { sort: query.sort, direction: 'desc' as const },
       request: { signal: call.signal },
     })
-    const items = data.map(pull).filter(change => query.state === 'all' || change.state === query.state)
-    return { items, ...nextPage(query, data.length) }
+    const mapped = data.map(pull)
+    const afterMs = query.updatedAfter === undefined ? undefined : Date.parse(query.updatedAfter)
+    const reachedCutoff = afterMs !== undefined && mapped.length > 0 && Date.parse(mapped.at(-1)!.updatedAt) <= afterMs
+    const items = mapped.filter(change => (query.state === 'all' || change.state === query.state) && (afterMs === undefined || Date.parse(change.updatedAt) > afterMs))
+    return { items, ...reachedCutoff ? {} : nextPage(query, data.length) }
   }
 
   async getMr(ref: RepoRef, number: number, call: Call) {
@@ -442,6 +610,62 @@ export class GithubProvider implements Provider {
     const raw: unknown = response.data
     const { text, truncated } = truncateBytes(typeof raw === 'string' ? raw : '', call.limits.maxDiffBytes)
     return { diff: text, truncated }
+  }
+
+  async mrCompare(ref: RepoRef, baseSha: string, headSha: string, call: Call): Promise<MrDiff> {
+    const response = await this.octokit.rest.repos.compareCommitsWithBasehead({
+      ...split(ref.path),
+      basehead: `${baseSha}...${headSha}`,
+      mediaType: { format: 'diff' },
+      request: { signal: call.signal },
+    })
+    const raw: unknown = response.data
+    const { text, truncated } = truncateBytes(typeof raw === 'string' ? raw : '', call.limits.maxDiffBytes)
+    return { diff: text, truncated }
+  }
+
+  async mrDiscussions(ref: RepoRef, number: number, query: Paging & { readonly onlyUnresolved?: boolean }, call: Call): Promise<Page<MrDiscussion>> {
+    const { owner, repo: repoName } = split(ref.path)
+    const fetchThreads = async (first: number, after: string | null) => {
+      const data = await this.graphql<{
+        repository?: {
+          pullRequest?: {
+            reviewThreads?: {
+              pageInfo: { hasNextPage: boolean; endCursor?: string | null }
+              nodes?: ReadonlyArray<GithubReviewThread | null> | null
+            } | null
+          } | null
+        } | null
+      }>(REVIEW_THREADS_QUERY, { owner, repoName, pullNumber: number, first, after, request: { signal: call.signal } })
+      const pr = data.repository?.pullRequest
+      if (pr === null || pr === undefined) throw new RepoError('not-found', `PR #${number} 不存在或令牌无权查看`)
+      const threads = pr.reviewThreads ?? { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+      const mapped = (threads.nodes ?? []).filter((entry): entry is GithubReviewThread => entry !== null && entry !== undefined).map(reviewThread)
+      return { mapped, pageInfo: threads.pageInfo }
+    }
+
+    if (query.page === 1 && query.onlyUnresolved !== true) {
+      const { mapped, pageInfo } = await fetchThreads(query.perPage, null)
+      return { items: mapped, ...pageInfo.hasNextPage ? { nextPage: 2 } : {} }
+    }
+
+    const needed = query.page * query.perPage + 1
+    const matched: MrDiscussion[] = []
+    let after: string | null = null
+    for (let step = 1; step <= MAX_STATUS_PAGES; step += 1) {
+      const { mapped, pageInfo }: Awaited<ReturnType<typeof fetchThreads>> = await fetchThreads(PAGE, after)
+      for (const item of mapped) {
+        if (query.onlyUnresolved !== true || (item.resolvable && !item.resolved)) matched.push(item)
+      }
+      if (matched.length >= needed || !pageInfo.hasNextPage) {
+        const start = (query.page - 1) * query.perPage
+        const items = matched.slice(start, start + query.perPage)
+        const hasMore = matched.length > start + query.perPage || pageInfo.hasNextPage
+        return { items, ...hasMore ? { nextPage: query.page + 1 } : {} }
+      }
+      after = pageInfo.endCursor ?? null
+    }
+    throw new RepoError('too-large', `PR #${number} 的讨论线程超过 ${MAX_STATUS_PAGES * PAGE} 条，无法完成筛选或分页`)
   }
 
   async mrStatus(ref: RepoRef, number: number, call: Call) {
@@ -547,6 +771,122 @@ export class GithubProvider implements Provider {
 
   async commentMr(ref: RepoRef, number: number, body: string, call: Call) {
     return await this.commentIssue(ref, number, body, call)
+  }
+
+  async mrReview(ref: RepoRef, number: number, request: MrReviewRequest, call: Call): Promise<MrReviewOutcome> {
+    const repo = split(ref.path)
+    const { data: pr } = await this.octokit.rest.pulls.get({ ...repo, pull_number: number, request: { signal: call.signal } })
+    if (pr.head.sha.toLowerCase() !== request.headSha.toLowerCase()) {
+      throw new RepoError('conflict', `PR #${number} 的最新提交已变为 ${pr.head.sha.slice(0, 12)}（评审基于 ${request.headSha.slice(0, 12)}）`)
+    }
+    let verdict: ReviewVerdict = request.verdict
+    let downgraded = false
+    if (verdict !== 'comment' && request.botUsername !== undefined && pr.user?.login !== undefined && pr.user.login.toLowerCase() === request.botUsername.toLowerCase()) {
+      verdict = 'comment'
+      downgraded = true
+    }
+
+    const submit = async (currentVerdict: ReviewVerdict, inline: readonly DraftInlineComment[], fallbacks: readonly DraftInlineComment[], ensureBody: boolean) => {
+      const event = currentVerdict === 'approve' ? 'APPROVE' as const : currentVerdict === 'request-changes' ? 'REQUEST_CHANGES' as const : 'COMMENT' as const
+      let body = composeReviewBody(request.body, fallbacks, request.signature)
+      if (body === undefined && (ensureBody || currentVerdict === 'request-changes')) {
+        body = composeReviewBody(currentVerdict === 'request-changes' ? '请求修改' : '（自审自动降级为评论）', [], request.signature)
+      }
+      const comments = inline.map(item => item.newLine !== undefined
+        ? { path: item.path, line: item.newLine, side: 'RIGHT' as const, body: item.body }
+        : { path: item.path, line: item.oldLine!, side: 'LEFT' as const, body: item.body })
+      return await this.octokit.rest.pulls.createReview({
+        ...repo,
+        pull_number: number,
+        commit_id: request.headSha,
+        event,
+        ...body === undefined ? {} : { body },
+        ...comments.length === 0 ? {} : { comments },
+        request: { signal: call.signal },
+      })
+    }
+
+    const buildOutcome = async (res: { readonly data: { readonly id: number; readonly html_url?: string } }, postedComments: number, fallbackInlineCount: number): Promise<MrReviewOutcome> => {
+      const ownCommentIds = [`review-${res.data.id}`]
+      if (postedComments > 0 && typeof this.octokit.rest.pulls.listCommentsForReview === 'function') {
+        try {
+          const { data: reviewComments } = await this.octokit.rest.pulls.listCommentsForReview({
+            ...repo,
+            pull_number: number,
+            review_id: res.data.id,
+            per_page: PAGE,
+            request: { signal: call.signal },
+          })
+          for (const entry of reviewComments) {
+            if (typeof entry.id === 'number') ownCommentIds.push(`line-${entry.id}`)
+          }
+        } catch {
+          // Best-effort suppression hint for mrWatch; review submission itself already succeeded.
+        }
+      }
+      return {
+        verdict,
+        ...downgraded ? { downgradedVerdict: true } : {},
+        postedComments,
+        fallbackInlineCount,
+        ...res.data.html_url === undefined || res.data.html_url === '' ? {} : { webUrl: res.data.html_url },
+        ownCommentIds,
+      }
+    }
+
+    try {
+      const res = await submit(verdict, request.comments, [], downgraded && request.comments.length === 0)
+      return await buildOutcome(res, request.comments.length, 0)
+    } catch (firstError) {
+      let currentError: unknown = firstError
+      const firstStatus = (currentError as { status?: unknown } | null | undefined)?.status
+      if (verdict !== 'comment' && (firstStatus === 422 || firstStatus === 400) && isSelfReviewFailure(currentError)) {
+        verdict = 'comment'
+        downgraded = true
+        try {
+          const res = await submit('comment', request.comments, [], request.comments.length === 0)
+          return await buildOutcome(res, request.comments.length, 0)
+        } catch (secondError) {
+          currentError = secondError
+        }
+      }
+      const status = (currentError as { status?: unknown } | null | undefined)?.status
+      if ((status === 422 || status === 400) && request.comments.length > 0) {
+        const res = await submit(verdict, [], request.comments, false)
+        return await buildOutcome(res, 0, request.comments.length)
+      }
+      throw currentError
+    }
+  }
+
+  async mrDiscussionReply(_ref: RepoRef, _number: number, discussionId: string, body: string, call: Call): Promise<MrReplyOutcome> {
+    const data = await this.graphql<{
+      addPullRequestReviewThreadReply?: { comment?: GithubGraphqlComment | null } | null
+    }>(REPLY_THREAD_MUTATION, { threadId: discussionId, commentBody: body, request: { signal: call.signal } })
+    const created = data.addPullRequestReviewThreadReply?.comment
+    if (created === null || created === undefined) throw new RepoError('unavailable', 'GitHub 未返回创建的线程回复')
+    const mapped = graphqlNote(created)
+    return {
+      note: mapped,
+      ownCommentIds: [mapped.id, ...typeof created.databaseId === 'number' ? [`line-${created.databaseId}`] : []],
+    }
+  }
+
+  async mrDiscussionResolve(_ref: RepoRef, _number: number, discussionId: string, resolved: boolean, call: Call): Promise<MrDiscussionResolveResult> {
+    if (resolved) {
+      const data = await this.graphql<{ resolveReviewThread?: { thread?: { id: string; isResolved: boolean } | null } | null }>(
+        RESOLVE_THREAD_MUTATION,
+        { threadId: discussionId, request: { signal: call.signal } },
+      )
+      const thread = data.resolveReviewThread?.thread
+      return { discussionId: thread?.id ?? discussionId, resolved: thread?.isResolved ?? true }
+    }
+    const data = await this.graphql<{ unresolveReviewThread?: { thread?: { id: string; isResolved: boolean } | null } | null }>(
+      UNRESOLVE_THREAD_MUTATION,
+      { threadId: discussionId, request: { signal: call.signal } },
+    )
+    const thread = data.unresolveReviewThread?.thread
+    return { discussionId: thread?.id ?? discussionId, resolved: thread?.isResolved ?? false }
   }
 
   async mergeMr(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase'; deleteSourceBranch: boolean }, call: Call) {

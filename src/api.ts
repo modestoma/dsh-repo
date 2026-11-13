@@ -1,5 +1,5 @@
 /**
- * The `dshRepos` service object (contract version 6). Each method with a tool
+ * The `dshRepos` service object (contract version 8). Each method with a tool
  * runs that tool's operation through the shared pipeline
  * (`dsh-repo/operations`); the remaining methods serve plugins and the
  * settings page and delegate to the engine.
@@ -9,9 +9,10 @@
 
 import type {
   BranchDeleteParams, BranchGetParams, BranchInfo, BranchListParams, CallerAgent, CallOptions, CatalogRepo, CiActionParams, CiActionResult, CiGetParams, CiJobLog, CiListParams, CiLogParams,
-  CiRun, CiRunDetail, CommentInfo, CommentParams, CommitInfo, CommitListParams, DshRepoService, FileContent, FileReadParams, HostCreate, HostInfo, HostsChange, IssueCreateParams, IssueDetail,
-  IssueInfo, IssueListParams, IssueUpdateParams, MergedBranchDeletion, MergeResult, MrCreateParams, MrDetail, MrDiff, MrInfo, MrListParams, MrMergeParams, MrStatus, MrUpdateParams, MrWatchParams,
-  MrWatchResult, NumberParams, Page, RepoFeature, RepoInfo, RepoListParams, RepoParams, RepoPublicSettings, RepoRef, RepoSettingsUpdate, RepoTarget, SnapshotAcquireParams,
+  CiRun, CiRunDetail, CommentInfo, CommentParams, CommitInfo, CommitListParams, DiscussionNote, DshRepoService, FileContent, FileReadParams, HostCreate, HostInfo, HostsChange, IssueCreateParams,
+  IssueDetail, IssueInfo, IssueListParams, IssueUpdateParams, MergedBranchDeletion, MergeResult, MrCompareParams, MrCreateParams, MrDetail, MrDiff, MrDiscussion, MrDiscussionReplyParams,
+  MrDiscussionResolveParams, MrDiscussionResolveResult, MrDiscussionsParams, MrInfo, MrListParams, MrMergeParams, MrReviewParams, MrReviewResult, MrStatus, MrUpdateParams, MrWatchParams,
+  MrWatchResult, NumberParams, Page, RepoFeature, RepoInfo, RepoListParams, RepoParams, RepoPublicSettings, RepoRef, RepoSettingsUpdate, RepoTarget, RepoUser, SnapshotAcquireParams,
   SnapshotLease, TreeListing, TreeListParams, WatchState, WorkspaceCreateParams, WorkspaceInfo, WorkspaceListParams, WorkspacePathParams, WorkspacePushParams, WorkspacePushResult,
   WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceStatus, WriteOptions,
 } from './contract.ts'
@@ -32,7 +33,7 @@ const NEVER = new AbortController().signal
 
 /** The `dshRepos` service. */
 export class DshReposApi implements DshRepoService {
-  readonly version = 7 as const
+  readonly version = 8 as const
   private readonly service: RepoService
 
   /** @param deps - operation collaborators and proxy control. */
@@ -56,10 +57,15 @@ export class DshReposApi implements DshRepoService {
   mrList(params: MrListParams & CallOptions): Promise<Page<MrInfo>> { return this.call('mrList', params) }
   mrGet(params: NumberParams & CallOptions): Promise<MrDetail> { return this.call('mrGet', params) }
   mrDiff(params: NumberParams & CallOptions): Promise<MrDiff> { return this.call('mrDiff', params) }
+  mrCompare(params: MrCompareParams & CallOptions): Promise<MrDiff> { return this.call('mrCompare', params) }
+  mrDiscussions(params: MrDiscussionsParams & CallOptions): Promise<Page<MrDiscussion>> { return this.call('mrDiscussions', params) }
   mrStatus(params: NumberParams & CallOptions): Promise<MrStatus> { return this.call('mrStatus', params) }
   mrCreate(params: MrCreateParams & WriteOptions): Promise<MrInfo & WatchState> { return this.call('mrCreate', params) }
   mrUpdate(params: MrUpdateParams & WriteOptions): Promise<MrInfo & Partial<WatchState>> { return this.call('mrUpdate', params) }
   mrComment(params: CommentParams & WriteOptions): Promise<CommentInfo> { return this.call('mrComment', params) }
+  mrReview(params: MrReviewParams & WriteOptions): Promise<MrReviewResult> { return this.call('mrReview', params) }
+  mrDiscussionReply(params: MrDiscussionReplyParams & WriteOptions): Promise<DiscussionNote> { return this.call('mrDiscussionReply', params) }
+  mrDiscussionResolve(params: MrDiscussionResolveParams & WriteOptions): Promise<MrDiscussionResolveResult> { return this.call('mrDiscussionResolve', params) }
   mrMerge(params: MrMergeParams & WriteOptions): Promise<MergeResult> { return this.call('mrMerge', params) }
   mrWatch(params: MrWatchParams & CallOptions & { readonly agent: CallerAgent }): Promise<MrWatchResult> { return this.call('mrWatch', params) }
   ciList(params: CiListParams & CallOptions): Promise<Page<CiRun>> { return this.call('ciList', params) }
@@ -76,6 +82,16 @@ export class DshReposApi implements DshRepoService {
 
   repoResolve(repo: RepoTarget): RepoRef {
     return this.service.forge.resolve(repo)
+  }
+
+  async currentBotUser(params: RepoParams & CallOptions): Promise<RepoUser> {
+    const repo = (params as { repo?: unknown } | undefined)?.repo
+    if (typeof repo !== 'string' || repo.trim() === '') throw new RepoError('invalid', 'currentBotUser 参数不合法：repo 不能为空')
+    try {
+      return await this.service.forge.currentBotUser(repo, { ...params.signal === undefined ? {} : { signal: params.signal } })
+    } catch (error) {
+      throw error instanceof RepoError ? error : toRepoError(error, 'currentBotUser')
+    }
   }
 
   repoOnChange(listener: () => void): () => void {

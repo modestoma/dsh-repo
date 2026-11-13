@@ -461,7 +461,7 @@ export class MirrorStore {
   }
 
   private git(args: readonly string[], cwd: string | undefined, env: Readonly<Record<string, string>>, signal?: AbortSignal): Promise<string> {
-    return this.deps.git(args, { ...cwd === undefined ? {} : { cwd }, timeoutMs: this.deps.limits().timeoutMs, env, ...signal === undefined ? {} : { signal } })
+    return this.deps.git(cwd === undefined ? args : [`--git-dir=${cwd}`, ...args], { ...cwd === undefined ? {} : { cwd }, timeoutMs: this.deps.limits().timeoutMs, env, ...signal === undefined ? {} : { signal } })
   }
 
   private async branchHead(dir: string, branch: string, signal?: AbortSignal): Promise<{ commit: string; commitTime: string } | undefined> {

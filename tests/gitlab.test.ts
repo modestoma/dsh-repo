@@ -326,4 +326,303 @@ describe('GitLab CI', () => {
     expect(await service.forge.cancelCi(REPO, { jobId: 2 })).toMatchObject({ jobId: 2, state: 'canceled' })
     expect(requests.map(request => request.url.pathname.split('/').slice(-3).join('/'))).toEqual(['pipelines/42/retry', 'pipelines/42/cancel', 'jobs/2/retry', 'jobs/2/cancel'])
   })
+
+  it('sorts merge requests by updated_at and cuts pagination early when updatedAfter is reached', async () => {
+    let rows = [
+      mr({ iid: 9, updated_at: '2026-11-13T12:00:00Z' }),
+      mr({ iid: 8, updated_at: '2026-11-13T10:00:00Z' }),
+    ]
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/merge_requests`, reply: () => ({ body: rows }) },
+    ])
+    const service = createService(testConfig(), TOKENS)
+
+    const cut = await service.forge.listMrs(REPO, { updatedAfter: '2026-11-13T10:00:00Z', perPage: 2 })
+    expect(cut.items.map(item => item.number)).toEqual([9])
+    expect(cut.nextPage).toBeUndefined()
+    expect(Object.fromEntries(requests[0]!.url.searchParams)).toMatchObject({ order_by: 'updated_at', sort: 'desc', per_page: '2' })
+
+    rows = [
+      mr({ iid: 10, updated_at: '2026-11-13T14:00:00Z' }),
+      mr({ iid: 9, updated_at: '2026-11-13T12:00:00Z' }),
+    ]
+    const more = await service.forge.listMrs(REPO, { sort: 'created', updatedAfter: '2026-11-13T10:00:00Z', perPage: 2 })
+    expect(more.items.map(item => item.number)).toEqual([10, 9])
+    expect(more.nextPage).toBe(2)
+    expect(Object.fromEntries(requests[1]!.url.searchParams)).toMatchObject({ order_by: 'created_at', sort: 'desc' })
+  })
+
+  it('compares commits and respects maxDiffBytes and compare_timeout truncation', async () => {
+    const base = '1'.repeat(40)
+    const head = '2'.repeat(40)
+    let timeout = false
+    const { requests } = fakeHttp([
+      {
+        method: 'GET',
+        path: `${API}/repository/compare`,
+        reply: () => ({
+          body: {
+            diffs: [{ old_path: 'src/a.ts', new_path: 'src/a.ts', new_file: false, deleted_file: false, diff: '@@ -1 +1 @@\n-old\n+new\n' }],
+            compare_timeout: timeout,
+          },
+        }),
+      },
+    ])
+    const service = createService(testConfig(), TOKENS)
+    const full = await service.forge.mrCompare(REPO, base, head)
+    expect(full.truncated).toBe(false)
+    expect(full.diff).toContain('--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new')
+    expect(Object.fromEntries(requests[0]!.url.searchParams)).toMatchObject({ from: base, to: head })
+
+    timeout = true
+    expect((await service.forge.mrCompare(REPO, base, head)).truncated).toBe(true)
+
+    const capped = createService(testConfig(), TOKENS, testSettings({ limits: { maxDiffBytes: 12 } }))
+    expect(await capped.forge.mrCompare(REPO, base, head)).toEqual({ diff: 'diff --git a', truncated: true })
+  })
+
+  it('lists MR discussions without system notes, maps positions and resolvedBy, and filters onlyUnresolved', async () => {
+    fakeHttp([
+      {
+        method: 'GET',
+        path: `${API}/merge_requests/7/discussions`,
+        reply: {
+          body: [
+            {
+              id: 'sys-only',
+              individual_note: true,
+              notes: [{ id: 1, body: 'assigned to @dev', author, created_at: '2026-11-13T09:00:00Z', system: true }],
+            },
+            {
+              id: 'disc-inline-open',
+              individual_note: false,
+              notes: [
+                {
+                  id: 11,
+                  body: 'Guard empty slice',
+                  author,
+                  created_at: '2026-11-13T10:00:00Z',
+                  updated_at: '2026-11-13T10:01:00Z',
+                  system: false,
+                  resolvable: true,
+                  resolved: false,
+                  position: { position_type: 'text', new_path: 'src/order.ts', old_path: 'src/order.ts', new_line: 42, old_line: null },
+                },
+                {
+                  id: 12,
+                  body: 'resolved all threads',
+                  author,
+                  created_at: '2026-11-13T10:02:00Z',
+                  system: true,
+                },
+              ],
+            },
+            {
+              id: 'disc-inline-resolved',
+              individual_note: false,
+              notes: [
+                {
+                  id: 21,
+                  body: 'Nit: typo',
+                  author,
+                  created_at: '2026-11-13T08:00:00Z',
+                  system: false,
+                  resolvable: true,
+                  resolved: true,
+                  resolved_by: { username: 'maintainer', web_url: 'https://code.example.com/gitlab/maintainer' },
+                  position: { position_type: 'text', new_path: 'src/old.ts', old_path: 'src/old.ts', new_line: null, old_line: 9 },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    ])
+    const service = createService(testConfig(), TOKENS)
+
+    const all = await service.forge.mrDiscussions(REPO, 7)
+    expect(all.items).toEqual([
+      {
+        id: 'disc-inline-open',
+        inline: true,
+        position: { path: 'src/order.ts', newLine: 42 },
+        resolvable: true,
+        resolved: false,
+        notes: [{
+          id: '11',
+          author: { username: 'dev', webUrl: 'https://code.example.com/gitlab/dev' },
+          body: 'Guard empty slice',
+          createdAt: '2026-11-13T10:00:00Z',
+          updatedAt: '2026-11-13T10:01:00Z',
+          webUrl: `${REPO}/-/merge_requests/7#note_11`,
+        }],
+      },
+      {
+        id: 'disc-inline-resolved',
+        inline: true,
+        position: { path: 'src/old.ts', oldLine: 9 },
+        resolvable: true,
+        resolved: true,
+        resolvedBy: { username: 'maintainer', webUrl: 'https://code.example.com/gitlab/maintainer' },
+        notes: [{
+          id: '21',
+          author: { username: 'dev', webUrl: 'https://code.example.com/gitlab/dev' },
+          body: 'Nit: typo',
+          createdAt: '2026-11-13T08:00:00Z',
+          webUrl: `${REPO}/-/merge_requests/7#note_21`,
+        }],
+      },
+    ])
+
+    const unresolved = await service.forge.mrDiscussions(REPO, 7, { onlyUnresolved: true })
+    expect(unresolved.items.map(item => item.id)).toEqual(['disc-inline-open'])
+  })
+
+  it('submits GitLab MR reviews with diff_refs positions, detects headSha drift, downgrades self-reviews, and folds out-of-hunk lines into summary note', async () => {
+    const baseSha = '1'.repeat(40)
+    const startSha = '2'.repeat(40)
+    let mrAuthor = 'contributor'
+    let approveStatus = 201
+    let discussionCall = 0
+    const { requests } = fakeHttp([
+      {
+        method: 'GET',
+        path: '/gitlab/api/v4/user',
+        reply: { body: { id: 99, username: 'gl-bot', name: 'Bot', web_url: 'https://code.example.com/gitlab/gl-bot' } },
+      },
+      {
+        method: 'GET',
+        path: `${API}/merge_requests/7`,
+        reply: () => ({
+          body: mr({
+            author: { username: mrAuthor, web_url: `https://code.example.com/gitlab/${mrAuthor}` },
+            diff_refs: { base_sha: baseSha, start_sha: startSha, head_sha: SHA },
+          }),
+        }),
+      },
+      {
+        method: 'POST',
+        path: `${API}/merge_requests/7/discussions`,
+        reply: (req) => {
+          discussionCall += 1
+          if (String(req.body).includes('999')) {
+            return { status: 400, body: { message: '400 Bad request - Note {:line_code=>["can\'t be blank"]}' } }
+          }
+          return { status: 201, body: { id: `d-${discussionCall}`, notes: [{ id: 300 + discussionCall, body: 'inline', author, created_at: 'c' }] } }
+        },
+      },
+      {
+        method: 'POST',
+        path: `${API}/merge_requests/7/approve`,
+        reply: () => approveStatus === 201
+          ? { status: 201, body: { id: 7 } }
+          : { status: approveStatus, body: { message: 'Author cannot approve merge request' } },
+      },
+      {
+        method: 'POST',
+        path: `${API}/merge_requests/7/notes`,
+        reply: { status: 201, body: { id: 501, body: 'summary', author, created_at: 'c' } },
+      },
+    ])
+    const service = createService(testConfig(), TOKENS)
+
+    // 1. Head SHA drift -> conflict.
+    await expect(service.forge.reviewMr(REPO, 7, {
+      headSha: 'c'.repeat(40),
+      verdict: 'approve',
+      body: 'LGTM',
+    })).rejects.toMatchObject({ code: 'conflict' })
+
+    // 2. Partial out-of-hunk fallback: 1 anchored inline comment + 1 out-of-hunk comment folded into summary note + approve.
+    const partial = await service.forge.reviewMr(REPO, 7, {
+      headSha: SHA,
+      verdict: 'approve',
+      body: 'Looks good overall',
+      comments: [
+        { path: 'src/order.ts', newLine: 18, body: 'Nice cleanup' },
+        { path: 'src/order.ts', newLine: 999, body: 'Outside hunk remark' },
+      ],
+      signature: '_— gl-bot_',
+    })
+    expect(partial).toEqual({
+      verdict: 'approve',
+      postedComments: 1,
+      fallbackInlineCount: 1,
+      webUrl: `${REPO}/-/merge_requests/7#note_501`,
+      ownCommentIds: ['301', '501'],
+    })
+    const multipart = String(requests.find(req => req.url.pathname.endsWith('/discussions'))?.body)
+    expect(multipart).toContain('position[position_type]')
+    expect(multipart).toContain(baseSha)
+    expect(multipart).toContain(startSha)
+    expect(multipart).toContain(SHA)
+    expect(multipart).toContain('src/order.ts')
+    const noteCall = requests.find(req => req.url.pathname.endsWith('/merge_requests/7/notes'))
+    expect(noteCall?.body).toEqual({
+      body: 'Looks good overall\n\n> **`src/order.ts:999`**\n> Outside hunk remark\n\n_— gl-bot_',
+    })
+
+    // 3. Proactive self-review downgrade when MR author matches gl-bot.
+    mrAuthor = 'gl-bot'
+    const selfProactive = await service.forge.reviewMr(REPO, 7, {
+      headSha: SHA,
+      verdict: 'request-changes',
+      body: 'Self review findings',
+    })
+    expect(selfProactive).toMatchObject({ verdict: 'comment', downgradedVerdict: true, postedComments: 0, fallbackInlineCount: 0 })
+
+    // 4. Reactive self-review downgrade when GitLab /approve returns 422.
+    mrAuthor = 'alias-account'
+    approveStatus = 422
+    const selfReactive = await service.forge.reviewMr(REPO, 7, {
+      headSha: SHA,
+      verdict: 'approve',
+      signature: '_— gl-bot_',
+    })
+    expect(selfReactive).toMatchObject({ verdict: 'comment', downgradedVerdict: true })
+  })
+
+  it('replies to and resolves/reopens GitLab discussion threads, and reads currentBotUser', async () => {
+    const { requests } = fakeHttp([
+      {
+        method: 'GET',
+        path: '/gitlab/api/v4/user',
+        reply: { body: { id: 99, username: 'gl-bot', name: 'Bot', web_url: 'https://code.example.com/gitlab/gl-bot' } },
+      },
+      {
+        method: 'POST',
+        path: `${API}/merge_requests/7/discussions/disc-1/notes`,
+        reply: { status: 201, body: { id: 88, body: 'Fixed!', author: { username: 'gl-bot', web_url: 'https://code.example.com/gitlab/gl-bot' }, created_at: '2026-11-13T12:00:00Z' } },
+      },
+      {
+        method: 'PUT',
+        path: `${API}/merge_requests/7/discussions/disc-1`,
+        reply: req => ({
+          body: {
+            id: 'disc-1',
+            notes: [{ id: 88, body: 'Fixed!', author, created_at: 'c', resolvable: true, resolved: req.url.searchParams.get('resolved') === 'true' }],
+          },
+        }),
+      },
+    ])
+    const service = createService(testConfig(), TOKENS)
+
+    expect(await service.forge.currentBotUser(REPO)).toEqual({ username: 'gl-bot', webUrl: 'https://code.example.com/gitlab/gl-bot' })
+
+    const reply = await service.forge.replyMrDiscussion(REPO, 7, 'disc-1', 'Fixed!')
+    expect(reply).toEqual({
+      note: {
+        id: '88',
+        author: { username: 'gl-bot', webUrl: 'https://code.example.com/gitlab/gl-bot' },
+        body: 'Fixed!',
+        createdAt: '2026-11-13T12:00:00Z',
+        webUrl: `${REPO}/-/merge_requests/7#note_88`,
+      },
+      ownCommentIds: ['88'],
+    })
+    expect(requests.find(req => req.method === 'POST')?.body).toEqual({ body: 'Fixed!' })
+
+    expect(await service.forge.resolveMrDiscussion(REPO, 7, 'disc-1', true)).toEqual({ discussionId: 'disc-1', resolved: true })
+    expect(await service.forge.resolveMrDiscussion(REPO, 7, 'disc-1', false)).toEqual({ discussionId: 'disc-1', resolved: false })
+  })
 })
