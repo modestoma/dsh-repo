@@ -398,13 +398,13 @@ describe('GitHub Actions CI', () => {
     expect(cut.nextPage).toBeUndefined()
     expect(Object.fromEntries(requests[0]!.url.searchParams)).toMatchObject({ sort: 'updated', direction: 'desc', per_page: '2' })
 
-    // Tail item strictly after updatedAfter -> full page keeps nextPage.
+    // When sort === 'created', an older updatedAt on the last item must NOT cut off nextPage!
     rows = [
       pullItem(4, '2026-11-13T13:00:00Z'),
-      pullItem(3, '2026-11-13T12:00:00Z'),
+      pullItem(2, '2026-11-13T08:00:00Z'),
     ]
     const more = await service.forge.listMrs(REPO, { sort: 'created', updatedAfter: '2026-11-13T10:00:00Z', perPage: 2 })
-    expect(more.items.map(item => item.number)).toEqual([4, 3])
+    expect(more.items.map(item => item.number)).toEqual([4])
     expect(more.nextPage).toBe(2)
     expect(Object.fromEntries(requests[1]!.url.searchParams)).toMatchObject({ sort: 'created', direction: 'desc' })
 
@@ -511,6 +511,54 @@ describe('GitHub Actions CI', () => {
     expect(requests.at(-1)?.url.href).toBe('https://ghe.example.com/api/graphql')
     expect(requests.at(-1)?.headers.get('authorization')).toBe('token ghe-token')
     expect(unresolved.items.map(item => item.id)).toEqual(['PRRT_2'])
+
+    // Intra-thread comment pagination when a review thread has >100 comments.
+    graphqlReply = () => {
+      const lastQuery = String((requests.at(-1)?.body as { query?: string } | undefined)?.query ?? '')
+      if (lastQuery.includes('node(id: $threadId)')) {
+        return {
+          body: {
+            data: {
+              node: {
+                comments: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [{
+                    id: 'PRRT_2_c2',
+                    databaseId: 102,
+                    body: 'Second page comment',
+                    createdAt: '2026-11-13T10:10:00Z',
+                    url: `${REPO}/pull/5#discussion_r102`,
+                    author: { login: 'bob', url: 'https://github.com/bob' },
+                  }],
+                },
+              },
+            },
+          },
+        }
+      }
+      return {
+        body: {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [{
+                    ...threadNode('PRRT_2', false, 'RIGHT', 20, 20),
+                    comments: {
+                      pageInfo: { hasNextPage: true, endCursor: 'cursor-100' },
+                      nodes: threadNode('PRRT_2', false, 'RIGHT', 20, 20).comments.nodes,
+                    },
+                  }],
+                },
+              },
+            },
+          },
+        },
+      }
+    }
+    const paginatedNotes = await service.forge.mrDiscussions(REPO, 5)
+    expect(paginatedNotes.items[0]?.notes.map(n => n.id)).toEqual(['PRRT_2_c1', 'PRRT_2_c2'])
 
     // GraphQL error classification: FORBIDDEN, RATE_LIMITED, NOT_FOUND, UNAUTHENTICATED, UNPROCESSABLE.
     for (const [type, code] of [
@@ -640,7 +688,11 @@ describe('GitHub Actions CI', () => {
     })
   })
 
-  it('replies to and resolves/reopens review threads via GraphQL, and reads currentBotUser', async () => {
+  it('replies to and resolves/reopens review threads via GraphQL after verifying thread ownership, and reads currentBotUser', async () => {
+    let threadOwner = 'modestoma'
+    let threadRepo = 'dsh-repo'
+    let threadPr = 5
+    let threadExists = true
     const { requests } = fakeHttp([
       { method: 'GET', path: '/user', reply: { body: { id: 9, login: 'dsh-bot', html_url: 'https://github.com/dsh-bot' } } },
       {
@@ -648,6 +700,23 @@ describe('GitHub Actions CI', () => {
         path: '/graphql',
         reply: (req) => {
           const { query } = req.body as { query: string; variables: Record<string, unknown> }
+          if (query.includes('__typename')) {
+            if (!threadExists) return { body: { data: { node: null } } }
+            return {
+              body: {
+                data: {
+                  node: {
+                    __typename: 'PullRequestReviewThread',
+                    id: 'PRRT_1',
+                    pullRequest: {
+                      number: threadPr,
+                      repository: { owner: { login: threadOwner }, name: threadRepo },
+                    },
+                  },
+                },
+              },
+            }
+          }
           if (query.includes('addPullRequestReviewThreadReply')) {
             return {
               body: {
@@ -691,6 +760,19 @@ describe('GitHub Actions CI', () => {
 
     expect(await service.forge.resolveMrDiscussion(REPO, 5, 'PRRT_1', true)).toEqual({ discussionId: 'PRRT_1', resolved: true })
     expect(await service.forge.resolveMrDiscussion(REPO, 5, 'PRRT_1', false)).toEqual({ discussionId: 'PRRT_1', resolved: false })
-    expect(requests.filter(req => req.url.pathname === '/graphql')).toHaveLength(3)
+    expect(requests.filter(req => req.url.pathname === '/graphql')).toHaveLength(6)
+
+    // Cross-PR / cross-repo thread ID is rejected before any mutation executes!
+    threadRepo = 'other-repo'
+    await expect(service.forge.replyMrDiscussion(REPO, 5, 'PRRT_FOREIGN', 'Hijack')).rejects.toMatchObject({ code: 'forbidden' })
+    await expect(service.forge.resolveMrDiscussion(REPO, 5, 'PRRT_FOREIGN', true)).rejects.toMatchObject({ code: 'forbidden' })
+    expect(requests.filter(req => req.url.pathname === '/graphql')).toHaveLength(8)
+
+    threadRepo = 'dsh-repo'
+    threadPr = 99
+    await expect(service.forge.resolveMrDiscussion(REPO, 5, 'PRRT_OTHER_PR', true)).rejects.toMatchObject({ code: 'forbidden' })
+
+    threadExists = false
+    await expect(service.forge.replyMrDiscussion(REPO, 5, 'PRRT_MISSING', 'Missing')).rejects.toMatchObject({ code: 'not-found' })
   })
 })

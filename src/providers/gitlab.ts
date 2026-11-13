@@ -603,7 +603,7 @@ export class GitlabProvider implements Provider {
       ...query.updatedAfter === undefined ? {} : { updatedAfter: query.updatedAfter },
     })
     const afterMs = query.updatedAfter === undefined ? undefined : Date.parse(query.updatedAfter)
-    const reachedCutoff = afterMs !== undefined && data.length > 0 && Date.parse(data.at(-1)!.updated_at) <= afterMs
+    const reachedCutoff = query.sort === 'updated' && afterMs !== undefined && data.length > 0 && Date.parse(data.at(-1)!.updated_at) <= afterMs
     // A source branch names a branch of this project, as GitHub's `head=owner:branch` does; MRs from forks with the same branch name are left out.
     const visible = query.sourceBranch === undefined ? data : data.filter(entry => !fromFork(entry))
     const items = visible.map(entry => mergeRequest(entry)).filter(change => afterMs === undefined || Date.parse(change.updatedAt) > afterMs)
@@ -821,6 +821,7 @@ export class GitlabProvider implements Provider {
   }
 
   async mrDiscussionReply(ref: RepoRef, number: number, discussionId: string, body: string, call: Call): Promise<MrReplyOutcome> {
+    if (!/^[A-Za-z0-9_-]+$/.test(discussionId)) throw new RepoError('invalid', `discussionId 不合法：${discussionId}`)
     call.signal.throwIfAborted()
     const created = await this.api.MergeRequestDiscussions.addNote(ref.path, number, discussionId, body)
     const mapped = discussionNote(created, ref.webUrl, number)
@@ -828,6 +829,7 @@ export class GitlabProvider implements Provider {
   }
 
   async mrDiscussionResolve(ref: RepoRef, number: number, discussionId: string, resolved: boolean, call: Call): Promise<MrDiscussionResolveResult> {
+    if (!/^[A-Za-z0-9_-]+$/.test(discussionId)) throw new RepoError('invalid', `discussionId 不合法：${discussionId}`)
     call.signal.throwIfAborted()
     const updated = await this.api.MergeRequestDiscussions.resolve(ref.path, number, discussionId, resolved)
     const userNotes = (updated.notes ?? []).filter(entry => entry.system !== true)

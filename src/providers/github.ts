@@ -140,7 +140,10 @@ interface GithubReviewThread {
   readonly originalLine?: number | null
   readonly startLine?: number | null
   readonly resolvedBy?: GithubGraphqlActor | null
-  readonly comments?: { readonly nodes?: ReadonlyArray<GithubGraphqlComment | null> | null } | null
+  readonly comments?: {
+    readonly pageInfo?: { readonly hasNextPage: boolean; readonly endCursor?: string | null } | null
+    readonly nodes?: ReadonlyArray<GithubGraphqlComment | null> | null
+  } | null
 }
 
 function graphqlUser(actor: GithubGraphqlActor | null | undefined): RepoUser {
@@ -203,6 +206,10 @@ const REVIEW_THREADS_QUERY = `
               url
             }
             comments(first: 100) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
               nodes {
                 id
                 databaseId
@@ -216,6 +223,53 @@ const REVIEW_THREADS_QUERY = `
                 }
               }
             }
+          }
+        }
+      }
+    }
+  }
+`
+
+const REVIEW_THREAD_COMMENTS_QUERY = `
+  query($threadId: ID!, $first: Int!, $after: String) {
+    node(id: $threadId) {
+      ... on PullRequestReviewThread {
+        comments(first: $first, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            id
+            databaseId
+            body
+            createdAt
+            updatedAt
+            url
+            author {
+              login
+              url
+            }
+          }
+        }
+      }
+    }
+  }
+`
+
+const THREAD_OWNERSHIP_QUERY = `
+  query($threadId: ID!) {
+    node(id: $threadId) {
+      __typename
+      ... on PullRequestReviewThread {
+        id
+        pullRequest {
+          number
+          repository {
+            owner {
+              login
+            }
+            name
           }
         }
       }
@@ -592,7 +646,7 @@ export class GithubProvider implements Provider {
     })
     const mapped = data.map(pull)
     const afterMs = query.updatedAfter === undefined ? undefined : Date.parse(query.updatedAfter)
-    const reachedCutoff = afterMs !== undefined && mapped.length > 0 && Date.parse(mapped.at(-1)!.updatedAt) <= afterMs
+    const reachedCutoff = query.sort === 'updated' && afterMs !== undefined && mapped.length > 0 && Date.parse(mapped.at(-1)!.updatedAt) <= afterMs
     const items = mapped.filter(change => (query.state === 'all' || change.state === query.state) && (afterMs === undefined || Date.parse(change.updatedAt) > afterMs))
     return { items, ...reachedCutoff ? {} : nextPage(query, data.length) }
   }
@@ -640,32 +694,63 @@ export class GithubProvider implements Provider {
       const pr = data.repository?.pullRequest
       if (pr === null || pr === undefined) throw new RepoError('not-found', `PR #${number} 不存在或令牌无权查看`)
       const threads = pr.reviewThreads ?? { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
-      const mapped = (threads.nodes ?? []).filter((entry): entry is GithubReviewThread => entry !== null && entry !== undefined).map(reviewThread)
-      return { mapped, pageInfo: threads.pageInfo }
+      const rawNodes = (threads.nodes ?? []).filter((entry): entry is GithubReviewThread => entry !== null && entry !== undefined)
+      return { rawNodes, pageInfo: threads.pageInfo }
     }
 
+    const hydrateSelected = async (selected: readonly GithubReviewThread[]): Promise<MrDiscussion[]> =>
+      await Promise.all(selected.map(entry => this.hydrateReviewThread(entry, number, call)))
+
     if (query.page === 1 && query.onlyUnresolved !== true) {
-      const { mapped, pageInfo } = await fetchThreads(query.perPage, null)
-      return { items: mapped, ...pageInfo.hasNextPage ? { nextPage: 2 } : {} }
+      const { rawNodes, pageInfo } = await fetchThreads(query.perPage, null)
+      const items = await hydrateSelected(rawNodes)
+      return { items, ...pageInfo.hasNextPage ? { nextPage: 2 } : {} }
     }
 
     const needed = query.page * query.perPage + 1
-    const matched: MrDiscussion[] = []
+    const matched: GithubReviewThread[] = []
     let after: string | null = null
     for (let step = 1; step <= MAX_STATUS_PAGES; step += 1) {
-      const { mapped, pageInfo }: Awaited<ReturnType<typeof fetchThreads>> = await fetchThreads(PAGE, after)
-      for (const item of mapped) {
-        if (query.onlyUnresolved !== true || (item.resolvable && !item.resolved)) matched.push(item)
+      const { rawNodes, pageInfo }: Awaited<ReturnType<typeof fetchThreads>> = await fetchThreads(PAGE, after)
+      for (const item of rawNodes) {
+        if (query.onlyUnresolved !== true || !item.isResolved) matched.push(item)
       }
       if (matched.length >= needed || !pageInfo.hasNextPage) {
         const start = (query.page - 1) * query.perPage
-        const items = matched.slice(start, start + query.perPage)
+        const items = await hydrateSelected(matched.slice(start, start + query.perPage))
         const hasMore = matched.length > start + query.perPage || pageInfo.hasNextPage
         return { items, ...hasMore ? { nextPage: query.page + 1 } : {} }
       }
       after = pageInfo.endCursor ?? null
     }
     throw new RepoError('too-large', `PR #${number} 的讨论线程超过 ${MAX_STATUS_PAGES * PAGE} 条，无法完成筛选或分页`)
+  }
+
+  private async hydrateReviewThread(node: GithubReviewThread, number: number, call: Call): Promise<MrDiscussion> {
+    const base = reviewThread(node)
+    if (node.comments?.pageInfo?.hasNextPage !== true) return base
+    const extraNotes: DiscussionNote[] = []
+    let after: string | null = node.comments.pageInfo.endCursor ?? null
+    for (let step = 1; step <= MAX_STATUS_PAGES; step += 1) {
+      const data = await this.graphql<{
+        node?: {
+          comments?: {
+            pageInfo: { hasNextPage: boolean; endCursor?: string | null }
+            nodes?: ReadonlyArray<GithubGraphqlComment | null> | null
+          } | null
+        } | null
+      }>(REVIEW_THREAD_COMMENTS_QUERY, { threadId: node.id, first: PAGE, after, request: { signal: call.signal } })
+      const comments = data.node?.comments
+      if (comments === null || comments === undefined) break
+      for (const entry of comments.nodes ?? []) {
+        if (entry !== null && entry !== undefined) extraNotes.push(graphqlNote(entry))
+      }
+      if (!comments.pageInfo.hasNextPage) {
+        return { ...base, notes: [...base.notes, ...extraNotes] }
+      }
+      after = comments.pageInfo.endCursor ?? null
+    }
+    throw new RepoError('too-large', `PR #${number} 讨论线程 ${node.id} 的回复超过 ${(MAX_STATUS_PAGES + 1) * PAGE} 条，无法完整读取`)
   }
 
   async mrStatus(ref: RepoRef, number: number, call: Call) {
@@ -859,7 +944,39 @@ export class GithubProvider implements Provider {
     }
   }
 
-  async mrDiscussionReply(_ref: RepoRef, _number: number, discussionId: string, body: string, call: Call): Promise<MrReplyOutcome> {
+  private async verifyReviewThreadTarget(ref: RepoRef, number: number, threadId: string, call: Call): Promise<void> {
+    const { owner, repo: repoName } = split(ref.path)
+    const data = await this.graphql<{
+      node?: {
+        __typename?: string
+        id?: string
+        pullRequest?: {
+          number?: number
+          repository?: {
+            owner?: { login?: string | null } | null
+            name?: string | null
+          } | null
+        } | null
+      } | null
+    }>(THREAD_OWNERSHIP_QUERY, { threadId, request: { signal: call.signal } })
+    const node = data.node
+    if (node === null || node === undefined || node.__typename !== 'PullRequestReviewThread' || node.pullRequest === null || node.pullRequest === undefined) {
+      throw new RepoError('not-found', `PR #${number} 中不存在讨论线程 ${threadId}`)
+    }
+    const threadOwner = node.pullRequest.repository?.owner?.login ?? ''
+    const threadRepo = node.pullRequest.repository?.name ?? ''
+    const threadPrNumber = node.pullRequest.number
+    if (
+      threadOwner.toLowerCase() !== owner.toLowerCase()
+      || threadRepo.toLowerCase() !== repoName.toLowerCase()
+      || threadPrNumber !== number
+    ) {
+      throw new RepoError('forbidden', `讨论线程 ${threadId} 不属于已授权目标 ${ref.path}#${number}`)
+    }
+  }
+
+  async mrDiscussionReply(ref: RepoRef, number: number, discussionId: string, body: string, call: Call): Promise<MrReplyOutcome> {
+    await this.verifyReviewThreadTarget(ref, number, discussionId, call)
     const data = await this.graphql<{
       addPullRequestReviewThreadReply?: { comment?: GithubGraphqlComment | null } | null
     }>(REPLY_THREAD_MUTATION, { threadId: discussionId, commentBody: body, request: { signal: call.signal } })
@@ -872,7 +989,8 @@ export class GithubProvider implements Provider {
     }
   }
 
-  async mrDiscussionResolve(_ref: RepoRef, _number: number, discussionId: string, resolved: boolean, call: Call): Promise<MrDiscussionResolveResult> {
+  async mrDiscussionResolve(ref: RepoRef, number: number, discussionId: string, resolved: boolean, call: Call): Promise<MrDiscussionResolveResult> {
+    await this.verifyReviewThreadTarget(ref, number, discussionId, call)
     if (resolved) {
       const data = await this.graphql<{ resolveReviewThread?: { thread?: { id: string; isResolved: boolean } | null } | null }>(
         RESOLVE_THREAD_MUTATION,

@@ -344,10 +344,10 @@ describe('GitLab CI', () => {
 
     rows = [
       mr({ iid: 10, updated_at: '2026-11-13T14:00:00Z' }),
-      mr({ iid: 9, updated_at: '2026-11-13T12:00:00Z' }),
+      mr({ iid: 8, updated_at: '2026-11-13T10:00:00Z' }),
     ]
     const more = await service.forge.listMrs(REPO, { sort: 'created', updatedAfter: '2026-11-13T10:00:00Z', perPage: 2 })
-    expect(more.items.map(item => item.number)).toEqual([10, 9])
+    expect(more.items.map(item => item.number)).toEqual([10])
     expect(more.nextPage).toBe(2)
     expect(Object.fromEntries(requests[1]!.url.searchParams)).toMatchObject({ order_by: 'created_at', sort: 'desc' })
   })
