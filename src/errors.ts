@@ -5,18 +5,23 @@
  * @module dsh-repo/errors
  */
 
-import type { RepoErrorCode, RepoFailure } from './contract.ts'
+import type { PartialMrReviewProgress, RepoErrorCode, RepoFailure } from './contract.ts'
 
 /** Expected failure of a `dshRepos` call. */
 export class RepoError extends Error implements RepoFailure {
   override readonly name = 'RepoError'
+  readonly partialReview?: PartialMrReviewProgress
 
   /**
    * @param code - failure class.
    * @param message - readable reason.
+   * @param options - optional partial progress attached by a multi-step write.
    */
-  constructor(readonly code: RepoErrorCode, message: string) {
+  constructor(readonly code: RepoErrorCode, message: string, options?: { readonly partialReview?: PartialMrReviewProgress }) {
     super(message)
+    if (options?.partialReview !== undefined) {
+      this.partialReview = options.partialReview
+    }
   }
 }
 
@@ -73,6 +78,15 @@ function httpFailureOf(error: unknown): HttpFailure | undefined {
   return undefined
 }
 
+function partialSuffix(partial: PartialMrReviewProgress | undefined): string {
+  if (partial === undefined) return ''
+  const parts: string[] = []
+  if (partial.postedComments > 0) parts.push(`已发布 ${partial.postedComments} 条行级评论`)
+  if (partial.approved === true) parts.push('已完成 approve')
+  if (partial.ownCommentIds.length > 0) parts.push(`已产生评论 ID [${partial.ownCommentIds.join(', ')}]`)
+  return parts.length === 0 ? '' : `（部分评审已生效：${parts.join('，')}）`
+}
+
 /**
  * Classify an error thrown while calling a host.
  * @param error - the thrown value.
@@ -81,25 +95,28 @@ function httpFailureOf(error: unknown): HttpFailure | undefined {
  */
 export function toRepoError(error: unknown, what: string): RepoError {
   if (error instanceof RepoError) return error
+  const partialReview = (error as { readonly partialReview?: PartialMrReviewProgress } | null | undefined)?.partialReview
+  const opts = partialReview === undefined ? undefined : { partialReview }
+  const suffix = partialSuffix(partialReview)
   const http = httpFailureOf(error)
   if (http !== undefined) {
     const detail = http.message === '' ? '' : `：${http.message}`
-    if (http.rateLimited) return new RepoError('rate-limited', `${what}失败，已达到接口限流${detail}`)
+    if (http.rateLimited) return new RepoError('rate-limited', `${what}失败，已达到接口限流${detail}${suffix}`, opts)
     switch (http.status) {
-      case 401: return new RepoError('unauthenticated', `${what}失败，令牌无效或已过期${detail}`)
-      case 403: return new RepoError('forbidden', `${what}失败，令牌没有权限${detail}`)
-      case 404: return new RepoError('not-found', `${what}失败，目标不存在或令牌无权查看${detail}`)
+      case 401: return new RepoError('unauthenticated', `${what}失败，令牌无效或已过期${detail}${suffix}`, opts)
+      case 403: return new RepoError('forbidden', `${what}失败，令牌没有权限${detail}${suffix}`, opts)
+      case 404: return new RepoError('not-found', `${what}失败，目标不存在或令牌无权查看${detail}${suffix}`, opts)
       case 405:
       case 406:
       case 409:
-      case 412: return new RepoError('conflict', `${what}失败，状态已变化或不满足条件${detail}`)
+      case 412: return new RepoError('conflict', `${what}失败，状态已变化或不满足条件${detail}${suffix}`, opts)
       case 400:
-      case 422: return new RepoError('invalid', `${what}失败，参数被拒绝${detail}`)
-      default: return new RepoError('unavailable', `${what}失败${http.status === undefined ? '' : `（HTTP ${http.status}）`}${detail}`)
+      case 422: return new RepoError('invalid', `${what}失败，参数被拒绝${detail}${suffix}`, opts)
+      default: return new RepoError('unavailable', `${what}失败${http.status === undefined ? '' : `（HTTP ${http.status}）`}${detail}${suffix}`, opts)
     }
   }
   if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError' || error.name === 'GitbeakerTimeoutError')) {
-    return new RepoError('unavailable', `${what}超时或被取消`)
+    return new RepoError('unavailable', `${what}超时或被取消${suffix}`, opts)
   }
-  return new RepoError('unavailable', `${what}失败：${error instanceof Error ? error.message : String(error)}`)
+  return new RepoError('unavailable', `${what}失败：${error instanceof Error ? error.message : String(error)}${suffix}`, opts)
 }

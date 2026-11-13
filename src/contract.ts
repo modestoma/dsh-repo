@@ -70,12 +70,23 @@ export type RepoErrorCode =
   /** Network failure, timeout, or another host error. */
   | 'unavailable'
 
+/** Partial progress already written to the host before a multi-step {@link DshRepoService.mrReview} failed. */
+export interface PartialMrReviewProgress {
+  readonly postedComments: number
+  readonly fallbackInlineCount: number
+  readonly ownCommentIds: readonly string[]
+  readonly approved?: boolean
+  readonly webUrl?: string
+}
+
 /** Fields of a rejection from the service. */
 export interface RepoFailure {
   readonly name: 'RepoError'
   readonly code: RepoErrorCode
   /** Readable reason (Chinese), including the host's message when there is one. */
   readonly message: string
+  /** Already-published review state when a multi-step {@link DshRepoService.mrReview} fails midway. */
+  readonly partialReview?: PartialMrReviewProgress
 }
 
 /** Caller fields every service method accepts besides its parameters. */

@@ -426,16 +426,22 @@ export const OPERATIONS: readonly Operation[] = [
       }),
     },
     run: async (args, deps, caller) => {
-      const { ownCommentIds, ...result } = await deps.service.forge.reviewMr(args.repo, args.number, {
-        headSha: args.headSha,
-        verdict: args.verdict,
-        ...args.body === undefined ? {} : { body: args.body },
-        ...args.comments === undefined ? {} : { comments: args.comments },
-        signature: deps.service.settings.current.tools.signature,
-        signal: caller.signal,
-      })
-      for (const id of ownCommentIds ?? []) await rememberComment(deps, args.repo, args.number, id)
-      return result
+      try {
+        const { ownCommentIds, ...result } = await deps.service.forge.reviewMr(args.repo, args.number, {
+          headSha: args.headSha,
+          verdict: args.verdict,
+          ...args.body === undefined ? {} : { body: args.body },
+          ...args.comments === undefined ? {} : { comments: args.comments },
+          signature: deps.service.settings.current.tools.signature,
+          signal: caller.signal,
+        })
+        for (const id of ownCommentIds ?? []) await rememberComment(deps, args.repo, args.number, id)
+        return result
+      } catch (error) {
+        const partialIds = error instanceof RepoError ? error.partialReview?.ownCommentIds : undefined
+        for (const id of partialIds ?? []) await rememberComment(deps, args.repo, args.number, id)
+        throw error
+      }
     },
   }),
   define({

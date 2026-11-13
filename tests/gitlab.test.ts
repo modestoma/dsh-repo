@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_SETTINGS } from '../src/config.ts'
+import { execute, operationOf } from '../src/operations.ts'
 import { GitlabProvider } from '../src/providers/gitlab.ts'
 import { createService, fakeHttp, testConfig, testSettings, TOKENS } from './helpers.ts'
 
@@ -624,5 +625,98 @@ describe('GitLab CI', () => {
 
     expect(await service.forge.resolveMrDiscussion(REPO, 7, 'disc-1', true)).toEqual({ discussionId: 'disc-1', resolved: true })
     expect(await service.forge.resolveMrDiscussion(REPO, 7, 'disc-1', false)).toEqual({ discussionId: 'disc-1', resolved: false })
+  })
+
+  it('publishes explicit request-changes verdict notes and preserves partial review progress when a later write fails', async () => {
+    const baseSha = '1'.repeat(40)
+    const startSha = '2'.repeat(40)
+    let discussionCallCount = 0
+    const { requests } = fakeHttp([
+      {
+        method: 'GET',
+        path: '/gitlab/api/v4/user',
+        reply: { body: { id: 99, username: 'gl-bot', name: 'Bot' } },
+      },
+      {
+        method: 'GET',
+        path: `${API}/merge_requests/7`,
+        reply: { body: mr({ diff_refs: { base_sha: baseSha, start_sha: startSha, head_sha: SHA } }) },
+      },
+      {
+        method: 'POST',
+        path: `${API}/merge_requests/7/discussions`,
+        reply: () => {
+          discussionCallCount += 1
+          if (discussionCallCount === 3) {
+            return { status: 403, body: { message: '403 Forbidden' } }
+          }
+          return {
+            status: 201,
+            body: { id: `disc-${discussionCallCount}`, notes: [{ id: 700 + discussionCallCount, body: 'inline', author, created_at: 'c' }] },
+          }
+        },
+      },
+      {
+        method: 'POST',
+        path: `${API}/merge_requests/7/notes`,
+        reply: { status: 201, body: { id: 901, body: 'summary', author, created_at: 'c' } },
+      },
+    ])
+    const service = createService(testConfig(), TOKENS)
+
+    // 1. Non-self `request-changes` with ONLY inline comments explicitly publishes a summary note stating the verdict.
+    const reqChanges = await service.forge.reviewMr(REPO, 7, {
+      headSha: SHA,
+      verdict: 'request-changes',
+      comments: [{ path: 'src/order.ts', newLine: 10, body: 'Null dereference here' }],
+      signature: '_— gl-bot_',
+    })
+    expect(reqChanges).toEqual({
+      verdict: 'request-changes',
+      postedComments: 1,
+      fallbackInlineCount: 0,
+      webUrl: `${REPO}/-/merge_requests/7#note_901`,
+      ownCommentIds: ['701', '901'],
+    })
+    const summaryReq = requests.find(req => req.url.pathname.endsWith('/merge_requests/7/notes'))
+    expect(summaryReq?.body).toEqual({
+      body: '**评审结论：请求修改（Request Changes）**\n\n_— gl-bot_',
+    })
+
+    // 2. Partial review failure: 1st inline comment succeeds (id 702), 2nd fails with 403 -> exposes `partialReview` AND suppresses `702` in `watch.ownComment`.
+    const ownRecorded: string[] = []
+    await expect(execute(
+      operationOf('mrReview'),
+      {
+        repo: REPO,
+        number: 7,
+        headSha: SHA,
+        verdict: 'comment',
+        comments: [
+          { path: 'src/order.ts', newLine: 12, body: 'First inline succeeds' },
+          { path: 'src/order.ts', newLine: 20, body: 'Second inline hits 403' },
+        ],
+      },
+      {
+        service,
+        leases: {} as never,
+        workspaces: {} as never,
+        workingDirectory: () => undefined,
+        parallel: async () => {},
+        approval: () => undefined,
+        watch: {
+          ownComment: async (_repo: string, _mr: number, id: string) => { ownRecorded.push(id) },
+        } as never,
+      },
+      { origin: 'service', signal: new AbortController().signal },
+    )).rejects.toMatchObject({
+      code: 'forbidden',
+      partialReview: {
+        postedComments: 1,
+        fallbackInlineCount: 0,
+        ownCommentIds: ['702'],
+      },
+    })
+    expect(ownRecorded).toEqual(['702'])
   })
 })

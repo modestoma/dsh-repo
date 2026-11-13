@@ -11,7 +11,7 @@
 import { Gitlab } from '@gitbeaker/rest'
 import type {
   BranchInfo, MrDiff, MrDiscussion, MrDiscussionResolveResult, MrInfo, MrState, MrStatus, CheckInfo, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiState, CiTestCounts,
-  CommentInfo, CommitAuthor, CommitInfo, DiffPosition, DiscussionNote, DraftInlineComment, IssueInfo, Page, RepoInfo, RepoRef, RepoUser, ReviewVerdict, SourceBranchDeletion, TreeEntry,
+  CommentInfo, CommitAuthor, CommitInfo, DiffPosition, DiscussionNote, DraftInlineComment, IssueInfo, Page, PartialMrReviewProgress, RepoInfo, RepoRef, RepoUser, ReviewVerdict, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { forgeKindInfo } from '../settings/contract.ts'
@@ -751,63 +751,88 @@ export class GitlabProvider implements Provider {
     let postedComments = 0
     const fallbacks: DraftInlineComment[] = []
     const ownCommentIds: string[] = []
-
-    for (const item of request.comments) {
-      if (diffRefs === undefined) {
-        fallbacks.push(item)
-        continue
-      }
-      call.signal.throwIfAborted()
-      try {
-        const created = await this.api.MergeRequestDiscussions.create(ref.path, number, item.body, {
-          position: {
-            positionType: 'text',
-            baseSha: diffRefs.base_sha,
-            startSha: diffRefs.start_sha,
-            headSha: diffRefs.head_sha,
-            newPath: item.path,
-            oldPath: item.path,
-            ...item.newLine === undefined ? {} : { newLine: String(item.newLine) },
-            ...item.oldLine === undefined ? {} : { oldLine: String(item.oldLine) },
-          },
-        })
-        postedComments += 1
-        for (const entry of created.notes ?? []) ownCommentIds.push(String(entry.id))
-      } catch (error) {
-        const status = gitlabStatus(error)
-        if (status === 400 || status === 422) {
-          fallbacks.push(item)
-        } else {
-          throw error
-        }
-      }
-    }
-
-    if (verdict === 'approve') {
-      call.signal.throwIfAborted()
-      try {
-        await this.api.MergeRequestApprovals.approve(ref.path, number, { sha: request.headSha })
-      } catch (error) {
-        const status = gitlabStatus(error)
-        if (status === 422 || ((status === 400 || status === 403) && /author|own|cannot\s+approve/i.test(errorText(error)))) {
-          verdict = 'comment'
-          downgraded = true
-        } else {
-          throw error
-        }
-      }
-    }
-
-    let summary = composeReviewBody(request.body, fallbacks, request.signature)
-    if (summary === undefined && downgraded && postedComments === 0) {
-      summary = composeReviewBody('（自审自动降级为评论）', [], request.signature)
-    }
+    let approved = false
     let webUrl: string | undefined = mrData.web_url
-    if (summary !== undefined && summary !== '') {
-      call.signal.throwIfAborted()
-      const created = await this.api.MergeRequestNotes.create(ref.path, number, summary)
-      ownCommentIds.push(String(created.id))
-      webUrl = `${mrData.web_url}#note_${created.id}`
+
+    try {
+      for (const item of request.comments) {
+        if (diffRefs === undefined) {
+          fallbacks.push(item)
+          continue
+        }
+        call.signal.throwIfAborted()
+        try {
+          const created = await this.api.MergeRequestDiscussions.create(ref.path, number, item.body, {
+            position: {
+              positionType: 'text',
+              baseSha: diffRefs.base_sha,
+              startSha: diffRefs.start_sha,
+              headSha: diffRefs.head_sha,
+              newPath: item.path,
+              oldPath: item.path,
+              ...item.newLine === undefined ? {} : { newLine: String(item.newLine) },
+              ...item.oldLine === undefined ? {} : { oldLine: String(item.oldLine) },
+            },
+          })
+          postedComments += 1
+          for (const entry of created.notes ?? []) ownCommentIds.push(String(entry.id))
+        } catch (error) {
+          const status = gitlabStatus(error)
+          if (status === 400 || status === 422) {
+            fallbacks.push(item)
+          } else {
+            throw error
+          }
+        }
+      }
+
+      if (verdict === 'approve') {
+        call.signal.throwIfAborted()
+        try {
+          await this.api.MergeRequestApprovals.approve(ref.path, number, { sha: request.headSha })
+          approved = true
+        } catch (error) {
+          const status = gitlabStatus(error)
+          if (status === 422 || ((status === 400 || status === 403) && /author|own|cannot\s+approve/i.test(errorText(error)))) {
+            verdict = 'comment'
+            downgraded = true
+          } else {
+            throw error
+          }
+        }
+      }
+
+      const effectiveBody = verdict === 'request-changes'
+        ? (request.body !== undefined && request.body !== ''
+          ? `**评审结论：请求修改（Request Changes）**\n\n${request.body}`
+          : '**评审结论：请求修改（Request Changes）**')
+        : request.body
+      let summary = composeReviewBody(effectiveBody, fallbacks, request.signature)
+      if (summary === undefined && downgraded && postedComments === 0) {
+        summary = composeReviewBody('（自审自动降级为评论）', [], request.signature)
+      }
+      if (summary !== undefined && summary !== '') {
+        call.signal.throwIfAborted()
+        const created = await this.api.MergeRequestNotes.create(ref.path, number, summary)
+        ownCommentIds.push(String(created.id))
+        webUrl = `${mrData.web_url}#note_${created.id}`
+      }
+    } catch (error) {
+      if (postedComments > 0 || ownCommentIds.length > 0 || approved) {
+        const partialReview: PartialMrReviewProgress = {
+          postedComments,
+          fallbackInlineCount: fallbacks.length,
+          ownCommentIds: [...ownCommentIds],
+          ...(approved ? { approved: true } : {}),
+          ...(webUrl === undefined ? {} : { webUrl }),
+        }
+        if (error instanceof RepoError) {
+          throw new RepoError(error.code, error.message, { partialReview })
+        }
+        const wrapped = error instanceof Error ? error : new Error(String(error))
+        throw Object.assign(wrapped, { partialReview })
+      }
+      throw error
     }
 
     return {
