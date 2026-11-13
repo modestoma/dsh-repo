@@ -11,7 +11,7 @@ import { ACCESS_AUTHORIZE_EVENT } from '../src/events.ts'
 import type { HostContext, ToolDefinition } from '../src/host.ts'
 import { Forge } from '../src/forge/forge.ts'
 import type { RepoService } from '../src/service.ts'
-import { credentials } from './helpers.ts'
+import { credentials, fakeHttp } from './helpers.ts'
 
 /** Disposers of every effect a test context ran; the tests stop them so the proxy and timers end. */
 const disposers: Array<() => void> = []
@@ -93,16 +93,17 @@ describe('plugin', () => {
     expect([...plugin.inject]).toEqual(['tools', 'credentials'])
   })
 
-  it('provides dshRepos v7, starts the local git proxy, and offers tools once the catalog holds a repository', async () => {
+  it('provides dshRepos v8, starts the local git proxy, and offers tools once the catalog holds a repository', async () => {
     const { ctx, registered, provided: map, env } = context()
     plugin.apply(ctx, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
     const { api } = provided(map)
     expect(api).toBeInstanceOf(DshReposApi)
-    expect(api.version).toBe(7)
+    expect(api.version).toBe(8)
     await vi.waitFor(() => { expect(api.settingsGet().proxyListening).toBeGreaterThan(0) })
     expect(api.settingsGet()).toMatchObject({ mirrorDir: undefined, proxyPort: 0, commitName: '', commitEmail: '', workspaceDir: undefined })
-    expect(registered.map(entry => entry.definition.name)).toHaveLength(33)
+    expect(registered.map(entry => entry.definition.name)).toHaveLength(38)
     expect(registered.map(entry => entry.definition.name)).not.toContain('repo_add')
+    expect(registered.map(entry => entry.definition.name)).not.toContain('repo_current_bot_user')
     const offered = async (name: string) => await registered.find(entry => entry.definition.name === name)!.when!()
     expect(await offered('repo_list')).toBe(false)
     await provided(map).engine.catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [] })
@@ -133,7 +134,7 @@ describe('plugin', () => {
     const { ctx, registered, provided: map, info, env } = context()
     plugin.apply(ctx, undefined, { env })
     const { api } = provided(map)
-    expect(registered.length).toBe(33)
+    expect(registered.length).toBe(38)
     expect(await registered[0]?.when?.()).toBe(false)
     expect(info).toHaveBeenCalled()
     const { engine } = provided(map)
@@ -184,5 +185,37 @@ describe('plugin', () => {
     const hosts = await provided(second.provided).api.hostList()
     expect(hosts).toMatchObject([{ kind: 'gitlab', url: 'https://code.example.com', alias: '公司 GitLab', origin: 'added' }])
     expect(() => plugin.apply(context().ctx, { hostsFile: join(first.env.DSH_HOME, 'dsh-repo') })).toThrow(/设置文件 .* 无法读取/)
+  })
+
+  it('caches currentBotUser per host, enforces catalog read access, and invalidates on hostOnChange', async () => {
+    let login = 'bot-one'
+    const { requests } = fakeHttp([
+      {
+        method: 'GET',
+        path: '/user',
+        reply: () => ({ body: { id: 1, login, html_url: `https://github.com/${login}` } }),
+      },
+    ])
+    const creds = credentials({ GITHUB_TOKEN: 'tok-1' })
+    const { ctx, provided: map, env } = context()
+    plugin.apply({ ...ctx, credentials: creds }, { hosts: [{ kind: 'github', url: 'https://github.com', tokenRef: 'GITHUB_TOKEN' }] }, { env })
+    const { api, engine } = provided(map)
+    const changes: string[] = []
+    api.hostOnChange((change) => { changes.push(change.kind) })
+
+    await expect(api.currentBotUser({ repo: 'https://github.com/a/b' })).rejects.toMatchObject({ code: 'not-allowed' })
+    await engine.catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [] })
+    await engine.catalog.add({ url: 'https://github.com/a/other', access: 'read', features: [] })
+
+    expect(await api.currentBotUser({ repo: 'https://github.com/a/b' })).toEqual({ username: 'bot-one', webUrl: 'https://github.com/bot-one' })
+    expect(await api.currentBotUser({ repo: 'github.com/a/other' })).toEqual({ username: 'bot-one', webUrl: 'https://github.com/bot-one' })
+    expect(requests.filter(req => req.url.pathname === '/user')).toHaveLength(1)
+
+    // Updating the host token fires hostOnChange and clears the per-host botUser cache.
+    login = 'bot-two'
+    await api.hostSetToken({ url: 'https://github.com', token: 'tok-2' })
+    expect(changes).toContain('token')
+    expect(await api.currentBotUser({ repo: 'https://github.com/a/b' })).toEqual({ username: 'bot-two', webUrl: 'https://github.com/bot-two' })
+    expect(requests.filter(req => req.url.pathname === '/user')).toHaveLength(2)
   })
 })

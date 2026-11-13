@@ -365,4 +365,414 @@ describe('GitHub Actions CI', () => {
     ])
     expect((await createService(testConfig(), TOKENS).forge.mrStatus(REPO, 5)).checks).toEqual([{ name: 'test', state: 'failure', webUrl: `${REPO}/actions/runs/77/job/2`, runId: 77, jobId: 2 }])
   })
+
+  it('sorts pull requests by updatedAt and cuts pagination early when updatedAfter is reached', async () => {
+    const pullItem = (number: number, updatedAt: string) => ({
+      number,
+      title: `PR ${number}`,
+      body: '',
+      state: 'open',
+      draft: false,
+      merged_at: null,
+      head: { ref: `feat/${number}`, sha: SHA, repo: { id: 1 } },
+      base: { ref: 'main', repo: { id: 1, default_branch: 'main' } },
+      user: author,
+      labels: [],
+      assignees: [],
+      created_at: '2026-11-10T00:00:00Z',
+      updated_at: updatedAt,
+      html_url: `${REPO}/pull/${number}`,
+    })
+    let rows = [
+      pullItem(3, '2026-11-13T12:00:00Z'),
+      pullItem(2, '2026-11-13T10:00:00Z'),
+    ]
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/pulls`, reply: () => ({ body: rows }) },
+    ])
+    const service = createService(testConfig(), TOKENS)
+
+    // Tail item equals updatedAfter -> excluded (strict >) and nextPage omitted despite full page.
+    const cut = await service.forge.listMrs(REPO, { updatedAfter: '2026-11-13T10:00:00Z', perPage: 2 })
+    expect(cut.items.map(item => item.number)).toEqual([3])
+    expect(cut.nextPage).toBeUndefined()
+    expect(Object.fromEntries(requests[0]!.url.searchParams)).toMatchObject({ sort: 'updated', direction: 'desc', per_page: '2' })
+
+    // When sort === 'created', an older updatedAt on the last item must NOT cut off nextPage!
+    rows = [
+      pullItem(4, '2026-11-13T13:00:00Z'),
+      pullItem(2, '2026-11-13T08:00:00Z'),
+    ]
+    const more = await service.forge.listMrs(REPO, { sort: 'created', updatedAfter: '2026-11-13T10:00:00Z', perPage: 2 })
+    expect(more.items.map(item => item.number)).toEqual([4])
+    expect(more.nextPage).toBe(2)
+    expect(Object.fromEntries(requests[1]!.url.searchParams)).toMatchObject({ sort: 'created', direction: 'desc' })
+
+    await expect(service.forge.listMrs(REPO, { updatedAfter: 'invalid-date' })).rejects.toMatchObject({ code: 'invalid' })
+  })
+
+  it('compares commits as unified diff and truncates at maxDiffBytes', async () => {
+    const base = '1'.repeat(40)
+    const head = '2'.repeat(40)
+    const { requests } = fakeHttp([
+      { method: 'GET', path: `${API}/compare/${base}...${head}`, reply: { body: 'diff --git a/a.ts b/a.ts\n+hello world\n' } },
+    ])
+    const service = createService(testConfig(), TOKENS, testSettings({ limits: { maxDiffBytes: 18 } }))
+    const compared = await service.forge.mrCompare(REPO, base, head)
+    expect(compared).toEqual({ diff: 'diff --git a/a.ts ', truncated: true })
+    expect(requests[0]?.headers.get('accept')).toContain('diff')
+  })
+
+  it('reads reviewThreads via GraphQL on github.com and GHES, filters onlyUnresolved, and maps GraphqlResponseError', async () => {
+    const threadNode = (id: string, isResolved: boolean, diffSide: 'LEFT' | 'RIGHT', line: number | null, originalLine: number | null) => ({
+      id,
+      isResolved,
+      isOutdated: line === null,
+      diffSide,
+      path: 'src/index.ts',
+      line,
+      originalLine,
+      resolvedBy: isResolved ? { login: 'reviewer', url: 'https://github.com/reviewer' } : null,
+      comments: {
+        nodes: [
+          {
+            id: `${id}_c1`,
+            databaseId: 101,
+            body: 'Check edge case',
+            createdAt: '2026-11-13T10:00:00Z',
+            updatedAt: '2026-11-13T10:05:00Z',
+            url: `${REPO}/pull/5#discussion_r101`,
+            author: { login: 'alice', url: 'https://github.com/alice' },
+          },
+        ],
+      },
+    })
+    let graphqlReply: () => { status?: number; body: unknown; headers?: Record<string, string> } = () => ({
+      body: {
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  threadNode('PRRT_1', true, 'RIGHT', 15, 15),
+                  threadNode('PRRT_2', false, 'LEFT', null, 8),
+                ],
+              },
+            },
+          },
+        },
+      },
+    })
+    const { requests } = fakeHttp([
+      { method: 'POST', path: '/graphql', reply: () => graphqlReply() },
+      { method: 'POST', path: '/api/graphql', reply: () => graphqlReply() },
+    ])
+    const service = createService(testConfig(), TOKENS)
+
+    const all = await service.forge.mrDiscussions(REPO, 5)
+    expect(requests[0]?.url.href).toBe('https://api.github.com/graphql')
+    expect(all.items).toEqual([
+      {
+        id: 'PRRT_1',
+        inline: true,
+        position: { path: 'src/index.ts', newLine: 15 },
+        resolvable: true,
+        resolved: true,
+        resolvedBy: { username: 'reviewer', webUrl: 'https://github.com/reviewer' },
+        notes: [{
+          id: 'PRRT_1_c1',
+          author: { username: 'alice', webUrl: 'https://github.com/alice' },
+          body: 'Check edge case',
+          createdAt: '2026-11-13T10:00:00Z',
+          updatedAt: '2026-11-13T10:05:00Z',
+          webUrl: `${REPO}/pull/5#discussion_r101`,
+        }],
+      },
+      {
+        id: 'PRRT_2',
+        inline: true,
+        position: { path: 'src/index.ts', oldLine: 8 },
+        resolvable: true,
+        resolved: false,
+        notes: [{
+          id: 'PRRT_2_c1',
+          author: { username: 'alice', webUrl: 'https://github.com/alice' },
+          body: 'Check edge case',
+          createdAt: '2026-11-13T10:00:00Z',
+          updatedAt: '2026-11-13T10:05:00Z',
+          webUrl: `${REPO}/pull/5#discussion_r101`,
+        }],
+      },
+    ])
+
+    // GHES rewrites <url>/api/v3 -> <url>/api/graphql and filters onlyUnresolved.
+    const unresolved = await service.forge.mrDiscussions('ghe.example.com/platform/api', 5, { onlyUnresolved: true })
+    expect(requests.at(-1)?.url.href).toBe('https://ghe.example.com/api/graphql')
+    expect(requests.at(-1)?.headers.get('authorization')).toBe('token ghe-token')
+    expect(unresolved.items.map(item => item.id)).toEqual(['PRRT_2'])
+
+    // Intra-thread comment pagination when a review thread has >100 comments.
+    graphqlReply = () => {
+      const lastQuery = String((requests.at(-1)?.body as { query?: string } | undefined)?.query ?? '')
+      if (lastQuery.includes('node(id: $threadId)')) {
+        return {
+          body: {
+            data: {
+              node: {
+                comments: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [{
+                    id: 'PRRT_2_c2',
+                    databaseId: 102,
+                    body: 'Second page comment',
+                    createdAt: '2026-11-13T10:10:00Z',
+                    url: `${REPO}/pull/5#discussion_r102`,
+                    author: { login: 'bob', url: 'https://github.com/bob' },
+                  }],
+                },
+              },
+            },
+          },
+        }
+      }
+      return {
+        body: {
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [{
+                    ...threadNode('PRRT_2', false, 'RIGHT', 20, 20),
+                    comments: {
+                      pageInfo: { hasNextPage: true, endCursor: 'cursor-100' },
+                      nodes: threadNode('PRRT_2', false, 'RIGHT', 20, 20).comments.nodes,
+                    },
+                  }],
+                },
+              },
+            },
+          },
+        },
+      }
+    }
+    const paginatedNotes = await service.forge.mrDiscussions(REPO, 5)
+    expect(paginatedNotes.items[0]?.notes.map(n => n.id)).toEqual(['PRRT_2_c1', 'PRRT_2_c2'])
+
+    // GraphQL error classification: FORBIDDEN, RATE_LIMITED, NOT_FOUND, UNAUTHENTICATED, UNPROCESSABLE.
+    for (const [type, code] of [
+      ['FORBIDDEN', 'forbidden'],
+      ['RATE_LIMITED', 'rate-limited'],
+      ['NOT_FOUND', 'not-found'],
+      ['UNAUTHENTICATED', 'unauthenticated'],
+      ['UNPROCESSABLE', 'invalid'],
+    ] as const) {
+      graphqlReply = () => ({ body: { data: null, errors: [{ type, message: `gql ${type}` }] } })
+      await expect(service.forge.mrDiscussions(REPO, 5)).rejects.toMatchObject({ code })
+    }
+  })
+
+  it('submits inline reviews, detects headSha drift, auto-downgrades self-reviews, and folds out-of-hunk comments into body', async () => {
+    let prAuthor = 'contributor'
+    let botLogin = 'dsh-bot'
+    let reviewBehavior: 'ok' | 'self-422' | 'hunk-422' = 'ok'
+    const { requests } = fakeHttp([
+      { method: 'GET', path: '/user', reply: () => ({ body: { id: 9, login: botLogin, html_url: `https://github.com/${botLogin}` } }) },
+      { method: 'GET', path: `${API}/pulls/5`, reply: () => ({ body: { head: { sha: SHA }, user: { login: prAuthor, html_url: `https://github.com/${prAuthor}` } } }) },
+      {
+        method: 'POST',
+        path: `${API}/pulls/5/reviews`,
+        reply: (req) => {
+          const payload = req.body as { event: string; comments?: unknown[]; body?: string }
+          if (reviewBehavior === 'self-422' && payload.event !== 'COMMENT') {
+            return { status: 422, body: { message: 'Unprocessable Entity', errors: ['Can not approve your own pull request'] } }
+          }
+          if (reviewBehavior === 'hunk-422' && Array.isArray(payload.comments) && payload.comments.length > 0) {
+            return { status: 422, body: { message: 'Pull request review thread line must be part of the diff' } }
+          }
+          return { status: 200, body: { id: 88, html_url: `${REPO}/pull/5#pullrequestreview-88` } }
+        },
+      },
+      {
+        method: 'GET',
+        path: `${API}/pulls/5/reviews/88/comments`,
+        reply: () => ({ body: [{ id: 501 }, { id: 502 }] }),
+      },
+    ])
+    const service = createService(testConfig(), TOKENS)
+
+    // 1. Head SHA drift -> conflict.
+    await expect(service.forge.reviewMr(REPO, 5, {
+      headSha: 'c'.repeat(40),
+      verdict: 'approve',
+      body: 'LGTM',
+    })).rejects.toMatchObject({ code: 'conflict' })
+
+    // 2. Normal review with RIGHT & LEFT inline comments and signature.
+    const normal = await service.forge.reviewMr(REPO, 5, {
+      headSha: SHA,
+      verdict: 'request-changes',
+      body: 'Found two issues.',
+      comments: [
+        { path: 'src/a.ts', newLine: 10, body: 'Null check' },
+        { path: 'src/b.ts', oldLine: 4, body: 'Removed guard' },
+      ],
+      signature: '_— bot_',
+    })
+    expect(normal).toMatchObject({
+      verdict: 'request-changes',
+      postedComments: 2,
+      fallbackInlineCount: 0,
+      webUrl: `${REPO}/pull/5#pullrequestreview-88`,
+      ownCommentIds: ['review-88', 'line-501', 'line-502'],
+    })
+    expect(normal.downgradedVerdict).toBeUndefined()
+    expect(requests.filter(req => req.method === 'POST').at(-1)?.body).toEqual({
+      commit_id: SHA,
+      event: 'REQUEST_CHANGES',
+      body: 'Found two issues.\n\n_— bot_',
+      comments: [
+        { path: 'src/a.ts', line: 10, side: 'RIGHT', body: 'Null check' },
+        { path: 'src/b.ts', line: 4, side: 'LEFT', body: 'Removed guard' },
+      ],
+    })
+
+    // 3. Proactive self-review downgrade when token account matches PR author.
+    prAuthor = 'dsh-bot'
+    const selfProactive = await service.forge.reviewMr(REPO, 5, {
+      headSha: SHA,
+      verdict: 'approve',
+      body: 'Self check passes.',
+      signature: '_— bot_',
+    })
+    expect(selfProactive).toMatchObject({
+      verdict: 'comment',
+      downgradedVerdict: true,
+      postedComments: 0,
+      fallbackInlineCount: 0,
+    })
+    expect((requests.at(-1)?.body as { event: string }).event).toBe('COMMENT')
+
+    // 4. Reactive self-review downgrade when host returns 422 on unknown/unmatched bot user.
+    prAuthor = 'other-alias'
+    reviewBehavior = 'self-422'
+    const selfReactive = await service.forge.reviewMr(REPO, 5, {
+      headSha: SHA,
+      verdict: 'approve',
+      signature: '_— bot_',
+    })
+    expect(selfReactive).toMatchObject({ verdict: 'comment', downgradedVerdict: true })
+    expect((requests.at(-1)?.body as { event: string; body: string }).event).toBe('COMMENT')
+    expect((requests.at(-1)?.body as { body: string }).body).toContain('_— bot_')
+
+    // 5. Out-of-bounds diff hunk 422 gracefully falls back to Markdown blockquotes in summary body.
+    prAuthor = 'contributor'
+    reviewBehavior = 'hunk-422'
+    const fallback = await service.forge.reviewMr(REPO, 5, {
+      headSha: SHA,
+      verdict: 'comment',
+      body: 'Overall summary',
+      comments: [{ path: 'src/out.ts', newLine: 999, body: 'Outside diff hunk\nsecond line' }],
+      signature: '_— bot_',
+    })
+    expect(fallback).toMatchObject({
+      verdict: 'comment',
+      postedComments: 0,
+      fallbackInlineCount: 1,
+    })
+    expect(requests.at(-1)?.body).toEqual({
+      commit_id: SHA,
+      event: 'COMMENT',
+      body: 'Overall summary\n\n> **`src/out.ts:999`**\n> Outside diff hunk\n> second line\n\n_— bot_',
+    })
+  })
+
+  it('replies to and resolves/reopens review threads via GraphQL after verifying thread ownership, and reads currentBotUser', async () => {
+    let threadOwner = 'modestoma'
+    let threadRepo = 'dsh-repo'
+    let threadPr = 5
+    let threadExists = true
+    const { requests } = fakeHttp([
+      { method: 'GET', path: '/user', reply: { body: { id: 9, login: 'dsh-bot', html_url: 'https://github.com/dsh-bot' } } },
+      {
+        method: 'POST',
+        path: '/graphql',
+        reply: (req) => {
+          const { query } = req.body as { query: string; variables: Record<string, unknown> }
+          if (query.includes('__typename')) {
+            if (!threadExists) return { body: { data: { node: null } } }
+            return {
+              body: {
+                data: {
+                  node: {
+                    __typename: 'PullRequestReviewThread',
+                    id: 'PRRT_1',
+                    pullRequest: {
+                      number: threadPr,
+                      repository: { owner: { login: threadOwner }, name: threadRepo },
+                    },
+                  },
+                },
+              },
+            }
+          }
+          if (query.includes('addPullRequestReviewThreadReply')) {
+            return {
+              body: {
+                data: {
+                  addPullRequestReviewThreadReply: {
+                    comment: {
+                      id: 'PRRC_55',
+                      databaseId: 550,
+                      body: 'Addressed in latest commit',
+                      createdAt: '2026-11-13T11:00:00Z',
+                      url: `${REPO}/pull/5#discussion_r550`,
+                      author: { login: 'dsh-bot', url: 'https://github.com/dsh-bot' },
+                    },
+                  },
+                },
+              },
+            }
+          }
+          if (query.includes('unresolveReviewThread')) {
+            return { body: { data: { unresolveReviewThread: { thread: { id: 'PRRT_1', isResolved: false } } } } }
+          }
+          return { body: { data: { resolveReviewThread: { thread: { id: 'PRRT_1', isResolved: true } } } } }
+        },
+      },
+    ])
+    const service = createService(testConfig(), TOKENS)
+
+    expect(await service.forge.currentBotUser(REPO)).toEqual({ username: 'dsh-bot', webUrl: 'https://github.com/dsh-bot' })
+
+    const reply = await service.forge.replyMrDiscussion(REPO, 5, 'PRRT_1', 'Addressed in latest commit')
+    expect(reply).toEqual({
+      note: {
+        id: 'PRRC_55',
+        author: { username: 'dsh-bot', webUrl: 'https://github.com/dsh-bot' },
+        body: 'Addressed in latest commit',
+        createdAt: '2026-11-13T11:00:00Z',
+        webUrl: `${REPO}/pull/5#discussion_r550`,
+      },
+      ownCommentIds: ['PRRC_55', 'line-550'],
+    })
+
+    expect(await service.forge.resolveMrDiscussion(REPO, 5, 'PRRT_1', true)).toEqual({ discussionId: 'PRRT_1', resolved: true })
+    expect(await service.forge.resolveMrDiscussion(REPO, 5, 'PRRT_1', false)).toEqual({ discussionId: 'PRRT_1', resolved: false })
+    expect(requests.filter(req => req.url.pathname === '/graphql')).toHaveLength(6)
+
+    // Cross-PR / cross-repo thread ID is rejected before any mutation executes!
+    threadRepo = 'other-repo'
+    await expect(service.forge.replyMrDiscussion(REPO, 5, 'PRRT_FOREIGN', 'Hijack')).rejects.toMatchObject({ code: 'forbidden' })
+    await expect(service.forge.resolveMrDiscussion(REPO, 5, 'PRRT_FOREIGN', true)).rejects.toMatchObject({ code: 'forbidden' })
+    expect(requests.filter(req => req.url.pathname === '/graphql')).toHaveLength(8)
+
+    threadRepo = 'dsh-repo'
+    threadPr = 99
+    await expect(service.forge.resolveMrDiscussion(REPO, 5, 'PRRT_OTHER_PR', true)).rejects.toMatchObject({ code: 'forbidden' })
+
+    threadExists = false
+    await expect(service.forge.replyMrDiscussion(REPO, 5, 'PRRT_MISSING', 'Missing')).rejects.toMatchObject({ code: 'not-found' })
+  })
 })

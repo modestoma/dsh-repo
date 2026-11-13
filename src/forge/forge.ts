@@ -9,13 +9,17 @@
  * @module dsh-repo/forge
  */
 
-import type { CallOptions, CiActionResult, CiJob, CiJobLog, MergedBranchDeletion, MergeMethod, MrInfo, MrState, Page, RepoAccess, RepoRef, RepoTarget } from '../contract.ts'
+import { z } from 'zod'
+import type {
+  CallOptions, CiActionResult, CiJob, CiJobLog, DraftInlineComment, MergedBranchDeletion, MergeMethod, MrDiff, MrDiscussion, MrDiscussionResolveResult,
+  MrInfo, MrState, Page, RepoAccess, RepoRef, RepoTarget, RepoUser, ReviewVerdict,
+} from '../contract.ts'
 import type { RepoCatalog } from '../catalog/catalog.ts'
 import type { CatalogEntry } from '../catalog/entry.ts'
 import { readLog } from '../ci/log.ts'
 import type { RepoSettings } from '../config.ts'
 import { RepoError, toRepoError } from '../errors.ts'
-import type { ActivityRequest, Call, MrActivity, Paging, Provider } from '../providers/types.ts'
+import type { ActivityRequest, Call, MrActivity, MrReplyOutcome, MrReviewOutcome, Paging, Provider } from '../providers/types.ts'
 import { requireWritesOn } from '../policy.ts'
 import { requireBranch, requireCommit } from '../refs.ts'
 import type { HostRegistry } from './hosts.ts'
@@ -91,6 +95,25 @@ export interface MergeFields extends CallOptions {
   readonly headSha: string
   readonly method?: MergeMethod
   readonly deleteSourceBranch?: boolean
+}
+
+/** Fields of a pull/merge request review. */
+export interface MrReviewFields extends CallOptions {
+  readonly headSha: string
+  readonly verdict: ReviewVerdict
+  readonly body?: string
+  readonly comments?: readonly DraftInlineComment[]
+  readonly signature?: string
+}
+
+/** Most inline comments in one review call. */
+const MAX_REVIEW_COMMENTS = 50
+const ISO_DATETIME = z.iso.datetime({ offset: true })
+
+function requireIsoTimestamp(value: string, label: string): void {
+  if (!ISO_DATETIME.safeParse(value).success || !Number.isFinite(Date.parse(value))) {
+    throw new RepoError('invalid', `${label}必须是合法的 ISO-8601 时间戳（例如 2026-11-13T00:00:00Z）：${value}`)
+  }
 }
 
 /** Pages of pull/merge requests from one branch read before giving up. */
@@ -233,12 +256,19 @@ export class Forge {
     return await this.run(repo, options, `评论 issue #${number}`, 'write', (provider, ref, call) => provider.commentIssue(ref, number, body, call))
   }
 
-  async listMrs(repo: RepoTarget, options: PageOptions & { readonly state?: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string } = {}) {
+  async listMrs(repo: RepoTarget, options: PageOptions & { readonly state?: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string; readonly sort?: 'created' | 'updated'; readonly updatedAfter?: string } = {}) {
+    if (options.sort !== undefined && options.sort !== 'created' && options.sort !== 'updated') {
+      throw new RepoError('invalid', `sort 必须是 created 或 updated：${String(options.sort)}`)
+    }
+    if (options.updatedAfter !== undefined) requireIsoTimestamp(options.updatedAfter, 'updatedAfter ')
+    const sort = options.sort ?? (options.updatedAfter === undefined ? undefined : 'updated')
     const query = {
       ...this.paging(options),
       state: options.state ?? 'open',
       ...options.sourceBranch === undefined ? {} : { sourceBranch: options.sourceBranch },
       ...options.targetBranch === undefined ? {} : { targetBranch: options.targetBranch },
+      ...sort === undefined ? {} : { sort },
+      ...options.updatedAfter === undefined ? {} : { updatedAfter: options.updatedAfter },
     }
     return await this.run(repo, options, '列出 PR/MR', 'read', (provider, ref, call) => provider.listMrs(ref, query, call))
   }
@@ -251,6 +281,21 @@ export class Forge {
   async mrDiff(repo: RepoTarget, number: number, options: CallOptions = {}) {
     requireNumber(number)
     return await this.run(repo, options, `读取 PR/MR #${number} 的 diff`, 'read', (provider, ref, call) => provider.mrDiff(ref, number, call))
+  }
+
+  async mrCompare(repo: RepoTarget, baseSha: string, headSha: string, options: CallOptions = {}): Promise<MrDiff> {
+    requireBranch(baseSha, 'baseSha ')
+    requireBranch(headSha, 'headSha ')
+    return await this.run(repo, options, `比较提交 ${baseSha.slice(0, 12)}...${headSha.slice(0, 12)}`, 'read', (provider, ref, call) => provider.mrCompare(ref, baseSha, headSha, call))
+  }
+
+  async mrDiscussions(repo: RepoTarget, number: number, options: PageOptions & { readonly onlyUnresolved?: boolean } = {}): Promise<Page<MrDiscussion>> {
+    requireNumber(number)
+    const query = {
+      ...this.paging(options),
+      ...options.onlyUnresolved === undefined ? {} : { onlyUnresolved: options.onlyUnresolved },
+    }
+    return await this.run(repo, options, `读取 PR/MR #${number} 的讨论线程`, 'read', (provider, ref, call) => provider.mrDiscussions(ref, number, query, call))
   }
 
   async mrStatus(repo: RepoTarget, number: number, options: CallOptions = {}) {
@@ -367,6 +412,60 @@ export class Forge {
     requireNumber(number)
     requireText(body, '评论内容')
     return await this.run(repo, options, `评论 PR/MR #${number}`, 'write', (provider, ref, call) => provider.commentMr(ref, number, body, call))
+  }
+
+  async reviewMr(repo: RepoTarget, number: number, fields: MrReviewFields): Promise<MrReviewOutcome> {
+    requireNumber(number)
+    requireCommit(fields.headSha.toLowerCase(), 'headSha ')
+    if (fields.verdict !== 'comment' && fields.verdict !== 'approve' && fields.verdict !== 'request-changes') {
+      throw new RepoError('invalid', `verdict 必须是 comment、approve 或 request-changes：${String(fields.verdict)}`)
+    }
+    const comments = fields.comments ?? []
+    if (comments.length > MAX_REVIEW_COMMENTS) throw new RepoError('invalid', `行级评论最多 ${MAX_REVIEW_COMMENTS} 条`)
+    for (const item of comments) {
+      requireRepoPath(item.path, '行级评论路径')
+      requireText(item.body, '行级评论内容')
+      if (item.newLine === undefined && item.oldLine === undefined) {
+        throw new RepoError('invalid', `行级评论（${item.path}）至少需要提供 newLine 或 oldLine`)
+      }
+      if (item.newLine !== undefined) requireId(item.newLine, 'newLine ')
+      if (item.oldLine !== undefined) requireId(item.oldLine, 'oldLine ')
+    }
+    const body = fields.body !== undefined && fields.body.trim() !== '' ? fields.body : undefined
+    if (fields.verdict !== 'approve' && body === undefined && comments.length === 0) {
+      throw new RepoError('invalid', `${fields.verdict} 评审至少需要提供 body 或行级 comments`)
+    }
+    return await this.run(repo, fields, `评审 PR/MR #${number}`, 'write', async (provider, ref, call, entry) => {
+      const bot = fields.verdict === 'comment'
+        ? undefined
+        : await this.deps.hosts.botUser(entry.url, call.signal).catch(() => undefined)
+      return await provider.mrReview(ref, number, {
+        headSha: fields.headSha,
+        verdict: fields.verdict,
+        ...body === undefined ? {} : { body },
+        comments,
+        signature: fields.signature ?? '',
+        ...bot === undefined ? {} : { botUsername: bot.username },
+      }, call)
+    })
+  }
+
+  async replyMrDiscussion(repo: RepoTarget, number: number, discussionId: string, body: string, options: CallOptions = {}): Promise<MrReplyOutcome> {
+    requireNumber(number)
+    requireText(discussionId, 'discussionId')
+    requireText(body, '回复内容')
+    return await this.run(repo, options, `回复 PR/MR #${number} 讨论线程 ${discussionId}`, 'write', (provider, ref, call) => provider.mrDiscussionReply(ref, number, discussionId, body, call))
+  }
+
+  async resolveMrDiscussion(repo: RepoTarget, number: number, discussionId: string, resolved: boolean, options: CallOptions = {}): Promise<MrDiscussionResolveResult> {
+    requireNumber(number)
+    requireText(discussionId, 'discussionId')
+    return await this.run(repo, options, `${resolved ? '解决' : '重新打开'} PR/MR #${number} 讨论线程 ${discussionId}`, 'write', (provider, ref, call) => provider.mrDiscussionResolve(ref, number, discussionId, resolved, call))
+  }
+
+  async currentBotUser(repo: RepoTarget, options: CallOptions = {}): Promise<RepoUser> {
+    const { target } = this.deps.catalog.open(repo, 'read')
+    return await this.deps.hosts.botUser(target.spec.url, options.signal)
   }
 
   async mergeMr(repo: RepoTarget, number: number, options: MergeFields) {

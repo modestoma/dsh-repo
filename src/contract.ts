@@ -35,7 +35,7 @@ export type DshReposServiceName = 'dshRepos'
  * consumer misbehave; a consumer refuses a provider whose version it does not
  * know.
  */
-export type DshReposVersion = 7
+export type DshReposVersion = 8
 
 /** Code host family. */
 export type ForgeKind = 'github' | 'gitlab'
@@ -70,12 +70,23 @@ export type RepoErrorCode =
   /** Network failure, timeout, or another host error. */
   | 'unavailable'
 
+/** Partial progress already written to the host before a multi-step {@link DshRepoService.mrReview} failed. */
+export interface PartialMrReviewProgress {
+  readonly postedComments: number
+  readonly fallbackInlineCount: number
+  readonly ownCommentIds: readonly string[]
+  readonly approved?: boolean
+  readonly webUrl?: string
+}
+
 /** Fields of a rejection from the service. */
 export interface RepoFailure {
   readonly name: 'RepoError'
   readonly code: RepoErrorCode
   /** Readable reason (Chinese), including the host's message when there is one. */
   readonly message: string
+  /** Already-published review state when a multi-step {@link DshRepoService.mrReview} fails midway. */
+  readonly partialReview?: PartialMrReviewProgress
 }
 
 /** Caller fields every service method accepts besides its parameters. */
@@ -348,6 +359,50 @@ export interface MrDiff {
   readonly diff: string
   /** Whether {@link diff} is incomplete: cut at the configured limit, or the host left out some files. */
   readonly truncated: boolean
+}
+
+/** Diff line position: which file and which side/line an inline comment attaches to. */
+export interface DiffPosition {
+  /** Path from the repository root, `/`-separated. */
+  readonly path: string
+  /** Line number in the new file (required for added or context lines; omitted for pure deletions). */
+  readonly newLine?: number
+  /** Line number in the old file (required for pure deletions; optional on modified hunks). */
+  readonly oldLine?: number
+}
+
+/** One message inside a discussion thread. */
+export interface DiscussionNote {
+  readonly id: string
+  readonly author: RepoUser
+  readonly body: string
+  readonly createdAt: string
+  readonly updatedAt?: string
+  readonly webUrl?: string
+}
+
+/** One discussion thread on a pull/merge request (inline review thread or resolvable conversation thread). */
+export interface MrDiscussion {
+  /** Thread id (GitHub review thread GraphQL node id / GitLab discussion id). */
+  readonly id: string
+  /** Whether this thread is anchored to a diff line; false for a top-level discussion. */
+  readonly inline: boolean
+  /** Diff line position, when {@link inline} is true. */
+  readonly position?: DiffPosition
+  /** Whether this thread supports resolution, and whether it is currently resolved. */
+  readonly resolvable: boolean
+  readonly resolved: boolean
+  readonly resolvedBy?: RepoUser
+  /** Notes in the thread, oldest first (`[0]` started the thread, the rest are replies). */
+  readonly notes: readonly DiscussionNote[]
+}
+
+/** Verdict of a pull/merge request review. */
+export type ReviewVerdict = 'comment' | 'approve' | 'request-changes'
+
+/** One inline review comment to post. */
+export interface DraftInlineComment extends DiffPosition {
+  readonly body: string
 }
 
 /** Aggregated CI result. */
@@ -804,6 +859,66 @@ export interface MrListParams extends RepoParams, PageParams {
   /** Branch of this repository the requests come from; requests from forks are left out. */
   readonly sourceBranch?: string
   readonly targetBranch?: string
+  /** Sort field (descending); defaults to `updated` when {@link updatedAfter} is given. */
+  readonly sort?: 'created' | 'updated'
+  /** ISO-8601 timestamp; keep only requests with `updatedAt` strictly after this time, stopping pagination once an older item is reached. */
+  readonly updatedAfter?: string
+}
+
+/** Parameters of {@link DshRepoService.mrCompare}. */
+export interface MrCompareParams extends RepoParams {
+  /** Base commit SHA or ref. */
+  readonly baseSha: string
+  /** Head commit SHA or ref. */
+  readonly headSha: string
+}
+
+/** Parameters of {@link DshRepoService.mrDiscussions}. */
+export interface MrDiscussionsParams extends NumberParams, PageParams {
+  /** Keep only unresolved resolvable threads. */
+  readonly onlyUnresolved?: boolean
+}
+
+/** Parameters of {@link DshRepoService.mrReview}. */
+export interface MrReviewParams extends NumberParams {
+  /** Head commit SHA the review targets; refused with `conflict` when the remote head moved. */
+  readonly headSha: string
+  /** Verdict; automatically downgraded to `comment` (`downgradedVerdict: true`) when the token account is the PR/MR author. */
+  readonly verdict: ReviewVerdict
+  /** Overall review summary; the tools' signature setting is appended. */
+  readonly body?: string
+  /** Inline review comments (at most 50). */
+  readonly comments?: readonly DraftInlineComment[]
+}
+
+/** Outcome of {@link DshRepoService.mrReview}. */
+export interface MrReviewResult {
+  readonly verdict: ReviewVerdict
+  /** True when `approve` or `request-changes` was downgraded to `comment` due to self-review restrictions. */
+  readonly downgradedVerdict?: boolean
+  readonly postedComments: number
+  /** Inline comments folded into the review summary because the host rejected their diff line position. */
+  readonly fallbackInlineCount: number
+  readonly webUrl?: string
+}
+
+/** Parameters of {@link DshRepoService.mrDiscussionReply}. */
+export interface MrDiscussionReplyParams extends NumberParams {
+  readonly discussionId: string
+  /** The tools' signature setting is appended. */
+  readonly body: string
+}
+
+/** Parameters of {@link DshRepoService.mrDiscussionResolve}. */
+export interface MrDiscussionResolveParams extends NumberParams {
+  readonly discussionId: string
+  readonly resolved: boolean
+}
+
+/** Outcome of {@link DshRepoService.mrDiscussionResolve}. */
+export interface MrDiscussionResolveResult {
+  readonly discussionId: string
+  readonly resolved: boolean
 }
 
 /** Parameters of {@link DshRepoService.mrCreate}. */
@@ -1142,6 +1257,10 @@ export interface DshRepoService {
   mrGet(params: NumberParams & CallOptions): Promise<MrDetail>
   /** @returns the request's unified diff. */
   mrDiff(params: NumberParams & CallOptions): Promise<MrDiff>
+  /** @returns the unified diff between two commits or refs. */
+  mrCompare(params: MrCompareParams & CallOptions): Promise<MrDiff>
+  /** @returns one page of discussion threads on the request. */
+  mrDiscussions(params: MrDiscussionsParams & CallOptions): Promise<Page<MrDiscussion>>
   /** @returns CI and merge readiness. */
   mrStatus(params: NumberParams & CallOptions): Promise<MrStatus>
   /** @returns the new request, watched for the Agent's Session while watching is on. */
@@ -1150,6 +1269,12 @@ export interface DshRepoService {
   mrUpdate(params: MrUpdateParams & WriteOptions): Promise<MrInfo & Partial<WatchState>>
   /** @returns the new comment. */
   mrComment(params: CommentParams & WriteOptions): Promise<CommentInfo>
+  /** @returns the submitted review outcome. */
+  mrReview(params: MrReviewParams & WriteOptions): Promise<MrReviewResult>
+  /** @returns the new reply note on a discussion thread. */
+  mrDiscussionReply(params: MrDiscussionReplyParams & WriteOptions): Promise<DiscussionNote>
+  /** @returns the updated resolution state of a discussion thread. */
+  mrDiscussionResolve(params: MrDiscussionResolveParams & WriteOptions): Promise<MrDiscussionResolveResult>
   /** @returns the merge outcome; needs catalog access `merge`. */
   mrMerge(params: MrMergeParams & WriteOptions): Promise<MergeResult>
   /**
@@ -1215,6 +1340,12 @@ export interface DshRepoService {
    * @returns the resolved repository.
    */
   repoResolve(repo: RepoTarget): RepoRef
+  /**
+   * Read the host user corresponding to the current token of the repository's host (cached per host and invalidated on host/token changes).
+   * Requires the repository in the catalog (`read`).
+   * @returns the token account's username and optional profile URL.
+   */
+  currentBotUser(params: RepoParams & CallOptions): Promise<RepoUser>
   /**
    * Observe every successful catalog change; a throwing listener does not affect the change.
    * @returns disposer.

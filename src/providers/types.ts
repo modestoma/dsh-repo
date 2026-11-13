@@ -8,8 +8,9 @@
  */
 
 import type {
-  BranchInfo, MrDetail, CommitAuthor, MrDiff, MrInfo, MrState, MrStatus, CiActionResult, CiJob, CiRun, CiRunDetail, CommentInfo, CommitInfo,
-  FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, RepoUser, TreeListing,
+  BranchInfo, MrDetail, CommitAuthor, MrDiff, MrDiscussion, MrDiscussionResolveResult, MrInfo, MrReviewResult, MrState, MrStatus, CiActionResult, CiJob, CiRun, CiRunDetail,
+  CommentInfo, CommitInfo, DiscussionNote, DraftInlineComment, FileContent, IssueDetail, IssueInfo, IssueState, MergeMethod, MergeResult, Page, RepoInfo, RepoRef, RepoUser,
+  ReviewVerdict, TreeListing,
 } from '../contract.ts'
 import type { HostSpec, RepoLimits } from '../config.ts'
 
@@ -34,10 +35,34 @@ export interface CiRunQuery {
   readonly state?: 'pending' | 'running' | 'success' | 'failure' | 'canceled'
 }
 
+/** Validated review payload passed to a provider. */
+export interface MrReviewRequest {
+  readonly headSha: string
+  readonly verdict: ReviewVerdict
+  readonly body?: string
+  readonly comments: readonly DraftInlineComment[]
+  readonly signature: string
+  /** Current token's username when known, for proactive self-review detection. */
+  readonly botUsername?: string
+}
+
+/** Provider review outcome, with posted comment ids so watches ignore own reviews. */
+export interface MrReviewOutcome extends MrReviewResult {
+  readonly ownCommentIds?: readonly string[]
+}
+
+/** Provider thread reply outcome, with extra ids for watch suppression. */
+export interface MrReplyOutcome {
+  readonly note: DiscussionNote
+  readonly ownCommentIds?: readonly string[]
+}
+
 /** One code host family. Methods throw SDK errors or {@link RepoError}; the service classifies them. */
 export interface Provider {
   /** Commit identity of the account that owns the token. */
   currentUser(call: Call): Promise<CommitAuthor>
+  /** Host user of the account that owns the token. */
+  botUser(call: Call): Promise<RepoUser>
   repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo>
   getBranch(ref: RepoRef, name: string, call: Call): Promise<BranchInfo | undefined>
   listBranches(ref: RepoRef, query: Paging & { readonly search?: string }, call: Call): Promise<Page<BranchInfo>>
@@ -53,13 +78,18 @@ export interface Provider {
   updateIssue(ref: RepoRef, number: number, update: IssueFields & { readonly state?: IssueState }, call: Call): Promise<IssueInfo>
   commentIssue(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
 
-  listMrs(ref: RepoRef, query: Paging & { readonly state: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string }, call: Call): Promise<Page<MrInfo>>
+  listMrs(ref: RepoRef, query: Paging & { readonly state: MrState | 'all'; readonly sourceBranch?: string; readonly targetBranch?: string; readonly sort?: 'created' | 'updated'; readonly updatedAfter?: string }, call: Call): Promise<Page<MrInfo>>
   getMr(ref: RepoRef, number: number, call: Call): Promise<MrDetail>
   mrDiff(ref: RepoRef, number: number, call: Call): Promise<MrDiff>
+  mrCompare(ref: RepoRef, baseSha: string, headSha: string, call: Call): Promise<MrDiff>
+  mrDiscussions(ref: RepoRef, number: number, query: Paging & { readonly onlyUnresolved?: boolean }, call: Call): Promise<Page<MrDiscussion>>
   mrStatus(ref: RepoRef, number: number, call: Call): Promise<MrStatus>
   createMr(ref: RepoRef, change: IssueFields & { readonly title: string; readonly sourceBranch: string; readonly targetBranch: string; readonly draft: boolean; readonly deleteSourceBranch: boolean }, call: Call): Promise<MrInfo>
   updateMr(ref: RepoRef, number: number, update: IssueFields & { readonly state?: 'open' | 'closed'; readonly targetBranch?: string }, call: Call): Promise<MrInfo>
   commentMr(ref: RepoRef, number: number, body: string, call: Call): Promise<CommentInfo>
+  mrReview(ref: RepoRef, number: number, request: MrReviewRequest, call: Call): Promise<MrReviewOutcome>
+  mrDiscussionReply(ref: RepoRef, number: number, discussionId: string, body: string, call: Call): Promise<MrReplyOutcome>
+  mrDiscussionResolve(ref: RepoRef, number: number, discussionId: string, resolved: boolean, call: Call): Promise<MrDiscussionResolveResult>
   /** With `deleteSourceBranch`, the result reports the source branch; a failed deletion does not throw. */
   mergeMr(ref: RepoRef, number: number, request: { readonly headSha: string; readonly method?: MergeMethod; readonly deleteSourceBranch: boolean }, call: Call): Promise<MergeResult>
   /** One poll for a watch: always the PR/MR, CI and comments only as `request` asks. */
@@ -274,4 +304,35 @@ export function errorText(error: unknown): string {
  */
 export function titleOf(message: string): string {
   return message.split('\n', 1)[0] ?? ''
+}
+
+/**
+ * Format an inline comment rejected by the host (e.g. line outside diff hunk) as a Markdown blockquote.
+ * @param item - inline comment to fold into the review summary.
+ * @returns Markdown blockquote naming the path, line, and body.
+ */
+export function formatFallbackInlineComment(item: DraftInlineComment): string {
+  const location = item.newLine !== undefined
+    ? `${item.path}:${item.newLine}`
+    : item.oldLine !== undefined
+      ? `${item.path}:${item.oldLine} (old)`
+      : item.path
+  const quoted = item.body.split('\n').map(line => line === '' ? '>' : `> ${line}`).join('\n')
+  return `> **\`${location}\`**\n${quoted}`
+}
+
+/**
+ * Build the summary body of a review, folding any fallback inline comments and appending the configured signature.
+ * @param body - caller-supplied review summary.
+ * @param fallbacks - inline comments that could not be anchored on diff hunks.
+ * @param signature - configured signature; empty adds none.
+ * @returns the composed review body, or undefined when there is neither summary nor fallback comments.
+ */
+export function composeReviewBody(body: string | undefined, fallbacks: readonly DraftInlineComment[], signature: string): string | undefined {
+  const parts: string[] = []
+  if (body !== undefined && body !== '') parts.push(body)
+  for (const item of fallbacks) parts.push(formatFallbackInlineComment(item))
+  if (parts.length === 0) return undefined
+  const combined = parts.join('\n\n')
+  return signature === '' ? combined : `${combined}\n\n${signature}`
 }
