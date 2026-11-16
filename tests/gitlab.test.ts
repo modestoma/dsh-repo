@@ -506,7 +506,8 @@ describe('GitLab CI', () => {
         path: `${API}/merge_requests/7/discussions`,
         reply: (req) => {
           discussionCall += 1
-          if (String(req.body).includes('999')) {
+          // Match the field value, not the whole multipart body: the random boundary can contain the same digits.
+          if (/name="position\[new_line\]"\r\n\r\n999\r\n/.test(String(req.body))) {
             return { status: 400, body: { message: '400 Bad request - Note {:line_code=>["can\'t be blank"]}' } }
           }
           return { status: 201, body: { id: `d-${discussionCall}`, notes: [{ id: 300 + discussionCall, body: 'inline', author, created_at: 'c' }] } }
