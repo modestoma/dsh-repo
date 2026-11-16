@@ -585,6 +585,9 @@ describe('GitHub Actions CI', () => {
         path: `${API}/pulls/5/reviews`,
         reply: (req) => {
           const payload = req.body as { event: string; comments?: unknown[]; body?: string }
+          if (payload.event !== 'APPROVE' && (payload.body === undefined || payload.body === '')) {
+            return { status: 422, body: { message: 'Unprocessable Entity', errors: ['Body is required'] } }
+          }
           if (reviewBehavior === 'self-422' && payload.event !== 'COMMENT') {
             return { status: 422, body: { message: 'Unprocessable Entity', errors: ['Can not approve your own pull request'] } }
           }
@@ -666,7 +669,39 @@ describe('GitHub Actions CI', () => {
     expect((requests.at(-1)?.body as { event: string; body: string }).event).toBe('COMMENT')
     expect((requests.at(-1)?.body as { body: string }).body).toContain('_— bot_')
 
-    // 5. Out-of-bounds diff hunk 422 gracefully falls back to Markdown blockquotes in summary body.
+    // 5. Inline-only COMMENT reviews keep their diff positions under a default summary.
+    prAuthor = 'contributor'
+    reviewBehavior = 'ok'
+    const inlineOnly = await service.forge.reviewMr(REPO, 5, {
+      headSha: SHA,
+      verdict: 'comment',
+      comments: [{ path: 'src/a.ts', newLine: 10, body: 'Null check' }],
+      signature: '_— bot_',
+    })
+    expect(inlineOnly).toMatchObject({ verdict: 'comment', postedComments: 1, fallbackInlineCount: 0 })
+    expect(requests.at(-2)?.body).toEqual({
+      commit_id: SHA,
+      event: 'COMMENT',
+      body: '评审意见见行级评论\n\n_— bot_',
+      comments: [{ path: 'src/a.ts', line: 10, side: 'RIGHT', body: 'Null check' }],
+    })
+
+    // 6. A self-review downgraded to COMMENT with inline comments and no summary keeps its inline comments.
+    prAuthor = 'dsh-bot'
+    const selfInline = await service.forge.reviewMr(REPO, 5, {
+      headSha: SHA,
+      verdict: 'request-changes',
+      comments: [{ path: 'src/b.ts', oldLine: 4, body: 'Removed guard' }],
+    })
+    expect(selfInline).toMatchObject({ verdict: 'comment', downgradedVerdict: true, postedComments: 1, fallbackInlineCount: 0 })
+    expect(requests.at(-2)?.body).toEqual({
+      commit_id: SHA,
+      event: 'COMMENT',
+      body: '（自审自动降级为评论）',
+      comments: [{ path: 'src/b.ts', line: 4, side: 'LEFT', body: 'Removed guard' }],
+    })
+
+    // 7. Out-of-bounds diff hunk 422 gracefully falls back to Markdown blockquotes in summary body.
     prAuthor = 'contributor'
     reviewBehavior = 'hunk-422'
     const fallback = await service.forge.reviewMr(REPO, 5, {

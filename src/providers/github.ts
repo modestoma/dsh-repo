@@ -871,11 +871,13 @@ export class GithubProvider implements Provider {
       downgraded = true
     }
 
-    const submit = async (currentVerdict: ReviewVerdict, inline: readonly DraftInlineComment[], fallbacks: readonly DraftInlineComment[], ensureBody: boolean) => {
+    // GitHub rejects COMMENT and REQUEST_CHANGES reviews without a body, even when they carry inline comments.
+    const submit = async (currentVerdict: ReviewVerdict, inline: readonly DraftInlineComment[], fallbacks: readonly DraftInlineComment[]) => {
       const event = currentVerdict === 'approve' ? 'APPROVE' as const : currentVerdict === 'request-changes' ? 'REQUEST_CHANGES' as const : 'COMMENT' as const
       let body = composeReviewBody(request.body, fallbacks, request.signature)
-      if (body === undefined && (ensureBody || currentVerdict === 'request-changes')) {
-        body = composeReviewBody(currentVerdict === 'request-changes' ? '请求修改' : '（自审自动降级为评论）', [], request.signature)
+      if (body === undefined && event !== 'APPROVE') {
+        const summary = event === 'REQUEST_CHANGES' ? '请求修改' : downgraded ? '（自审自动降级为评论）' : '评审意见见行级评论'
+        body = composeReviewBody(summary, [], request.signature)
       }
       const comments = inline.map(item => item.newLine !== undefined
         ? { path: item.path, line: item.newLine, side: 'RIGHT' as const, body: item.body }
@@ -920,7 +922,7 @@ export class GithubProvider implements Provider {
     }
 
     try {
-      const res = await submit(verdict, request.comments, [], downgraded && request.comments.length === 0)
+      const res = await submit(verdict, request.comments, [])
       return await buildOutcome(res, request.comments.length, 0)
     } catch (firstError) {
       let currentError: unknown = firstError
@@ -929,7 +931,7 @@ export class GithubProvider implements Provider {
         verdict = 'comment'
         downgraded = true
         try {
-          const res = await submit('comment', request.comments, [], request.comments.length === 0)
+          const res = await submit('comment', request.comments, [])
           return await buildOutcome(res, request.comments.length, 0)
         } catch (secondError) {
           currentError = secondError
@@ -937,7 +939,7 @@ export class GithubProvider implements Provider {
       }
       const status = (currentError as { status?: unknown } | null | undefined)?.status
       if ((status === 422 || status === 400) && request.comments.length > 0) {
-        const res = await submit(verdict, [], request.comments, false)
+        const res = await submit(verdict, [], request.comments)
         return await buildOutcome(res, 0, request.comments.length)
       }
       throw currentError
