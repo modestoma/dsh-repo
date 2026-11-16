@@ -19,8 +19,11 @@ export type SettingsListener = (next: RepoSettings, previous: RepoSettings) => P
 export class RuntimeSettings {
   private readonly listeners = new Set<SettingsListener>()
 
-  /** @param store - settings file. */
-  constructor(private readonly store: SettingsStore) {}
+  /**
+   * @param store - settings file.
+   * @param check - why valid settings cannot be saved given the rest of the plugin's state, checked before every save; undefined when they can.
+   */
+  constructor(private readonly store: SettingsStore, private readonly check: (next: RepoSettings) => string | undefined = () => undefined) {}
 
   /** @returns the run-time settings now in effect. */
   get current(): RepoSettings {
@@ -43,11 +46,13 @@ export class RuntimeSettings {
    * order.
    * @param input - complete settings from the settings page.
    * @returns the settings now in effect.
-   * @throws {RepoError} `invalid` naming every bad field, `unavailable` when the file cannot be written or a listener failed after the save.
+   * @throws {RepoError} `invalid` naming every bad field or the reason the check gave, `unavailable` when the file cannot be written or a listener failed after the save.
    */
   async update(input: unknown): Promise<RepoSettings> {
     const previous = this.current
     const next = input === undefined ? DEFAULT_SETTINGS : resolveSettings(input)
+    const problem = this.check(next)
+    if (problem !== undefined) throw new RepoError('invalid', problem)
     await this.store.setSettings(next)
     const failures: string[] = []
     for (const listener of this.listeners) {

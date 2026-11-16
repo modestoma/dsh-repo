@@ -7,7 +7,7 @@
  * @module dsh-repo/forge/hosts
  */
 
-import type { CommitAuthor, HostCreate, HostInfo, HostsChange, RepoTarget, TokenStatus } from '../contract.ts'
+import type { CommitAuthor, HostCreate, HostInfo, HostsChange, RepoTarget, RepoUser, TokenStatus } from '../contract.ts'
 import type { HostSpec } from '../config.ts'
 import { RepoError, toRepoError } from '../errors.ts'
 import type { HostCredentials, HostLogger } from '../host.ts'
@@ -59,6 +59,8 @@ export class HostRegistry {
   private readonly providers = new Map<string, Provider>()
   /** Commit identity of each host's token account, keyed by host URL and checked against the token it was read with. */
   private readonly identities = new Map<string, { readonly token: string; readonly author: Promise<CommitAuthor> }>()
+  /** Host user of each host's token account, keyed by host URL and invalidated on host/token changes. */
+  private readonly botUsers = new Map<string, { readonly token: string; readonly user: Promise<RepoUser> }>()
   private readonly listeners = new Set<(change: HostsChange) => void>()
   private readonly factory: ProviderFactory
 
@@ -119,6 +121,7 @@ export class HostRegistry {
     const spec = await this.deps.store.remove(url)
     this.providers.delete(spec.url)
     this.identities.delete(spec.url)
+    this.botUsers.delete(spec.url)
     try {
       await this.deps.credentials.unset(spec.tokenRef)
     } catch (error) {
@@ -168,6 +171,10 @@ export class HostRegistry {
    * @param change - what changed.
    */
   notify(change: HostsChange): void {
+    if (change.kind !== 'mirror') {
+      this.identities.delete(change.url)
+      this.botUsers.delete(change.url)
+    }
     for (const listener of [...this.listeners]) {
       try {
         listener(change)
@@ -180,6 +187,7 @@ export class HostRegistry {
   /** Drop the built providers, so the next call builds them with the current API deadline. */
   resetProviders(): void {
     this.providers.clear()
+    this.botUsers.clear()
   }
 
   /**
@@ -231,6 +239,32 @@ export class HostRegistry {
       return await (signal === undefined ? entry.author : Promise.race([entry.author, abortion(signal)]))
     } catch (error) {
       throw toRepoError(error, `读取 ${spec.url} 令牌账号的提交身份（作者默认用令牌账号）`)
+    }
+  }
+
+  /**
+   * Host user of the token account of the host `url` belongs to; cached per host
+   * and invalidated when the host or its token changes.
+   * @param url - accepted git address under a configured host.
+   * @param signal - caller cancellation of the wait.
+   * @returns the token account's username and optional profile URL.
+   * @throws {RepoError} `not-allowed` without a configured host, and the classified failure of the host's current-user API.
+   */
+  async botUser(url: string, signal: AbortSignal | undefined): Promise<RepoUser> {
+    const spec = this.hostOf(url)
+    const token = await this.token(spec)
+    let entry = this.botUsers.get(spec.url)
+    if (entry?.token !== token) {
+      const settings = this.deps.store.settings()
+      const user = this.provider(spec).botUser({ signal: AbortSignal.timeout(settings.timeoutMs), limits: settings.limits })
+      entry = { token, user }
+      this.botUsers.set(spec.url, entry)
+      user.catch(() => { if (this.botUsers.get(spec.url) === entry) this.botUsers.delete(spec.url) })
+    }
+    try {
+      return await (signal === undefined ? entry.user : Promise.race([entry.user, abortion(signal)]))
+    } catch (error) {
+      throw toRepoError(error, `读取 ${spec.url} 当前令牌账号`)
     }
   }
 

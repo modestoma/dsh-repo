@@ -10,13 +10,13 @@
 
 import { Gitlab } from '@gitbeaker/rest'
 import type {
-  BranchInfo, MrInfo, MrState, MrStatus, CheckInfo, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiState, CiTestCounts, CommentInfo, CommitAuthor, CommitInfo,
-  IssueInfo, RepoInfo, RepoRef, RepoUser, SourceBranchDeletion, TreeEntry,
+  BranchInfo, MrDiff, MrDiscussion, MrDiscussionResolveResult, MrInfo, MrState, MrStatus, CheckInfo, CiActionResult, CiFailure, CiJob, CiRun, CiRunDetail, CiState, CiTestCounts,
+  CommentInfo, CommitAuthor, CommitInfo, DiffPosition, DiscussionNote, DraftInlineComment, IssueInfo, Page, PartialMrReviewProgress, RepoInfo, RepoRef, RepoUser, ReviewVerdict, SourceBranchDeletion, TreeEntry,
 } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { forgeKindInfo } from '../settings/contract.ts'
-import { capFailures, errorText, joinRepoPath, nextPage, okBody, pathSegments, titleOf, truncateBytes } from './types.ts'
-import type { ActivityItem, ActivityRequest, Call, ForgeAdapter, MrActivity, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
+import { capFailures, composeReviewBody, errorText, joinRepoPath, nextPage, okBody, pathSegments, titleOf, truncateBytes } from './types.ts'
+import type { ActivityItem, ActivityRequest, Call, ForgeAdapter, MrActivity, MrReplyOutcome, MrReviewOutcome, MrReviewRequest, CiRunQuery, Paging, Provider, TokenSource } from './types.ts'
 
 /** GitLab's maximum page size. */
 const MAX_PAGE = 100
@@ -77,6 +77,7 @@ interface GitlabMergeRequest extends GitlabIssue {
   readonly target_project_id?: number
   readonly should_remove_source_branch?: boolean | null
   readonly force_remove_source_branch?: boolean | null
+  readonly diff_refs?: { readonly base_sha: string; readonly head_sha: string; readonly start_sha: string } | null
 }
 
 /** Whether a merge request comes from a fork. */
@@ -139,6 +140,118 @@ function statusOf(data: GitlabMergeStatus): MrStatus {
 
 function note(value: GitlabNote): CommentInfo {
   return { id: String(value.id), author: user(value.author), body: value.body, createdAt: value.created_at }
+}
+
+interface GitlabDiscussionPosition {
+  readonly position_type?: string
+  readonly new_path?: string | null
+  readonly old_path?: string | null
+  readonly new_line?: number | string | null
+  readonly old_line?: number | string | null
+}
+
+function lineNumber(value: number | string | null | undefined): number | undefined {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return value
+  if (typeof value === 'string' && /^\d+$/.test(value)) {
+    const parsed = Number(value)
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined
+  }
+  return undefined
+}
+
+interface GitlabDiscussionNote {
+  readonly id: number
+  readonly body: string
+  readonly author: GitlabUser
+  readonly created_at: string
+  readonly updated_at?: string | null
+  readonly system?: boolean
+  readonly resolvable?: boolean
+  readonly resolved?: boolean
+  readonly resolved_by?: GitlabUser | string | null
+  readonly position?: GitlabDiscussionPosition | null
+}
+
+interface GitlabDiscussion {
+  readonly id: string
+  readonly individual_note?: boolean
+  readonly notes?: readonly GitlabDiscussionNote[]
+}
+
+interface GitlabDiffFile {
+  readonly old_path: string
+  readonly new_path: string
+  readonly new_file: boolean
+  readonly deleted_file: boolean
+  readonly diff: string
+  readonly too_large?: boolean
+  readonly collapsed?: boolean
+}
+
+function isNoteResolvable(entry: GitlabDiscussionNote): boolean {
+  if (typeof entry.resolvable === 'boolean') return entry.resolvable
+  return typeof entry.resolved === 'boolean' || (entry.position !== undefined && entry.position !== null)
+}
+
+function discussionNote(entry: GitlabDiscussionNote, repoWebUrl: string, number: number): DiscussionNote {
+  return {
+    id: String(entry.id),
+    author: user(entry.author),
+    body: entry.body,
+    createdAt: entry.created_at,
+    ...typeof entry.updated_at === 'string' && entry.updated_at !== '' ? { updatedAt: entry.updated_at } : {},
+    webUrl: `${repoWebUrl}/-/merge_requests/${number}#note_${entry.id}`,
+  }
+}
+
+function mapDiscussion(entry: GitlabDiscussion, repoWebUrl: string, number: number): MrDiscussion | undefined {
+  const userNotes = (entry.notes ?? []).filter(item => item.system !== true)
+  const first = userNotes[0]
+  if (first === undefined) return undefined
+  const pos = first.position
+  const path = pos?.new_path ?? pos?.old_path ?? undefined
+  const inline = typeof path === 'string' && path !== ''
+  const newLine = lineNumber(pos?.new_line)
+  const oldLine = lineNumber(pos?.old_line)
+  const position: DiffPosition | undefined = inline
+    ? {
+      path,
+      ...newLine === undefined ? {} : { newLine },
+      ...oldLine === undefined ? {} : { oldLine },
+    }
+    : undefined
+  const resolvableNotes = userNotes.filter(isNoteResolvable)
+  const resolvable = resolvableNotes.length > 0
+  const resolved = resolvable && resolvableNotes.every(item => item.resolved === true)
+  const resolver = resolved ? resolvableNotes.find(item => item.resolved_by !== undefined && item.resolved_by !== null)?.resolved_by : undefined
+  return {
+    id: entry.id,
+    inline,
+    ...position === undefined ? {} : { position },
+    resolvable,
+    resolved,
+    ...resolver === undefined || resolver === null ? {} : { resolvedBy: typeof resolver === 'string' ? { username: resolver } : user(resolver) },
+    notes: userNotes.map(item => discussionNote(item, repoWebUrl, number)),
+  }
+}
+
+function formatDiffs(files: readonly GitlabDiffFile[], maxDiffBytes: number, extraTruncated = false): MrDiff {
+  // GitLab leaves `diff` empty for collapsed or oversized files; say so instead of presenting a complete diff.
+  let omitted = false
+  const parts = files.map((file) => {
+    const from = file.new_file ? '/dev/null' : `a/${file.old_path}`
+    const to = file.deleted_file ? '/dev/null' : `b/${file.new_path}`
+    const skipped = file.too_large === true || (file.collapsed === true && file.diff === '')
+    if (skipped) omitted = true
+    return `diff --git a/${file.old_path} b/${file.new_path}\n--- ${from}\n+++ ${to}\n${skipped ? '# GitLab 未返回这个文件的 diff（文件过大或已折叠）\n' : file.diff}`
+  })
+  const { text, truncated } = truncateBytes(parts.join(''), maxDiffBytes)
+  return { diff: text, truncated: truncated || omitted || extraTruncated }
+}
+
+function gitlabStatus(error: unknown): number | undefined {
+  const status = (error as { cause?: { response?: { status?: unknown } } } | null | undefined)?.cause?.response?.status
+  return typeof status === 'number' ? status : undefined
 }
 
 function pipelineState(status: string): CheckInfo['state'] {
@@ -342,6 +455,11 @@ export class GitlabProvider implements Provider {
     return { name: data.name, email: email ?? `${data.id}-${data.username}@users.noreply.${new URL(this.host).host}` }
   }
 
+  async botUser(call: Call): Promise<RepoUser> {
+    call.signal.throwIfAborted()
+    return user(await this.api.Users.showCurrentUser())
+  }
+
   async repoInfo(ref: RepoRef, call: Call): Promise<RepoInfo> {
     call.signal.throwIfAborted()
     const data = await this.api.Projects.show(ref.path)
@@ -472,7 +590,7 @@ export class GitlabProvider implements Provider {
     return note(await this.api.IssueNotes.create(ref.path, number, body))
   }
 
-  async listMrs(ref: RepoRef, query: Paging & { state: MrState | 'all'; sourceBranch?: string; targetBranch?: string }, call: Call) {
+  async listMrs(ref: RepoRef, query: Paging & { state: MrState | 'all'; sourceBranch?: string; targetBranch?: string; sort?: 'created' | 'updated'; updatedAfter?: string }, call: Call) {
     call.signal.throwIfAborted()
     const state = query.state === 'all' ? undefined : query.state === 'open' ? 'opened' as const : query.state
     const data = await this.api.MergeRequests.all({
@@ -481,10 +599,15 @@ export class GitlabProvider implements Provider {
       ...state === undefined ? {} : { state },
       ...query.sourceBranch === undefined ? {} : { sourceBranch: query.sourceBranch },
       ...query.targetBranch === undefined ? {} : { targetBranch: query.targetBranch },
+      ...query.sort === undefined ? {} : { orderBy: query.sort === 'updated' ? 'updated_at' as const : 'created_at' as const, sort: 'desc' as const },
+      ...query.updatedAfter === undefined ? {} : { updatedAfter: query.updatedAfter },
     })
+    const afterMs = query.updatedAfter === undefined ? undefined : Date.parse(query.updatedAfter)
+    const reachedCutoff = query.sort === 'updated' && afterMs !== undefined && data.length > 0 && Date.parse(data.at(-1)!.updated_at) <= afterMs
     // A source branch names a branch of this project, as GitHub's `head=owner:branch` does; MRs from forks with the same branch name are left out.
-    const items = query.sourceBranch === undefined ? data : data.filter(entry => !fromFork(entry))
-    return { items: items.map(entry => mergeRequest(entry)), ...nextPage(query, data.length) }
+    const visible = query.sourceBranch === undefined ? data : data.filter(entry => !fromFork(entry))
+    const items = visible.map(entry => mergeRequest(entry)).filter(change => afterMs === undefined || Date.parse(change.updatedAt) > afterMs)
+    return { items, ...reachedCutoff ? {} : nextPage(query, data.length) }
   }
 
   async getMr(ref: RepoRef, number: number, call: Call) {
@@ -499,17 +622,40 @@ export class GitlabProvider implements Provider {
   async mrDiff(ref: RepoRef, number: number, call: Call) {
     call.signal.throwIfAborted()
     const files = await this.api.MergeRequests.allDiffs(ref.path, number, { perPage: MAX_PAGE })
-    // GitLab leaves `diff` empty for collapsed or oversized files; say so instead of presenting a complete diff.
-    let omitted = false
-    const parts = files.map((file) => {
-      const from = file.new_file ? '/dev/null' : `a/${file.old_path}`
-      const to = file.deleted_file ? '/dev/null' : `b/${file.new_path}`
-      const skipped = file.too_large === true || (file.collapsed === true && file.diff === '')
-      if (skipped) omitted = true
-      return `diff --git a/${file.old_path} b/${file.new_path}\n--- ${from}\n+++ ${to}\n${skipped ? '# GitLab 未返回这个文件的 diff（文件过大或已折叠）\n' : file.diff}`
-    })
-    const { text, truncated } = truncateBytes(parts.join(''), call.limits.maxDiffBytes)
-    return { diff: text, truncated: truncated || omitted }
+    return formatDiffs(files, call.limits.maxDiffBytes)
+  }
+
+  async mrCompare(ref: RepoRef, baseSha: string, headSha: string, call: Call): Promise<MrDiff> {
+    call.signal.throwIfAborted()
+    const data = await this.api.Repositories.compare(ref.path, baseSha, headSha)
+    return formatDiffs(data.diffs ?? [], call.limits.maxDiffBytes, data.compare_timeout === true)
+  }
+
+  async mrDiscussions(ref: RepoRef, number: number, query: Paging & { readonly onlyUnresolved?: boolean }, call: Call): Promise<Page<MrDiscussion>> {
+    call.signal.throwIfAborted()
+    if (query.onlyUnresolved !== true) {
+      const raw: readonly GitlabDiscussion[] = await this.api.MergeRequestDiscussions.all(ref.path, number, paging(query))
+      const items = raw.map(entry => mapDiscussion(entry, ref.webUrl, number)).filter((entry): entry is MrDiscussion => entry !== undefined)
+      return { items, ...nextPage(query, raw.length) }
+    }
+    const needed = query.page * query.perPage + 1
+    const matched: MrDiscussion[] = []
+    for (let page = 1; page <= MAX_NOTE_PAGES; page += 1) {
+      call.signal.throwIfAborted()
+      const raw: readonly GitlabDiscussion[] = await this.api.MergeRequestDiscussions.all(ref.path, number, { page, perPage: MAX_PAGE, maxPages: 1 })
+      for (const entry of raw) {
+        const mapped = mapDiscussion(entry, ref.webUrl, number)
+        if (mapped !== undefined && mapped.resolvable && !mapped.resolved) matched.push(mapped)
+      }
+      const exhausted = raw.length < MAX_PAGE
+      if (matched.length >= needed || exhausted) {
+        const start = (query.page - 1) * query.perPage
+        const items = matched.slice(start, start + query.perPage)
+        const hasMore = matched.length > start + query.perPage || !exhausted
+        return { items, ...hasMore ? { nextPage: query.page + 1 } : {} }
+      }
+    }
+    throw new RepoError('too-large', `MR !${number} 的讨论线程超过 ${MAX_NOTE_PAGES * MAX_PAGE} 条，无法完成筛选或分页`)
   }
 
   async mrStatus(ref: RepoRef, number: number, call: Call) {
@@ -581,6 +727,140 @@ export class GitlabProvider implements Provider {
   async commentMr(ref: RepoRef, number: number, body: string, call: Call) {
     call.signal.throwIfAborted()
     return note(await this.api.MergeRequestNotes.create(ref.path, number, body))
+  }
+
+  async mrReview(ref: RepoRef, number: number, request: MrReviewRequest, call: Call): Promise<MrReviewOutcome> {
+    call.signal.throwIfAborted()
+    const mrData: GitlabMergeRequest = await this.api.MergeRequests.show(ref.path, number)
+    const remoteHead = mrData.sha
+    const diffRefs = mrData.diff_refs ?? undefined
+    if (
+      remoteHead.toLowerCase() !== request.headSha.toLowerCase()
+      || (diffRefs !== undefined && diffRefs.head_sha !== '' && diffRefs.head_sha.toLowerCase() !== request.headSha.toLowerCase())
+    ) {
+      throw new RepoError('conflict', `MR !${number} 的最新提交已变为 ${remoteHead.slice(0, 12)}（评审基于 ${request.headSha.slice(0, 12)}）`)
+    }
+
+    let verdict: ReviewVerdict = request.verdict
+    let downgraded = false
+    if (verdict !== 'comment' && request.botUsername !== undefined && mrData.author?.username !== undefined && mrData.author.username.toLowerCase() === request.botUsername.toLowerCase()) {
+      verdict = 'comment'
+      downgraded = true
+    }
+
+    let postedComments = 0
+    const fallbacks: DraftInlineComment[] = []
+    const ownCommentIds: string[] = []
+    let approved = false
+    let webUrl: string | undefined = mrData.web_url
+
+    try {
+      for (const item of request.comments) {
+        if (diffRefs === undefined) {
+          fallbacks.push(item)
+          continue
+        }
+        call.signal.throwIfAborted()
+        try {
+          const created = await this.api.MergeRequestDiscussions.create(ref.path, number, item.body, {
+            position: {
+              positionType: 'text',
+              baseSha: diffRefs.base_sha,
+              startSha: diffRefs.start_sha,
+              headSha: diffRefs.head_sha,
+              newPath: item.path,
+              oldPath: item.path,
+              ...item.newLine === undefined ? {} : { newLine: String(item.newLine) },
+              ...item.oldLine === undefined ? {} : { oldLine: String(item.oldLine) },
+            },
+          })
+          postedComments += 1
+          for (const entry of created.notes ?? []) ownCommentIds.push(String(entry.id))
+        } catch (error) {
+          const status = gitlabStatus(error)
+          if (status === 400 || status === 422) {
+            fallbacks.push(item)
+          } else {
+            throw error
+          }
+        }
+      }
+
+      if (verdict === 'approve') {
+        call.signal.throwIfAborted()
+        try {
+          await this.api.MergeRequestApprovals.approve(ref.path, number, { sha: request.headSha })
+          approved = true
+        } catch (error) {
+          const status = gitlabStatus(error)
+          if (status === 422 || ((status === 400 || status === 403) && /author|own|cannot\s+approve/i.test(errorText(error)))) {
+            verdict = 'comment'
+            downgraded = true
+          } else {
+            throw error
+          }
+        }
+      }
+
+      const effectiveBody = verdict === 'request-changes'
+        ? (request.body !== undefined && request.body !== ''
+          ? `**评审结论：请求修改（Request Changes）**\n\n${request.body}`
+          : '**评审结论：请求修改（Request Changes）**')
+        : request.body
+      let summary = composeReviewBody(effectiveBody, fallbacks, request.signature)
+      if (summary === undefined && downgraded && postedComments === 0) {
+        summary = composeReviewBody('（自审自动降级为评论）', [], request.signature)
+      }
+      if (summary !== undefined && summary !== '') {
+        call.signal.throwIfAborted()
+        const created = await this.api.MergeRequestNotes.create(ref.path, number, summary)
+        ownCommentIds.push(String(created.id))
+        webUrl = `${mrData.web_url}#note_${created.id}`
+      }
+    } catch (error) {
+      if (postedComments > 0 || ownCommentIds.length > 0 || approved) {
+        const partialReview: PartialMrReviewProgress = {
+          postedComments,
+          fallbackInlineCount: fallbacks.length,
+          ownCommentIds: [...ownCommentIds],
+          ...(approved ? { approved: true } : {}),
+          ...(webUrl === undefined ? {} : { webUrl }),
+        }
+        if (error instanceof RepoError) {
+          throw new RepoError(error.code, error.message, { partialReview })
+        }
+        const wrapped = error instanceof Error ? error : new Error(String(error))
+        throw Object.assign(wrapped, { partialReview })
+      }
+      throw error
+    }
+
+    return {
+      verdict,
+      ...downgraded ? { downgradedVerdict: true } : {},
+      postedComments,
+      fallbackInlineCount: fallbacks.length,
+      ...webUrl === undefined ? {} : { webUrl },
+      ownCommentIds,
+    }
+  }
+
+  async mrDiscussionReply(ref: RepoRef, number: number, discussionId: string, body: string, call: Call): Promise<MrReplyOutcome> {
+    if (!/^[A-Za-z0-9_-]+$/.test(discussionId)) throw new RepoError('invalid', `discussionId 不合法：${discussionId}`)
+    call.signal.throwIfAborted()
+    const created = await this.api.MergeRequestDiscussions.addNote(ref.path, number, discussionId, body)
+    const mapped = discussionNote(created, ref.webUrl, number)
+    return { note: mapped, ownCommentIds: [mapped.id] }
+  }
+
+  async mrDiscussionResolve(ref: RepoRef, number: number, discussionId: string, resolved: boolean, call: Call): Promise<MrDiscussionResolveResult> {
+    if (!/^[A-Za-z0-9_-]+$/.test(discussionId)) throw new RepoError('invalid', `discussionId 不合法：${discussionId}`)
+    call.signal.throwIfAborted()
+    const updated = await this.api.MergeRequestDiscussions.resolve(ref.path, number, discussionId, resolved)
+    const userNotes = (updated.notes ?? []).filter(entry => entry.system !== true)
+    const resolvableNotes = userNotes.filter(isNoteResolvable)
+    const actualResolved = resolvableNotes.length > 0 ? resolvableNotes.every(entry => entry.resolved === true) : resolved
+    return { discussionId: updated.id, resolved: actualResolved }
   }
 
   async mergeMr(ref: RepoRef, number: number, request: { headSha: string; method?: 'merge' | 'squash' | 'rebase'; deleteSourceBranch: boolean }, call: Call) {

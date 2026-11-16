@@ -17,7 +17,7 @@ import type { HostSpec, RepoSettings } from '../config.ts'
 import { RepoError } from '../errors.ts'
 import { forgeKindInfo } from './contract.ts'
 import { JsonFile } from '../files.ts'
-import { catalogEntrySchema } from '../catalog/entry.ts'
+import { catalogEntrySchema, upgradeLegacyEntries } from '../catalog/entry.ts'
 import type { CatalogEntry } from '../catalog/entry.ts'
 import type { HostLogger } from '../host.ts'
 
@@ -135,7 +135,9 @@ export class SettingsStore {
       prepare: (raw) => {
         const retired = dropRetired(raw)
         const local = dropLocalRepos(raw)
+        const upgraded = upgradeLegacyEntries(raw)
         return [
+          ...upgraded.length === 0 ? [] : [`仓库清单里 ${upgraded.join('、')} 的分支已拆成基线分支、功能分支和本地同步分支（都取原来的分支），下次保存时写入新格式`],
           ...retired.length === 0 ? [] : [`${retired.join('、')} 已由仓库清单取代，已忽略，下次保存时删除；可访问的仓库和每个仓库的权限请在「代码仓库 → 仓库」中配置`],
           ...local.length === 0 ? [] : [`仓库清单里的本地仓库 ${local.join('、')} 已不再支持，已忽略，下次保存时删除；请改用代码托管主机上的 https 地址`],
         ]

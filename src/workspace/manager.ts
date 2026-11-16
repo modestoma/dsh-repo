@@ -9,7 +9,12 @@
  *   git proxy and answers the proxy's password with the workspace's secret,
  *   so plain `git fetch` and `git push` work there without any token. Nothing
  *   is written to the user's or the system's git configuration.
- * - Each workspace has one remote branch, fixed at creation; a `commit-msg`
+ * - A workspace starts from the catalog entry's baseline branch unless the
+ *   caller names another base. Its one remote branch is fixed at creation:
+ *   the caller's, or a name generated from the branch name template; a branch
+ *   the remote does not have yet must match the branch name pattern. The
+ *   entry's branch rules replace the run-time settings field by field.
+ * - A `commit-msg`
  *   hook adds `DSH-Session: <id>` (the running Session from
  *   `$DSH_SESSION_ID`, else the creating Session).
  * - The checkout is untrusted: its configuration, hooks, and attributes are
@@ -26,6 +31,9 @@ import { isAbsolute, join, resolve } from 'node:path'
 import type { CommitAuthor, CommitTrailer, WorkspaceFileChange, WorkspaceInfo, WorkspaceStatus } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import { requireBranch, requireCommit } from '../refs.ts'
+import { matchesBranchPattern, renderBranchName } from '../settings/branch-names.ts'
+import type { CatalogEntry } from '../catalog/entry.ts'
+import type { RepoSettings } from '../config.ts'
 import type { HostLogger } from '../host.ts'
 import { GitError } from '../mirror/git.ts'
 import type { GitRunner } from '../mirror/git.ts'
@@ -35,6 +43,21 @@ import type { RepoService } from '../service.ts'
 import type { WorkspaceRecord, WorkspaceRegistry } from './registry.ts'
 
 const ZERO = /^0+$/
+
+/**
+ * The branch rules that apply to a repository: each field of the catalog entry's rules, else the run-time setting.
+ * @param entry - catalog entry.
+ * @param settings - run-time workspace settings.
+ * @returns the template and the pattern (empty: no rule).
+ */
+export function branchRulesOf(entry: CatalogEntry, settings: RepoSettings['workspace']): { readonly template: string; readonly pattern: string } {
+  return { template: entry.branchRules?.template ?? settings.branchTemplate, pattern: entry.branchRules?.pattern ?? settings.branchPattern }
+}
+
+/** Local date as `YYYYMMDD`. */
+function localDate(now: Date): string {
+  return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+}
 
 /** Options of git commands run inside a workspace. */
 export interface WorkspaceGitOptions {
@@ -235,16 +258,28 @@ export class WorkspaceManager {
     const url = entry.url
     const path = await this.checkPath(request.path)
     if (request.commit !== undefined) requireCommit(request.commit, '起点提交')
-    if (request.base !== undefined) requireBranch(request.base, '合入分支名')
+    if (request.base !== undefined) requireBranch(request.base, '基线分支名')
     const proxy = this.deps.proxy()
     if (proxy === undefined) throw new RepoError('unavailable', 'dsh-repo 的本机 git 代理没有运行，无法创建工作区；查看日志里代理启动失败的原因，或在设置页换一个代理端口')
-    const mirror = await service.mirrors.sync(url, { ...request.base === undefined ? {} : { branch: request.base }, signal })
-    const branch = request.branch ?? `dsh/${request.session === undefined ? randomBytes(4).toString('hex') : request.session.replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toLowerCase() || randomBytes(4).toString('hex')}`
-    requireBranch(branch, '分支名')
-    if (branch === mirror.defaultBranch) throw new RepoError('invalid', `不能在默认分支 ${branch} 上工作；用 base 指定合入目标，推送到别的分支`)
-    if (branch === mirror.branch) throw new RepoError('invalid', `分支 ${branch} 是合入目标，不能同时作为工作区的推送分支`)
+    const base = request.base ?? entry.base
+    const mirror = await service.mirrors.sync(url, { ...base === undefined ? {} : { branch: base }, signal })
+    const rules = branchRulesOf(entry, service.settings.current.workspace)
+    const random = randomBytes(4).toString('hex')
+    const branch = request.branch ?? renderBranchName(rules.template, {
+      session: request.session?.replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toLowerCase() || random,
+      random,
+      date: localDate(new Date()),
+    })
+    requireBranch(branch, request.branch === undefined ? `分支命名模板 ${rules.template} 生成的分支名` : '分支名')
+    if (branch === mirror.defaultBranch) throw new RepoError('invalid', `不能在默认分支 ${branch} 上工作；用 base 指定基线分支，推送到别的分支`)
+    if (branch === mirror.branch) throw new RepoError('invalid', `分支 ${branch} 是基线分支，不能同时作为工作区的推送分支`)
     await service.policy.requirePushableBranch(url, branch, signal)
     const existing = await this.mirrorBranch(mirror.dir, branch, signal)
+    if (existing === undefined && !matchesBranchPattern(branch, rules.pattern)) {
+      throw new RepoError('invalid', request.branch === undefined
+        ? `分支命名模板 ${rules.template} 生成的 ${branch} 不符合分支名规则 ${rules.pattern}；请管理员在「代码仓库」设置里调整模板或规则`
+        : `新分支 ${branch} 不符合分支名规则 ${rules.pattern}；换一个符合规则的名字，或不传 branch 让 dsh-repo 按模板生成`)
+    }
     if (existing !== undefined && request.commit !== undefined) throw new RepoError('invalid', `分支 ${branch} 已存在，工作区从它的最新提交开始，不能再指定 commit`)
     let start = existing ?? request.commit ?? mirror.commit
     if (existing === undefined && request.commit !== undefined) {

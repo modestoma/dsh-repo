@@ -121,13 +121,31 @@ describe('workspace creation', () => {
     expect(continued).toMatchObject({ base: 'dev', baseCommit: head, branch: 'feature/x' })
     await expect(manager.create({ repo: url, path: join(sessions, 'a'), branch: 'feature/x', commit })).rejects.toMatchObject({ code: 'invalid' })
     await expect(manager.create({ repo: url, path: join(sessions, 'b'), branch: 'main' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('默认分支') })
-    await expect(manager.create({ repo: url, path: join(sessions, 'c'), base: 'dev', branch: 'dev' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('合入目标') })
+    await expect(manager.create({ repo: url, path: join(sessions, 'c'), base: 'dev', branch: 'dev' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('是基线分支') })
     await expect(manager.create({ repo: url, path: join(sessions, 'd'), base: 'dev', commit: head })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('不在分支 dev 上') })
     await expect(manager.create({ repo: url, path: join(sessions, 'older'), branch: 'x' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('不是空目录') })
     await expect(manager.create({ repo: url, path: join(sessions, 'older', 'inner'), branch: 'x' })).rejects.toMatchObject({ code: 'invalid' })
     await expect(manager.create({ repo: url, path: 'relative', branch: 'x' })).rejects.toMatchObject({ code: 'invalid' })
     await expect(manager.create({ repo: `${REMOTE_HOST}/team/elsewhere`, path: join(sessions, 'e') })).rejects.toMatchObject({ code: 'not-allowed' })
     expect(existsSync(join(sessions, 'b'))).toBe(false)
+  })
+
+  it('starts from the catalog baseline branch and names new branches by the template and the pattern', async () => {
+    const { bare, seed, manager, service, sessions, url } = await setup()
+    gitAs(seed, 'push', '--quiet', bare, 'HEAD:refs/heads/dev')
+    gitAs(seed, 'push', '--quiet', bare, 'HEAD:refs/heads/legacy/x')
+    const [entry] = service.catalog.entries()
+    await service.catalog.update(entry!.id, { url, access: 'write', features: [], base: 'dev', branchTemplate: 'feature/{date}-{session}', branchPattern: '^feature/' })
+    expect(await manager.create({ repo: url, path: join(sessions, 'a'), session: 'Sess-1234567890' })).toMatchObject({ base: 'dev', branch: expect.stringMatching(/^feature\/\d{8}-sess1234$/) })
+    await expect(manager.create({ repo: url, path: join(sessions, 'b'), branch: 'fix/x' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('不符合分支名规则 ^feature/') })
+    // An existing branch is continued even when its name breaks the pattern.
+    expect(await manager.create({ repo: url, path: join(sessions, 'c'), branch: 'legacy/x' })).toMatchObject({ base: 'dev', branch: 'legacy/x' })
+    // The run-time settings apply where the entry sets nothing; a template the pattern refuses is reported.
+    await service.catalog.update(entry!.id, { url, access: 'write', features: [], branchPattern: '^fix/' })
+    await expect(manager.create({ repo: url, path: join(sessions, 'd') })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('分支命名模板 dsh/{session} 生成的') })
+    await service.catalog.update(entry!.id, { url, access: 'write', features: [] })
+    await service.settings.update({ workspace: { branchTemplate: 'bot/{random}', branchPattern: '^bot/' } })
+    expect(await manager.create({ repo: url, path: join(sessions, 'e') })).toMatchObject({ base: 'main', branch: expect.stringMatching(/^bot\/[0-9a-f]{8}$/) })
   })
 
   it('does not take a branch below the requested name for the requested branch', async () => {

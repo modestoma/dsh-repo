@@ -4,8 +4,8 @@
  * @module dsh-repo/client/api
  */
 
-import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE, WORKSPACE_DIR_ROUTE, WORKSPACES_ROUTE } from '../settings/contract.ts'
-import type { HostAddRequest, MirrorUsage, MutationError, MutationOk, PickedDirectory, RepoInput, RepoSettingsWire, SettingsState, WorkspaceCreated, WorkspaceCreateInput, WorkspaceRow, WorkspaceRows } from '../settings/contract.ts'
+import { HOST_TOKEN_ROUTE, HOSTS_ROUTE, MIRROR_ROUTE, MIRROR_USAGE_ROUTE, PICK_DIRECTORY_ROUTE, REPO_BRANCHES_ROUTE, REPO_FETCH_ROUTE, REPO_SYNC_ROUTE, REPOS_ROUTE, SETTINGS_ROUTE, STATE_ROUTE, WATCHES_ROUTE, WORKSPACE_DIR_ROUTE, WORKSPACES_ROUTE } from '../settings/contract.ts'
+import type { HostAddRequest, MirrorUsage, MutationError, MutationOk, PickedDirectory, RepoBranches, RepoInput, RepoSettingsWire, SettingsState, WorkspaceCreated, WorkspaceCreateInput, WorkspaceRow, WorkspaceRows } from '../settings/contract.ts'
 
 /**
  * Error text of a value thrown by a request.
@@ -175,6 +175,24 @@ export function syncRepo(id: string): Promise<SettingsState> {
   return mutate(REPO_SYNC_ROUTE, 'POST', { id })
 }
 
+/**
+ * Fetch a repository's mirror again in the background; responds once the fetch started.
+ * @param id - entry id.
+ * @returns the new state.
+ */
+export function fetchRepo(id: string): Promise<SettingsState> {
+  return mutate(REPO_FETCH_ROUTE, 'POST', { id })
+}
+
+/**
+ * The branches a repository's mirror holds, read without contacting the remote.
+ * @param id - entry id.
+ * @returns the sorted branches and the default branch.
+ */
+export function fetchBranches(id: string): Promise<RepoBranches> {
+  return request<RepoBranches>(REPO_BRANCHES_ROUTE, { method: 'POST', body: JSON.stringify({ id }) })
+}
+
 /** @returns the repositories in the mirror directory with their disk usage. */
 export function fetchMirrorUsage(): Promise<MirrorUsage> {
   return request<MirrorUsage>(MIRROR_USAGE_ROUTE)
@@ -206,7 +224,7 @@ export async function fetchWorkspaces(): Promise<WorkspaceRow[]> {
 
 /**
  * Create a workspace under the workspace directory.
- * @param input - catalog entry, base, branch, and directory name.
+ * @param input - catalog entry, base, and directory name.
  * @returns the new workspace.
  */
 export async function createWorkspace(input: WorkspaceCreateInput): Promise<WorkspaceRow> {

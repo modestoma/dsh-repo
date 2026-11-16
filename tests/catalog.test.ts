@@ -7,7 +7,6 @@ import { catalogKey } from '../src/catalog/catalog.ts'
 import { SettingsStore } from '../src/settings/store.ts'
 import { MirrorStore } from '../src/mirror/store.ts'
 import { RepoService } from '../src/service.ts'
-import { RepoError } from '../src/errors.ts'
 import { credentials, mirrorLimits, testConfig } from './helpers.ts'
 
 /** A service with an empty catalog over a fresh settings file. */
@@ -60,12 +59,15 @@ describe('repository catalog', () => {
 
   it('adds, changes, and removes entries, refusing a repository held twice and a full catalog', async () => {
     const { catalog, file } = setup()
-    const added = await catalog.add({ url: ' https://github.com/a/b ', branch: ' dev ', access: 'write', features: ['b-feature', 'a-feature', 'b-feature'] })
-    expect(added).toMatchObject({ id: expect.stringMatching(/^[0-9a-f]{12}$/), url: 'https://github.com/a/b', branch: 'dev', access: 'write', features: ['b-feature', 'a-feature'] })
+    const added = await catalog.add({ url: ' https://github.com/a/b ', base: ' dev ', access: 'write', features: [{ id: 'b-feature', branch: ' main ' }, { id: 'a-feature', branch: '' }, { id: 'b-feature' }], localSync: { enabled: false, dir: '/srv/x', branch: 'release' }, branchTemplate: ' feature/{random} ', branchPattern: '^feature/' })
+    expect(added).toMatchObject({ id: expect.stringMatching(/^[0-9a-f]{12}$/), url: 'https://github.com/a/b', base: 'dev', access: 'write', features: [{ id: 'b-feature', branch: 'main' }, { id: 'a-feature' }], localSync: { branch: 'release' }, branchRules: { template: 'feature/{random}', pattern: '^feature/' } })
     await expect(catalog.add({ url: 'git@github.com:A/B.git', access: 'read', features: [] })).rejects.toMatchObject({ code: 'invalid' })
     await expect(catalog.add({ url: 'https://github.com/A/B', access: 'read', features: [] })).rejects.toMatchObject({ code: 'conflict' })
-    await expect(catalog.add({ url: 'https://github.com/a/c', access: 'read', features: ['Bad'] })).rejects.toMatchObject({ code: 'invalid' })
-    await expect(catalog.add({ url: 'https://github.com/a/c', access: 'read', features: [], branch: '-x' })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(catalog.add({ url: 'https://github.com/a/c', access: 'read', features: [{ id: 'Bad' }] })).rejects.toMatchObject({ code: 'invalid' })
+    await expect(catalog.add({ url: 'https://github.com/a/c', access: 'read', features: [], base: '-x' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('基线分支') })
+    await expect(catalog.add({ url: 'https://github.com/a/c', access: 'read', features: [{ id: 'x', branch: 'a..b' }] })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('功能 x 的分支') })
+    await expect(catalog.add({ url: 'https://github.com/a/c', access: 'read', features: [], branchTemplate: 'fixed' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('{session} 或 {random}') })
+    await expect(catalog.add({ url: 'https://github.com/a/c', access: 'read', features: [], branchPattern: '(' })).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('正则') })
     const updated = await catalog.update(added.id, { url: 'https://github.com/a/b', access: 'merge', features: [] })
     expect(updated).toEqual({ id: added.id, url: 'https://github.com/a/b', access: 'merge', features: [], addedAt: added.addedAt })
     await expect(catalog.update('000000000000', { url: 'https://github.com/a/b', access: 'read', features: [] })).rejects.toMatchObject({ code: 'not-found' })
@@ -93,53 +95,27 @@ describe('repository catalog', () => {
     second()
     expect(catalog.registeredFeatures()).toEqual([])
     expect(() => service.catalog.registerFeature({ id: 'x', title: '' })).toThrow(expect.objectContaining({ code: 'invalid' }))
-    await catalog.add({ url: 'https://github.com/a/b', access: 'read', features: ['log-analysis'], localSync: { enabled: false, dir: '/srv/skills' } })
+    await catalog.add({ url: 'https://github.com/a/b', access: 'read', features: [{ id: 'log-analysis', branch: 'main' }], localSync: { enabled: false, dir: '/srv/skills' } })
     await catalog.add({ url: 'https://github.com/a/c', access: 'read', features: [] })
     expect(service.catalog.list().map(repo => repo.url)).toEqual(['https://github.com/a/b', 'https://github.com/a/c'])
-    expect(service.catalog.list({ feature: 'log-analysis' })).toEqual([{ id: expect.any(String), url: 'https://github.com/a/b', access: 'read', features: ['log-analysis'], localSync: { enabled: false, dir: '/srv/skills', intervalMinutes: 720 } }])
+    expect(service.catalog.list({ feature: 'log-analysis' })).toEqual([{ id: expect.any(String), url: 'https://github.com/a/b', access: 'read', features: [{ id: 'log-analysis', branch: 'main' }], localSync: { enabled: false, dir: '/srv/skills', intervalMinutes: 720 } }])
     stop()
-    await catalog.add({ url: 'https://github.com/a/d', access: 'read', features: ['log-analysis'] })
+    await catalog.add({ url: 'https://github.com/a/d', access: 'read', features: [{ id: 'log-analysis' }] })
     expect(seen).toEqual([[], [], [], ['https://github.com/a/b'], ['https://github.com/a/b']])
   })
 
-  it('adds a repository after the confirmation passes, and turns features on for an entry', async () => {
-    const asked: string[] = []
-    let refuse: string | undefined
-    const confirm = async (summary: string) => {
-      asked.push(summary)
-      if (refuse !== undefined) throw new RepoError('forbidden', refuse)
-    }
-    const { service } = setup()
-    service.catalog.registerFeature({ id: 'log-analysis', title: '日志分析' })
-    refuse = '只有管理员可以改仓库清单'
-    await expect(service.catalog.ensure('https://github.com/a/b', { features: ['log-analysis'] }, confirm)).rejects.toMatchObject({ code: 'forbidden', message: expect.stringContaining('只有管理员') })
-    expect(service.catalog.list()).toEqual([])
-    refuse = undefined
-    const added = await service.catalog.ensure('https://github.com/a/b', { features: ['log-analysis'] }, confirm)
-    expect(added).toMatchObject({ status: 'added', repo: { url: 'https://github.com/a/b', access: 'read', features: ['log-analysis'] } })
-    expect(asked.at(-1)).toBe('把 github.com/a/b 加入 dsh-repo 仓库清单（权限：只读；打开功能：日志分析）')
-    expect(await service.catalog.ensure('https://GitHub.com/A/B', { features: ['log-analysis'] }, confirm)).toMatchObject({ status: 'unchanged' })
-    expect(asked).toHaveLength(2)
-    const updated = await service.catalog.ensure('https://github.com/a/b', { features: ['other'], access: 'merge' }, confirm)
-    expect(updated).toMatchObject({ status: 'updated', repo: { access: 'read', features: ['log-analysis', 'other'] } })
-    expect(asked.at(-1)).toBe('为仓库清单中的 github.com/a/b 打开功能：other')
-    await expect(service.catalog.ensure('https://github.com/a/b', { branch: 'dev' }, confirm)).rejects.toMatchObject({ code: 'conflict', message: expect.stringContaining('默认分支') })
-    await expect(service.catalog.ensure('https://gitlab.com/a/c', {}, confirm)).rejects.toMatchObject({ code: 'not-allowed' })
-    expect(await service.catalog.ensure('https://github.com/a/c', { branch: 'dev', access: 'write' }, confirm)).toMatchObject({ status: 'added', repo: { branch: 'dev', access: 'write', features: [] } })
-    expect(asked).toHaveLength(4)
-    // Concurrent additions on different branches: the one stored second is refused instead of joining the first's branch.
-    const racing = await Promise.allSettled([
-      service.catalog.ensure('https://github.com/a/race', { branch: 'main', features: ['x'] }, confirm),
-      service.catalog.ensure('https://github.com/a/race', { branch: 'dev', features: ['y'] }, confirm),
+  it('rewrites entries of earlier versions: their branch becomes the baseline, feature, and local sync branch', () => {
+    const { catalog } = setup({
+      hosts: [],
+      repos: [
+        { id: '000000000001', url: 'https://github.com/a/b', branch: 'main', access: 'write', features: ['log-analysis'], localSync: { enabled: true, dir: '/srv/b', intervalMinutes: 60 }, addedAt: 't' },
+        { id: '000000000002', url: 'https://github.com/a/c', access: 'read', features: ['log-analysis'], addedAt: 't' },
+      ],
+    })
+    expect(catalog.list()).toEqual([
+      { id: '000000000001', url: 'https://github.com/a/b', base: 'main', access: 'write', features: [{ id: 'log-analysis', branch: 'main' }], localSync: { enabled: true, dir: '/srv/b', intervalMinutes: 60, branch: 'main' } },
+      { id: '000000000002', url: 'https://github.com/a/c', access: 'read', features: [{ id: 'log-analysis' }] },
     ])
-    expect(racing.map(outcome => outcome.status)).toEqual(['fulfilled', 'rejected'])
-    expect(racing[1]).toMatchObject({ reason: { code: 'conflict' } })
-    expect(service.catalog.list().find(repo => repo.url === 'https://github.com/a/race')).toMatchObject({ branch: 'main', features: ['x'] })
-    // The merged feature list stays within the limit the settings file accepts.
-    const many = Array.from({ length: 20 }, (_, index) => `f${index}`)
-    await service.catalog.ensure('https://github.com/a/full', { features: many }, confirm)
-    await expect(service.catalog.ensure('https://github.com/a/full', { features: ['one-more'] }, confirm)).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('最多打开 20 个功能') })
-    expect(service.catalog.list().find(repo => repo.url === 'https://github.com/a/full')?.features).toHaveLength(20)
   })
 
   it('keeps entries whose host is gone, reports them, and skips them for the highest access', async () => {

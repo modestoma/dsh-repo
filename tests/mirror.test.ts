@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { SettingsStore } from '../src/settings/store.ts'
 import { credentialEnvironment, runGit } from '../src/mirror/git.ts'
 import type { GitRunner } from '../src/mirror/git.ts'
@@ -181,6 +181,103 @@ describe('mirror store', () => {
     await expect(service.mirrors.sync(repo.url, { branch: '-x' })).rejects.toMatchObject({ code: 'invalid' })
     git(repo.dir, 'branch', 'dev')
     expect(await service.mirrors.sync(repo.url, { branch: 'dev' })).toMatchObject({ branch: 'dev', defaultBranch: 'main', commit: repo.commit })
+  })
+})
+
+describe('mirror fetch state', () => {
+  it('records each fetch, keeps a missing branch from counting as a failed fetch, and forgets everything when the directory changes', async () => {
+    const { root, service, remote } = setup()
+    const repo = origin(remote)
+    await allow(service, [repo.url])
+    expect(service.mirrors.status(repo.url)).toBeUndefined()
+    await service.mirrors.prefetch(repo.url)
+    const ready = service.mirrors.status(repo.url)
+    expect(ready).toEqual({ state: 'ready', fetchedAt: expect.any(String) })
+    await expect(service.mirrors.sync(repo.url, { branch: 'nope' })).rejects.toMatchObject({ code: 'not-found' })
+    expect(service.mirrors.status(repo.url)).toMatchObject({ state: 'ready' })
+    expect(await service.mirrors.branches(repo.url)).toEqual({ branches: ['main'], defaultBranch: 'main' })
+    // A repository outside the catalog says nothing about the mirror.
+    await expect(service.mirrors.sync('https://git.test/team/other')).rejects.toMatchObject({ code: 'not-allowed' })
+    expect(service.mirrors.status('https://git.test/team/other')).toBeUndefined()
+    await service.mirrors.setDir(join(root, 'moved'))
+    expect(service.mirrors.status(repo.url)).toBeUndefined()
+    expect(await service.mirrors.branches(repo.url)).toEqual({ branches: [] })
+  })
+
+  it('records a failed fetch with its reason, keeping the time of the last success', async () => {
+    let fail = false
+    const remote = fileRemote()
+    const { service } = setup({ git: async (args, options) => { if (fail && args.includes('fetch')) throw new Error('remote hung up'); return await remote.git(args, options) } })
+    const repo = origin(remote)
+    await allow(service, [repo.url])
+    await service.mirrors.prefetch(repo.url)
+    const fetchedAt = service.mirrors.status(repo.url)?.fetchedAt
+    fail = true
+    await service.mirrors.prefetch(repo.url)
+    expect(service.mirrors.status(repo.url)).toEqual({ state: 'failed', fetchedAt, error: expect.stringContaining('remote hung up') })
+  })
+
+  it('starts a new background fetch after the mirror directory changes, and ignores the outcome of the one for the old directory', async () => {
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let held = true
+    const remote = fileRemote()
+    const { root, service } = setup({ git: async (args, options) => {
+      if (held && args.includes('clone')) {
+        held = false
+        await gate
+      }
+      return await remote.git(args, options)
+    } })
+    const repo = origin(remote)
+    await allow(service, [repo.url])
+    const old = service.mirrors.prefetch(repo.url)
+    await vi.waitFor(() => { expect(held).toBe(false) })
+    const moved = join(root, 'moved')
+    await service.mirrors.setDir(moved)
+    await service.mirrors.prefetch(repo.url)
+    expect(service.mirrors.status(repo.url)).toMatchObject({ state: 'ready' })
+    expect((await service.mirrors.branches(repo.url)).branches).toEqual(['main'])
+    await service.mirrors.setDir(join(root, 'third'))
+    release?.()
+    await old
+    // The fetch begun for the first directory finished after two changes and reports nothing.
+    expect(service.mirrors.status(repo.url)).toBeUndefined()
+  })
+
+  it('keeps the outcome of a background fetch when an overlapping call is cancelled', async () => {
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let held = true
+    const remote = fileRemote()
+    const { service } = setup({ git: async (args, options) => {
+      if (held && args.includes('clone')) {
+        held = false
+        await gate
+      }
+      return await remote.git(args, options)
+    } })
+    const repo = origin(remote)
+    await allow(service, [repo.url])
+    const background = service.mirrors.prefetch(repo.url)
+    await vi.waitFor(() => { expect(held).toBe(false) })
+    const controller = new AbortController()
+    const foreground = service.mirrors.sync(repo.url, { signal: controller.signal }).then(() => undefined, (error: unknown) => error)
+    expect(service.mirrors.status(repo.url)).toEqual({ state: 'fetching' })
+    controller.abort(new Error('cancelled'))
+    release?.()
+    await background
+    await foreground
+    expect(service.mirrors.status(repo.url)).toEqual({ state: 'ready', fetchedAt: expect.any(String) })
+  })
+
+  it('checks that a repository can be reached and has the branches an entry names, before it is in the catalog', async () => {
+    const { service, remote } = setup()
+    const repo = origin(remote)
+    git(repo.dir, 'branch', 'dev')
+    await service.mirrors.checkRemote(repo.url, [{ name: 'dev', label: '基线分支' }, { name: 'main', label: '本地同步分支' }])
+    await expect(service.mirrors.checkRemote(repo.url, [{ name: 'release', label: '基线分支' }])).rejects.toMatchObject({ code: 'invalid', message: expect.stringContaining('没有分支 release（基线分支）') })
+    await expect(service.mirrors.checkRemote('https://git.test/team/missing', [])).rejects.toMatchObject({ code: 'unavailable' })
   })
 })
 

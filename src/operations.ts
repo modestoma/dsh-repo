@@ -9,7 +9,7 @@
  *    (`dsh-repo/policy`) refuses while writes are `off` and checks the
  *    repository's catalog access;
  * 3. for a write made for an Agent (every tool call, and a service call with
- *    `agent`): refuse a catalog change while writes are `off`, dispatch
+ *    `agent`): dispatch
  *    `access/authorize` for the Agent's Session, and while writes are `ask`
  *    show the approval card (declined → `declined`);
  * 4. run, including the steps after a write (PR/MR watching, own-comment
@@ -38,8 +38,8 @@ import type { RepoService } from './service.ts'
 import { createWorkspace, listWorkspaces, pushWorkspace, pushWorkspacePrompt, removeWorkspace, workspaceStatus } from './workspace/flow.ts'
 import type { WorkspaceManager } from './workspace/manager.ts'
 
-/** Which settings offer a tool: reads and watch always, writes unless `writes` is `off`, merge too; each also needs a catalog repository with that access. `admin` (adding repositories) needs no catalog entry. The plugin offers watch only while watching is active. */
-export type ToolAccess = 'read' | 'watch' | 'write' | 'merge' | 'admin'
+/** Which settings offer a tool: reads and watch always, writes unless `writes` is `off`, merge too; each also needs a catalog repository with that access. The plugin offers watch only while watching is active. */
+export type ToolAccess = 'read' | 'watch' | 'write' | 'merge'
 
 /** Collaborators every operation may use. */
 export interface OperationDeps {
@@ -70,8 +70,8 @@ export type Gate = (prompt: Prompt) => Promise<void>
 
 /** A write's gate. */
 interface WriteSpec<A> {
-  /** Catalog access the write needs on its repository; undefined for one outside the catalog (repoAdd). */
-  readonly level: WriteLevel | undefined
+  /** Catalog access the write needs on its repository. */
+  readonly level: WriteLevel
   readonly authorize: AuthorizeLevel
   /** The approval text; absent when `run` calls the gate itself. */
   readonly prompt?: (args: A, deps: OperationDeps, caller: Caller) => Prompt | Promise<Prompt>
@@ -116,6 +116,12 @@ const ciTarget = z.object({ repo, runId: runId.optional(), jobId: jobId.optional
   .refine(args => (args.runId === undefined) !== (args.jobId === undefined), { message: 'Give exactly one of runId and jobId' })
 const mrBody = z.string().optional().describe('Description for reviewers: what changed and why, how it was verified, and anything risky or left undone. Keep it short; link issues instead of restating them; never paste conversation transcripts')
 const workspacePath = z.string().min(1).optional().describe('Workspace directory or a directory inside it; default: the current working directory')
+const draftInlineComment = z.object({
+  path: z.string().min(1).describe('File path from the repository root, /-separated'),
+  newLine: z.number().int().min(1).optional().describe('1-based line number in the new file (added or context lines)'),
+  oldLine: z.number().int().min(1).optional().describe('1-based line number in the old file (deleted lines)'),
+  body: z.string().min(1).describe('Inline review comment body'),
+}).strict().refine(item => item.newLine !== undefined || item.oldLine !== undefined, { message: 'Give at least one of newLine and oldLine' })
 
 function define<S extends z.ZodType, R>(operation: Operation<S, R>): Operation<S, R> {
   return operation
@@ -133,7 +139,7 @@ function stateSuffix(state: string | undefined): string {
  * @param service - the engine.
  * @param url - catalog address.
  * @param ref - requested branch, tag, or full commit id; undefined means `branch`.
- * @param branch - the branch the catalog entry follows; undefined means the remote's default branch.
+ * @param branch - the catalog entry's baseline branch; undefined means the remote's default branch.
  * @param signal - cancellation.
  * @returns the full commit id.
  * @throws {RepoError} the mirror's sync and lookup failures.
@@ -165,7 +171,7 @@ export const OPERATIONS: readonly Operation[] = [
     tool: 'repo_list',
     method: 'repoList',
     access: 'read',
-    description: 'List the repositories these tools can reach (the deployment\'s repository catalog) with the branch each follows and its access: `read` (read only, local workspaces and snapshots), `write` (also push, issues, PRs/MRs, comments, CI retry/cancel), or `merge` (also merge PRs/MRs). Every other repository is refused; an administrator adds repositories on the dsh-repo settings page.',
+    description: 'List the repositories these tools can reach (the deployment\'s repository catalog) with each one\'s baseline branch (`base`: where changes start and PRs/MRs merge back; absent = the default branch), its access, and the features turned on (each with the branch it works on; absent = base). Access: `read` (read only, local workspaces and snapshots), `write` (also push, issues, PRs/MRs, comments, CI retry/cancel), or `merge` (also merge PRs/MRs). Every other repository is refused; an administrator adds repositories on the dsh-repo settings page.',
     schema: z.object({ feature: z.string().min(1).optional().describe('Only repositories with this feature turned on') }).strict(),
     run: async (args, { service }) => service.catalog.list(args.feature === undefined ? {} : { feature: args.feature }),
   }),
@@ -176,27 +182,6 @@ export const OPERATIONS: readonly Operation[] = [
     description: 'Show a repository\'s default branch, visibility, description, and clone URL on GitHub or GitLab.',
     schema: z.object({ repo }).strict(),
     run: (args, { service }, caller) => service.forge.repoInfo(args.repo, { signal: caller.signal }),
-  }),
-  define({
-    tool: 'repo_add',
-    method: 'repoAdd',
-    access: 'admin',
-    description: 'Add a repository to the catalog these tools can reach, or turn features on for it, after an administrator approves. A new entry gets `read` access unless `access` asks for more; an existing entry keeps its access. Requires user approval.',
-    schema: z.object({
-      repo: z.string().min(1).describe('HTTPS address on a configured host'),
-      branch: z.string().min(1).optional().describe('Branch the entry follows; default: the remote\'s default branch'),
-      access: z.enum(['read', 'write', 'merge']).optional().describe('Access of a new entry; default read'),
-      features: z.array(z.string().min(1)).optional().describe('Feature ids to turn on'),
-    }).strict(),
-    write: { level: undefined, authorize: 'admin' },
-    run: async (args, { service }, caller, gate) => {
-      caller.signal.throwIfAborted()
-      return await service.catalog.ensure(args.repo, {
-        ...args.branch === undefined ? {} : { branch: args.branch },
-        ...args.access === undefined ? {} : { access: args.access },
-        ...args.features === undefined ? {} : { features: args.features },
-      }, summaryText => gate({ zh: summaryText, en: `Change the dsh-repo repository catalog: ${args.repo}${args.access === undefined ? '' : ` (access ${args.access})`}` }))
-    },
   }),
   define({
     tool: 'repo_branch_list',
@@ -298,8 +283,17 @@ export const OPERATIONS: readonly Operation[] = [
     tool: 'repo_mr_list',
     method: 'mrList',
     access: 'read',
-    description: 'List pull requests (GitHub) or merge requests (GitLab).',
-    schema: z.object({ repo, state: z.enum(['open', 'closed', 'merged', 'all']).optional(), sourceBranch: z.string().optional().describe('Branch of this repository the PRs/MRs come from; ones from forks are left out'), targetBranch: z.string().optional(), page, perPage }).strict(),
+    description: 'List pull requests (GitHub) or merge requests (GitLab), optionally sorted by creation or update time and filtered to ones updated after an ISO-8601 timestamp.',
+    schema: z.object({
+      repo,
+      state: z.enum(['open', 'closed', 'merged', 'all']).optional(),
+      sourceBranch: z.string().optional().describe('Branch of this repository the PRs/MRs come from; ones from forks are left out'),
+      targetBranch: z.string().optional(),
+      sort: z.enum(['created', 'updated']).optional().describe('Sort field (descending); defaults to updated when updatedAfter is given'),
+      updatedAfter: z.iso.datetime({ offset: true }).optional().describe('ISO-8601 timestamp; keep only PRs/MRs with updatedAt strictly after this time'),
+      page,
+      perPage,
+    }).strict(),
     run: (args, { service }, caller) => service.forge.listMrs(args.repo, { ...args, signal: caller.signal }),
   }),
   define({
@@ -319,6 +313,37 @@ export const OPERATIONS: readonly Operation[] = [
     run: (args, { service }, caller) => service.forge.mrDiff(args.repo, args.number, { signal: caller.signal }),
   }),
   define({
+    tool: 'repo_mr_compare',
+    method: 'mrCompare',
+    access: 'read',
+    description: 'Read the incremental unified diff between two commits or refs (`baseSha` → `headSha`). Long diffs are cut at the configured size limit.',
+    schema: z.object({
+      repo,
+      baseSha: z.string().min(1).describe('Base commit SHA or ref'),
+      headSha: z.string().min(1).describe('Head commit SHA or ref'),
+    }).strict(),
+    run: (args, { service }, caller) => service.forge.mrCompare(args.repo, args.baseSha, args.headSha, { signal: caller.signal }),
+  }),
+  define({
+    tool: 'repo_mr_discussions',
+    method: 'mrDiscussions',
+    access: 'read',
+    description: 'List discussion threads (inline code review threads and resolvable threads) on a pull/merge request, with diff line positions, resolution state, and replies.',
+    schema: z.object({
+      repo,
+      number,
+      onlyUnresolved: z.boolean().optional().describe('Keep only unresolved resolvable threads'),
+      page,
+      perPage,
+    }).strict(),
+    run: (args, { service }, caller) => service.forge.mrDiscussions(args.repo, args.number, {
+      ...args.onlyUnresolved === undefined ? {} : { onlyUnresolved: args.onlyUnresolved },
+      ...args.page === undefined ? {} : { page: args.page },
+      ...args.perPage === undefined ? {} : { perPage: args.perPage },
+      signal: caller.signal,
+    }),
+  }),
+  define({
     tool: 'repo_mr_status',
     method: 'mrStatus',
     access: 'read',
@@ -331,13 +356,13 @@ export const OPERATIONS: readonly Operation[] = [
     method: 'mrCreate',
     access: 'write',
     description: 'Open a pull request (GitHub) or merge request (GitLab) from a pushed branch. repo_workspace_push can open one in the same step. When the settings delete source branches, a GitLab MR is opened with "delete source branch" ticked, so GitLab removes the branch once it is merged. While PR/MR watching is on, its CI results, comments, reviews, and merge or close arrive in this session as messages (`watching` in the result), so do not poll it. Requires user approval.',
-    schema: z.object({ repo, title: z.string().min(1), body: mrBody, sourceBranch: z.string().min(1), targetBranch: z.string().optional(), draft: z.boolean().optional(), labels, assignees }).strict(),
+    schema: z.object({ repo, title: z.string().min(1), body: mrBody, sourceBranch: z.string().min(1), targetBranch: z.string().optional().describe('Branch to merge into; default the repository\'s baseline branch in the catalog, else its default branch'), draft: z.boolean().optional(), labels, assignees }).strict(),
     write: {
       level: 'write',
       authorize: 'code-write',
       prompt: args => ({
-        zh: `创建${args.draft === true ? '草稿 ' : ''}PR/MR\n仓库：${args.repo}\n分支：${args.sourceBranch} → ${args.targetBranch ?? '默认分支'}\n标题：${args.title}`,
-        en: `Open a ${args.draft === true ? 'draft ' : ''}PR/MR\nRepository: ${args.repo}\nBranches: ${args.sourceBranch} → ${args.targetBranch ?? 'default branch'}\nTitle: ${args.title}`,
+        zh: `创建${args.draft === true ? '草稿 ' : ''}PR/MR\n仓库：${args.repo}\n分支：${args.sourceBranch} → ${args.targetBranch ?? '基线分支'}\n标题：${args.title}`,
+        en: `Open a ${args.draft === true ? 'draft ' : ''}PR/MR\nRepository: ${args.repo}\nBranches: ${args.sourceBranch} → ${args.targetBranch ?? 'baseline branch'}\nTitle: ${args.title}`,
       }),
     },
     run: async (args, deps, caller) => {
@@ -375,6 +400,96 @@ export const OPERATIONS: readonly Operation[] = [
       await rememberComment(deps, args.repo, args.number, comment.id)
       return comment
     },
+  }),
+  define({
+    tool: 'repo_mr_review',
+    method: 'mrReview',
+    access: 'write',
+    description: 'Submit a structured review on a pull/merge request at `headSha`: verdict (`comment`, `approve`, or `request-changes`), optional summary `body`, and up to 50 inline diff `comments`. Self-reviews automatically downgrade `approve`/`request-changes` to `comment`; inline comments whose line lies outside the remote diff hunk gracefully fold into the summary body as Markdown blockquotes. Requires user approval.',
+    schema: z.object({
+      repo,
+      number,
+      headSha: z.string().min(40).describe('Full head commit SHA the review targets (from repo_mr_get or repo_mr_status)'),
+      verdict: z.enum(['comment', 'approve', 'request-changes']).describe('Review verdict; auto-downgraded to comment on self-review'),
+      body: z.string().optional().describe('Overall review summary; signature is appended automatically'),
+      comments: z.array(draftInlineComment).max(50).optional().describe('Inline diff comments (at most 50)'),
+    }).strict().refine(
+      args => args.verdict === 'approve' || (args.body !== undefined && args.body.trim() !== '') || (args.comments !== undefined && args.comments.length > 0),
+      { message: 'Provide body or at least one inline comment' },
+    ),
+    write: {
+      level: 'write',
+      authorize: 'code-write',
+      prompt: args => ({
+        zh: `评审 ${args.repo} 的 PR/MR #${args.number}（${args.verdict}，head ${args.headSha.slice(0, 12)}${args.comments === undefined || args.comments.length === 0 ? '' : `，${args.comments.length} 条行级评论`}）`,
+        en: `Review PR/MR #${args.number} in ${args.repo} (${args.verdict} at ${args.headSha.slice(0, 12)})`,
+      }),
+    },
+    run: async (args, deps, caller) => {
+      try {
+        const { ownCommentIds, ...result } = await deps.service.forge.reviewMr(args.repo, args.number, {
+          headSha: args.headSha,
+          verdict: args.verdict,
+          ...args.body === undefined ? {} : { body: args.body },
+          ...args.comments === undefined ? {} : { comments: args.comments },
+          signature: deps.service.settings.current.tools.signature,
+          signal: caller.signal,
+        })
+        for (const id of ownCommentIds ?? []) await rememberComment(deps, args.repo, args.number, id)
+        return result
+      } catch (error) {
+        const partialIds = error instanceof RepoError ? error.partialReview?.ownCommentIds : undefined
+        for (const id of partialIds ?? []) await rememberComment(deps, args.repo, args.number, id)
+        throw error
+      }
+    },
+  }),
+  define({
+    tool: 'repo_mr_discussion_reply',
+    method: 'mrDiscussionReply',
+    access: 'write',
+    description: 'Reply to an existing discussion thread on a pull/merge request. Requires user approval.',
+    schema: z.object({
+      repo,
+      number,
+      discussionId: z.string().min(1).describe('Discussion thread id from repo_mr_discussions'),
+      body: z.string().min(1).describe('Reply body'),
+    }).strict(),
+    write: {
+      level: 'write',
+      authorize: 'code-write',
+      prompt: args => ({
+        zh: `回复 ${args.repo} 的 PR/MR #${args.number} 讨论线程 ${args.discussionId}`,
+        en: `Reply to discussion ${args.discussionId} on PR/MR #${args.number} in ${args.repo}`,
+      }),
+    },
+    run: async (args, deps, caller) => {
+      const signed = withSignature(args.body, deps.service.settings.current.tools.signature) ?? args.body
+      const { note, ownCommentIds } = await deps.service.forge.replyMrDiscussion(args.repo, args.number, args.discussionId, signed, { signal: caller.signal })
+      for (const id of ownCommentIds ?? [note.id]) await rememberComment(deps, args.repo, args.number, id)
+      return note
+    },
+  }),
+  define({
+    tool: 'repo_mr_discussion_resolve',
+    method: 'mrDiscussionResolve',
+    access: 'write',
+    description: 'Resolve or reopen a resolvable discussion thread on a pull/merge request. Requires user approval.',
+    schema: z.object({
+      repo,
+      number,
+      discussionId: z.string().min(1).describe('Discussion thread id from repo_mr_discussions'),
+      resolved: z.boolean().describe('true marks resolved, false reopens'),
+    }).strict(),
+    write: {
+      level: 'write',
+      authorize: 'code-write',
+      prompt: args => ({
+        zh: `${args.resolved ? '解决' : '重新打开'} ${args.repo} 的 PR/MR #${args.number} 讨论线程 ${args.discussionId}`,
+        en: `${args.resolved ? 'Resolve' : 'Reopen'} discussion ${args.discussionId} on PR/MR #${args.number} in ${args.repo}`,
+      }),
+    },
+    run: (args, { service }, caller) => service.forge.resolveMrDiscussion(args.repo, args.number, args.discussionId, args.resolved, { signal: caller.signal }),
   }),
   define({
     tool: 'repo_mr_merge',
@@ -506,11 +621,11 @@ export const OPERATIONS: readonly Operation[] = [
     method: 'snapshotAcquire',
     access: 'read',
     description: 'Get a read-only local copy (plain files, no .git) of a repository at a branch, tag, or commit, to search and read the whole code base with the ordinary file and shell tools. Branches and tags are fetched fresh from the remote; a full commit id already fetched earlier is used without contacting the remote. Snapshots of the same commit are shared; do not write into one. To change code, use repo_workspace_create instead.',
-    schema: z.object({ repo, ref: z.string().min(1).optional().describe('Branch, tag, or full commit id; default: the branch the catalog follows, or the default branch') }).strict(),
+    schema: z.object({ repo, ref: z.string().min(1).optional().describe('Branch, tag, or full commit id; default: the repository\'s baseline branch') }).strict(),
     run: async (args, deps, caller) => {
       const { service } = deps
       const entry = service.catalog.require(args.repo, 'read')
-      const target = await snapshotTarget(service, entry.url, args.ref, entry.branch, caller.signal)
+      const target = await snapshotTarget(service, entry.url, args.ref, entry.base, caller.signal)
       const lease = await service.mirrors.store.acquire(entry.url, target, caller.signal)
       if (caller.origin === 'service') return { repo: entry.url, commit: lease.commit, path: lease.dir, release: lease.release }
       deps.leases.hold(`${sessionOf(caller) ?? ''}\u0000${entry.url}`, lease.release)
@@ -521,13 +636,13 @@ export const OPERATIONS: readonly Operation[] = [
     tool: 'repo_workspace_create',
     method: 'workspaceCreate',
     access: 'read',
-    description: 'Create a workspace to change a repository\'s code: an ordinary git clone (with its own .git) in a new directory under the current working directory (beside the current workspace when the working directory is inside one), which then becomes the working directory. Work there with the ordinary file and shell tools and plain git (status, diff, add, commit, log, pull, push): its origin goes through dsh-repo, so fetch and push work without tokens, but pushing to the default branch, protected branches, tags, or deleting branches is refused. The workspace pushes to one branch: `branch` (an existing branch is continued, e.g. the source branch of an open PR/MR to update) or, by default, a branch named after this session. Finish with repo_workspace_push, which commits, pushes, and can open the PR/MR in one approved step. For follow-up fixes to work already pushed, keep using the same workspace.',
+    description: 'Create a workspace to change a repository\'s code: an ordinary git clone (with its own .git) in a new directory under the current working directory (beside the current workspace when the working directory is inside one), which then becomes the working directory. Work there with the ordinary file and shell tools and plain git (status, diff, add, commit, log, pull, push): its origin goes through dsh-repo, so fetch and push work without tokens, but pushing to the default branch, protected branches, tags, or deleting branches is refused. The workspace starts from the repository\'s baseline branch (see repo_list) unless `base` names another, and pushes to one branch: `branch` (an existing branch is continued, e.g. the source branch of an open PR/MR to update; a new one must match the deployment\'s branch name rule) or, by default, a name the deployment\'s branch name template generates (the same branch for every workspace of this session when the template uses the session). Finish with repo_workspace_push, which commits, pushes, and can open the PR/MR in one approved step. For follow-up fixes to work already pushed, keep using the same workspace.',
     schema: z.object({
       repo,
       path: z.string().min(1).optional().describe('Directory for the workspace, missing or empty, inside the session directory; default: a new directory named after the repository under the working directory, or beside the workspace the working directory is in'),
-      base: z.string().min(1).optional().describe('Branch the work merges into, and starts from unless `branch` exists; default: the default branch'),
+      base: z.string().min(1).optional().describe('Branch the work starts from unless `branch` exists, and the default target of its PR/MR; default: the repository\'s baseline branch. Only when the user asks for another one'),
       commit: commit.optional().describe('Full commit id on `base` to start from, e.g. the commit a log analysis looked at'),
-      branch: z.string().min(1).optional().describe('Branch to push to; an existing one is continued from its head. Default: dsh/<session id>'),
+      branch: z.string().min(1).optional().describe('Branch to push to; an existing one is continued from its head, a new one must match the branch name rule. Default: generated from the branch name template. Give it only to continue an existing branch or when the user names one'),
     }).strict(),
     run: async (args, deps, caller) => await createWorkspace(deps, args, caller),
   }),
@@ -589,7 +704,6 @@ export const OPERATIONS: readonly Operation[] = [
  */
 export function toolOffered(access: ToolAccess, settings: RepoSettings['tools'], highest: RepoAccess | undefined): boolean {
   if (!settings.enabled) return false
-  if (access === 'admin') return settings.writes !== 'off'
   if (highest === undefined) return false
   if (access === 'read' || access === 'watch') return true
   if (settings.writes === 'off') return false
@@ -630,10 +744,9 @@ function gateOf(operation: Operation, args: unknown, deps: OperationDeps, caller
     if (spec === undefined) return
     const target = prompt.repo ?? (args as { repo?: unknown }).repo
     const name = caller.origin === 'tool' ? operation.tool : operation.method
-    if (spec.level !== undefined && typeof target === 'string') deps.service.policy.requireWrite(target, spec.level, name)
+    if (typeof target === 'string') deps.service.policy.requireWrite(target, spec.level, name)
     const gated = caller.origin === 'tool' || caller.agent !== undefined
     if (!gated) return
-    if (spec.level === undefined) deps.service.policy.requireWritesOn(name)
     const writes = deps.service.settings.current.tools.writes
     const session = sessionOf(caller)
     if (session !== undefined) await authorize(deps.parallel, { session, level: spec.authorize, action: operation.method, summary: prompt.zh })

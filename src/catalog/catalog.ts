@@ -3,9 +3,9 @@
  * the access it allows, the features other plugins turned on for it, and its
  * local sync.
  *
- * - The catalog is stored in the settings file and changed by the settings
- *   page or {@link RepoCatalog.ensure}; every change is a read-modify-write
- *   after the ones queued before it.
+ * - The catalog is stored in the settings file and changed only by the
+ *   settings page; every change is a read-modify-write after the ones queued
+ *   before it.
  * - A repository is identified by its key: `host/path` (lowercase) of its
  *   address on a configured host. An address on a host that is not configured cannot be added, and an
  *   entry whose host was removed afterwards matches nothing until the host is
@@ -20,17 +20,16 @@
 
 import { randomBytes } from 'node:crypto'
 import type { HostSpec } from '../config.ts'
-import type { CatalogRepo, RepoAccess, RepoAddResult, RepoFeature, RepoTarget } from '../contract.ts'
+import type { CatalogRepo, RepoAccess, RepoFeature, RepoTarget } from '../contract.ts'
 import { RepoError } from '../errors.ts'
 import type { HostLogger } from '../host.ts'
 import type { SettingsStore } from '../settings/store.ts'
 import { overlaps, realPathOf } from '../paths.ts'
-import { ACCESS_LEVELS, MAX_REPO_FEATURES, MAX_REPOS } from '../settings/contract.ts'
+import { ACCESS_LEVELS, MAX_REPOS } from '../settings/contract.ts'
 import type { RepoInput } from '../settings/contract.ts'
 import { resolveTarget } from '../target.ts'
 import type { ResolvedTarget } from '../target.ts'
-import { requireBranch } from '../refs.ts'
-import { allows, checkFeature, checkFeatureIds, checkInput, publicRepo } from './entry.ts'
+import { allows, checkFeature, checkInput, publicRepo } from './entry.ts'
 import type { CatalogEntry, CheckedInput } from './entry.ts'
 
 /** Collaborators of the catalog. */
@@ -150,7 +149,7 @@ export class RepoCatalog {
    */
   list(options: { readonly feature?: string } = {}): readonly CatalogRepo[] {
     const { feature } = options
-    return this.entries().filter(entry => feature === undefined || entry.features.includes(feature)).map(publicRepo)
+    return this.entries().filter(entry => feature === undefined || entry.features.some(item => item.id === feature)).map(publicRepo)
   }
 
   /** @returns the highest access any reachable entry allows, or undefined for an empty catalog. */
@@ -211,7 +210,7 @@ export class RepoCatalog {
       if (current.length >= MAX_REPOS) throw new RepoError('too-large', `仓库清单最多 ${MAX_REPOS} 个仓库`)
       this.checkUnique(key, current, undefined)
       this.checkSyncDir(checked, current, undefined, real)
-      const entry: CatalogEntry = { id: randomBytes(6).toString('hex'), ...checked, features: [...checked.features], addedAt: new Date(this.now()).toISOString() }
+      const entry: CatalogEntry = { id: randomBytes(6).toString('hex'), ...checked, addedAt: new Date(this.now()).toISOString() }
       return { repos: [...current, entry], result: entry }
     })
     this.emit()
@@ -234,7 +233,7 @@ export class RepoCatalog {
       if (existing === undefined) throw new RepoError('not-found', '仓库清单中没有这个仓库，可能已经删除')
       this.checkUnique(key, current, id)
       this.checkSyncDir(checked, current, id, real)
-      const entry: CatalogEntry = { id, ...checked, features: [...checked.features], addedAt: existing.addedAt }
+      const entry: CatalogEntry = { id, ...checked, addedAt: existing.addedAt }
       return { repos: current.map(item => item.id === id ? entry : item), result: entry }
     })
     this.emit()
@@ -252,55 +251,6 @@ export class RepoCatalog {
     const removed = await this.deps.store.updateRepos(current => ({ repos: current.filter(entry => entry.id !== id), result: current.find(entry => entry.id === id) }))
     if (removed !== undefined) this.emit()
     return removed
-  }
-
-  /**
-   * Add a repository, or turn features on for the entry holding it.
-   * @param url - repository address.
-   * @param options - branch, access, and features; `session` is asked about by the caller before this runs.
-   * @param authorize - runs once a change is certain and before it is stored; rejects to refuse.
-   * @returns the outcome and the entry.
-   * @throws {RepoError} `invalid`, `not-allowed`, `conflict` for another branch, `too-large`, `unavailable`, and whatever `authorize` rejects with.
-   */
-  async ensure(url: string, options: { readonly branch?: string; readonly access?: RepoAccess; readonly features?: readonly string[] }, authorize: (summary: string) => Promise<void>): Promise<RepoAddResult> {
-    const trimmed = url.trim()
-    const branch = options.branch?.trim()
-    if (branch !== undefined && branch !== '') requireBranch(branch, '分支名')
-    const features = checkFeatureIds(options.features ?? [])
-    const checked = checkInput({ url: trimmed, ...branch === undefined || branch === '' ? {} : { branch }, access: options.access ?? 'read', features })
-    const key = catalogKey(checked.url, this.deps.store.all())
-    const existing = this.find(checked.url)
-    if (existing !== undefined && (checked.branch ?? '') !== '' && checked.branch !== existing.branch) {
-      throw new RepoError('conflict', `${key} 已在仓库清单中，跟随${existing.branch === undefined ? '默认分支' : `分支 ${existing.branch}`}；改分支请在「代码仓库 → 仓库」中操作`)
-    }
-    const missing = existing === undefined ? features : features.filter(id => !existing.features.includes(id))
-    if (existing !== undefined && missing.length === 0) return { status: 'unchanged', repo: publicRepo(existing) }
-    const names = missing.map(id => this.features.get(id)?.feature.title ?? id).join('、')
-    await authorize(existing === undefined
-      ? `把 ${key} 加入 dsh-repo 仓库清单（权限：${accessLabel(checked.access)}${names === '' ? '' : `；打开功能：${names}`}）`
-      : `为仓库清单中的 ${key} 打开功能：${names}`)
-    type Outcome = { readonly status: RepoAddResult['status']; readonly entry: CatalogEntry }
-    const outcome = await this.deps.store.updateRepos<Outcome>((current) => {
-      const held = current.find((entry) => {
-        const own = this.keyOf(entry)
-        return 'key' in own && own.key === key
-      })
-      if (held !== undefined) {
-        // Another call may have stored the entry, on another branch, while this one was being authorized.
-        if (checked.branch !== undefined && checked.branch !== held.branch) {
-          throw new RepoError('conflict', `${key} 已在仓库清单中，跟随${held.branch === undefined ? '默认分支' : `分支 ${held.branch}`}；改分支请在「代码仓库 → 仓库」中操作`)
-        }
-        const next: CatalogEntry = { ...held, features: [...new Set([...held.features, ...features])] }
-        if (next.features.length === held.features.length) return { repos: current, result: { status: 'unchanged', entry: held } }
-        if (next.features.length > MAX_REPO_FEATURES) throw new RepoError('invalid', `一个仓库最多打开 ${MAX_REPO_FEATURES} 个功能，${key} 已有 ${held.features.length} 个`)
-        return { repos: current.map(entry => entry.id === held.id ? next : entry), result: { status: 'updated', entry: next } }
-      }
-      if (current.length >= MAX_REPOS) throw new RepoError('too-large', `仓库清单最多 ${MAX_REPOS} 个仓库`)
-      const entry: CatalogEntry = { id: randomBytes(6).toString('hex'), ...checked, features: [...features], addedAt: new Date(this.now()).toISOString() }
-      return { repos: [...current, entry], result: { status: 'added', entry } }
-    })
-    if (outcome.status !== 'unchanged') this.emit()
-    return { status: outcome.status, repo: publicRepo(outcome.entry) }
   }
 
   private withKey(key: string): CatalogEntry | undefined {
