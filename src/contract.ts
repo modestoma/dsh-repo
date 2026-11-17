@@ -42,8 +42,9 @@ export type ForgeKind = 'github' | 'gitlab'
 
 /**
  * A repository: its web or clone URL (`https://host/owner/name`,
- * `git@host:owner/name.git`, `ssh://git@host/owner/name.git`) or
- * `host/owner/name`. GitLab paths may have nested groups.
+ * `git@host:owner/name.git`, `ssh://git@host/owner/name.git`),
+ * `host/owner/name`, or `owner/name` alone when exactly one catalog entry has
+ * that path. GitLab paths may have nested groups.
  */
 export type RepoTarget = string
 
@@ -1336,8 +1337,9 @@ export interface DshRepoService {
   workspaceRemove(params: WorkspaceRemoveParams & CallOptions): Promise<WorkspaceRemoveResult>
 
   /**
-   * Resolve a target against the configured hosts without calling the host.
+   * Resolve a target against the configured hosts and, for a path without a host, the catalog, without calling the host or checking access.
    * @returns the resolved repository.
+   * @throws `invalid` for an unreadable target or a path several catalog entries have; `not-allowed` when no configured host serves it and no catalog entry has it as its path.
    */
   repoResolve(repo: RepoTarget): RepoRef
   /**

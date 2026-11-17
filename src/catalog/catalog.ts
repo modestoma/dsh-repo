@@ -10,6 +10,9 @@
  *   address on a configured host. An address on a host that is not configured cannot be added, and an
  *   entry whose host was removed afterwards matches nothing until the host is
  *   added again.
+ * - A call may name a repository by its path alone (`group/sub/project`,
+ *   no scheme or host) when exactly one entry has that path; an address on a
+ *   configured host always wins over this lookup.
  * - Features are registered by other plugins at run time and are only
  *   labels: switches stay stored while their plugin is not loaded.
  * - Local sync directories must not overlap each other or the mirror
@@ -61,7 +64,27 @@ export function catalogKey(url: string, hosts: readonly HostSpec[]): string {
 }
 
 function keyOfTarget(target: ResolvedTarget): string {
-  return target.webUrl.replace(/^https?:\/\//, '').toLowerCase()
+  return addressOf(target).toLowerCase()
+}
+
+/** The repository's web address without its scheme. */
+function addressOf(target: ResolvedTarget): string {
+  return target.webUrl.replace(/^https?:\/\//, '')
+}
+
+/** Entries named in the refusal of a path no entry has. */
+const MAX_SUGGESTIONS = 5
+
+/**
+ * The repository path a target without a scheme or host could name.
+ * @param input - trimmed target.
+ * @returns the lowercase path without surrounding slashes and `.git`, or undefined unless the target is two or more `/`-separated segments without `:`, `@`, `?`, `#`, or whitespace.
+ */
+function barePath(input: string): string | undefined {
+  if (/[:@?#\s\\]/.test(input)) return undefined
+  const segments = input.replace(/\.git\/*$/i, '').split('/').filter(segment => segment !== '')
+  if (segments.length < 2 || segments.some(segment => segment === '.' || segment === '..')) return undefined
+  return segments.join('/').toLowerCase()
 }
 
 /** A repository the catalog allows a call on, resolved once. */
@@ -110,7 +133,28 @@ export class RepoCatalog {
    * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no configured host serves it.
    */
   find(target: RepoTarget): CatalogEntry | undefined {
-    return this.withKey(catalogKey(target, this.deps.store.all()))
+    return this.withKey(keyOfTarget(this.resolve(target)))
+  }
+
+  /**
+   * Resolve a repository target to its host without an access check. An
+   * address on a configured host resolves as given; otherwise a target without
+   * a scheme is matched as a repository path against the entries.
+   * @param target - repository address, `host/path`, PR/MR URL, or the repository path of one entry.
+   * @returns the repository resolved to its host.
+   * @throws {RepoError} `invalid` for an unreadable target or a path several entries have, `not-allowed` when no configured host serves it and no entry has it as its path.
+   */
+  resolve(target: RepoTarget): ResolvedTarget {
+    const input = target.trim()
+    const hosts = this.deps.store.all()
+    try {
+      return resolveTarget(input, hosts)
+    } catch (error) {
+      const path = error instanceof RepoError && error.code === 'not-allowed' ? barePath(input) : undefined
+      const match = path === undefined ? undefined : this.resolvePath(input, path, hosts)
+      if (match === undefined) throw error
+      return match
+    }
   }
 
   /**
@@ -121,7 +165,7 @@ export class RepoCatalog {
    * @throws {RepoError} `not-allowed` without a configured host, when the catalog does not hold the repository, or when its access is lower; `invalid` for an unreadable target.
    */
   open(target: RepoTarget, needed: RepoAccess): CatalogHandle {
-    const resolved = resolveTarget(target.trim(), this.deps.store.all())
+    const resolved = this.resolve(target)
     const key = keyOfTarget(resolved)
     const entry = this.withKey(key)
     if (entry === undefined) throw new RepoError('not-allowed', `${key} 不在 dsh-repo 的仓库清单中，不能访问；请管理员在「代码仓库 → 仓库」中添加`)
@@ -251,6 +295,33 @@ export class RepoCatalog {
     const removed = await this.deps.store.updateRepos(current => ({ repos: current.filter(entry => entry.id !== id), result: current.find(entry => entry.id === id) }))
     if (removed !== undefined) this.emit()
     return removed
+  }
+
+  /**
+   * The entry whose repository path is `path`, for a target no configured host serves.
+   * @returns the entry's target, or undefined when no entry has the path and its first segment looks like a host name, so the refusal of that host stands.
+   * @throws {RepoError} `invalid` when several entries have the path, `not-allowed` when none has it.
+   */
+  private resolvePath(input: string, path: string, hosts: readonly HostSpec[]): ResolvedTarget | undefined {
+    const reachable = this.entries().flatMap((entry) => {
+      try {
+        return [resolveTarget(entry.url, hosts)]
+      } catch {
+        // An entry whose host was removed matches nothing until the host is added again.
+        return []
+      }
+    })
+    const matches = reachable.filter(item => item.path.toLowerCase() === path)
+    const [match] = matches
+    if (match !== undefined && matches.length === 1) return match
+    if (matches.length > 1) {
+      throw new RepoError('invalid', `${input} 不带主机名，仓库清单中有多个仓库是这个路径：${matches.map(addressOf).join('、')}；请用完整地址`)
+    }
+    if (path.slice(0, path.indexOf('/')).includes('.')) return undefined
+    const name = path.slice(path.lastIndexOf('/') + 1)
+    const similar = reachable.filter(item => item.path.toLowerCase().split('/').at(-1) === name).slice(0, MAX_SUGGESTIONS)
+    const hint = similar.length > 0 ? `同名的仓库：${similar.map(addressOf).join('、')}` : '用 repo_list 查看能访问的仓库，并用它给的地址'
+    throw new RepoError('not-allowed', `${input} 不带主机名，仓库清单中也没有路径是 ${path} 的仓库；${hint}`)
   }
 
   private withKey(key: string): CatalogEntry | undefined {
