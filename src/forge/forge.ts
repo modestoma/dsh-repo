@@ -180,13 +180,13 @@ export class Forge {
   constructor(private readonly deps: ForgeDeps) {}
 
   /**
-   * Resolve a target to its host without consulting the catalog.
-   * @param repo - repository address, `host/path`, or PR/MR URL.
+   * Resolve a target to its host without an access check.
+   * @param repo - repository address, `host/path`, PR/MR URL, or the repository path of one catalog entry.
    * @returns the host kind, host, path, and web address.
-   * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no configured host serves it.
+   * @throws {RepoError} see `RepoCatalog.resolve`.
    */
   resolve(repo: RepoTarget): RepoRef {
-    const { spec: _spec, ...ref } = this.deps.hosts.resolve(repo)
+    const { spec: _spec, ...ref } = this.deps.catalog.resolve(repo)
     return ref
   }
 

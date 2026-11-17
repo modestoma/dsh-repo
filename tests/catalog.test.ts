@@ -57,6 +57,32 @@ describe('repository catalog', () => {
     expect(catalog.require('github.com/a/c', 'merge').access).toBe('merge')
   })
 
+  it('resolves a repository path without a host to the one entry that has it', async () => {
+    const { catalog, service } = setup()
+    await catalog.add({ url: 'https://code.example.com/gitlab/pe/tool/modem_cli', access: 'read', features: [] })
+    await catalog.add({ url: 'https://github.com/team/app', access: 'read', features: [] })
+    await catalog.add({ url: 'https://ghe.example.com/team/app', access: 'read', features: [] })
+    await catalog.add({ url: 'https://github.com/other/modem_cli', access: 'read', features: [] })
+    expect(catalog.open('pe/tool/modem_cli', 'read')).toMatchObject({ key: 'code.example.com/gitlab/pe/tool/modem_cli', target: { kind: 'gitlab', path: 'pe/tool/modem_cli', spec: { url: 'https://code.example.com/gitlab' } } })
+    expect(catalog.find(' /PE/Tool/modem_cli.git/ ')?.url).toBe('https://code.example.com/gitlab/pe/tool/modem_cli')
+    expect(service.forge.resolve('pe/tool/modem_cli')).toEqual({ kind: 'gitlab', host: 'code.example.com', path: 'pe/tool/modem_cli', webUrl: 'https://code.example.com/gitlab/pe/tool/modem_cli' })
+    // A configured host wins over an entry path.
+    expect(catalog.open('github.com/team/app', 'read').key).toBe('github.com/team/app')
+    expect(() => catalog.open('team/app', 'read')).toThrow(expect.objectContaining({ code: 'invalid', message: expect.stringContaining('github.com/team/app、ghe.example.com/team/app') }))
+    expect(() => catalog.open('tool/modem_cli', 'read')).toThrow(expect.objectContaining({ code: 'not-allowed', message: expect.stringContaining('同名的仓库：code.example.com/gitlab/pe/tool/modem_cli、github.com/other/modem_cli') }))
+    expect(() => catalog.open('pe/tool/nothing', 'read')).toThrow(expect.objectContaining({ code: 'not-allowed', message: expect.stringContaining('用 repo_list 查看') }))
+    // A first segment that looks like a host name keeps the host refusal; other forms never become paths.
+    expect(() => catalog.open('git.unknown.com/pe/tool/modem_cli', 'read')).toThrow(expect.objectContaining({ code: 'not-allowed', message: expect.stringContaining('没有为 git.unknown.com 配置主机') }))
+    expect(() => catalog.open('https://pe/tool/modem_cli', 'read')).toThrow(expect.objectContaining({ message: expect.stringContaining('没有为 pe 配置主机') }))
+    expect(() => catalog.open('modem_cli', 'read')).toThrow(expect.objectContaining({ message: expect.stringContaining('没有为 modem_cli 配置主机') }))
+    expect(() => catalog.open('pe/../modem_cli', 'read')).toThrow(expect.objectContaining({ code: 'not-allowed' }))
+  })
+
+  it('skips entries whose host was removed when resolving a path without a host', () => {
+    const { catalog } = setup({ hosts: [], repos: [{ id: '000000000001', url: 'https://gone.example.com/pe/app', access: 'read', features: [], addedAt: 't' }, { id: '000000000002', url: 'https://github.com/pe/app', access: 'read', features: [], addedAt: 't' }] })
+    expect(catalog.open('pe/app', 'read').key).toBe('github.com/pe/app')
+  })
+
   it('adds, changes, and removes entries, refusing a repository held twice and a full catalog', async () => {
     const { catalog, file } = setup()
     const added = await catalog.add({ url: ' https://github.com/a/b ', base: ' dev ', access: 'write', features: [{ id: 'b-feature', branch: ' main ' }, { id: 'a-feature', branch: '' }, { id: 'b-feature' }], localSync: { enabled: false, dir: '/srv/x', branch: 'release' }, branchTemplate: ' feature/{random} ', branchPattern: '^feature/' })

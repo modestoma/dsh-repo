@@ -7,7 +7,7 @@
  * @module dsh-repo/forge/hosts
  */
 
-import type { CommitAuthor, HostCreate, HostInfo, HostsChange, RepoTarget, RepoUser, TokenStatus } from '../contract.ts'
+import type { CommitAuthor, HostCreate, HostInfo, HostsChange, RepoUser, TokenStatus } from '../contract.ts'
 import type { HostSpec } from '../config.ts'
 import { RepoError, toRepoError } from '../errors.ts'
 import type { HostCredentials, HostLogger } from '../host.ts'
@@ -15,8 +15,7 @@ import { forgeOf } from '../providers/forges.ts'
 import type { Provider } from '../providers/types.ts'
 import { isAcceptedToken, MAX_TOKEN_LENGTH } from '../settings/store.ts'
 import type { SettingsStore } from '../settings/store.ts'
-import { hostOf, resolveTarget } from '../target.ts'
-import type { ResolvedTarget } from '../target.ts'
+import { hostOf } from '../target.ts'
 
 /** Builds the provider of one host; tests substitute it. */
 export type ProviderFactory = (spec: HostSpec, token: () => Promise<string>, timeoutMs: number) => Provider
@@ -77,16 +76,6 @@ export class HostRegistry {
   /** Whether any host is configured or added. */
   get configured(): boolean {
     return this.all().length > 0
-  }
-
-  /**
-   * Resolve a target to its host; whether it may be reached is the catalog's decision.
-   * @param repo - repository address, `host/path`, or PR/MR URL.
-   * @returns the target with its host.
-   * @throws {RepoError} `invalid` for an unreadable target, `not-allowed` when no configured host serves it.
-   */
-  resolve(repo: RepoTarget): ResolvedTarget {
-    return resolveTarget(repo, this.all())
   }
 
   /** @returns every host with its token status. */

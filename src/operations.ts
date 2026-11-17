@@ -103,7 +103,7 @@ export class DeclinedError extends RepoError {
   }
 }
 
-const repo = z.string().min(1).describe('Repository: web or clone URL (https://github.com/owner/name, git@gitlab.example.com:group/project.git) or host/path')
+const repo = z.string().min(1).describe('Repository: preferably its url from repo_list; also a web or clone URL (https://github.com/owner/name, git@gitlab.example.com:group/project.git), host/path, or the path alone (group/sub/project) when it names one repository in repo_list')
 const number = z.number().int().min(1).describe('Issue or PR/MR number as shown in the web UI (GitLab IID)')
 const page = z.number().int().min(1).optional().describe('1-based page, default 1')
 const perPage = z.number().int().min(1).max(100).optional().describe('Items per page')
